@@ -1700,7 +1700,7 @@ mod tests {
     fn earlier_files_in_the_way() -> Result<crate::review_session::EarlierSceneFiles, String> {
         Ok(crate::review_session::EarlierSceneFiles {
             scene_dir: test_sessions::scene_dir(),
-            file_names: crate::review_session::EarlierSceneFiles::numbered_names(3),
+            splits: crate::review_session::EarlierSceneFiles::a_split_into(3),
         })
     }
 

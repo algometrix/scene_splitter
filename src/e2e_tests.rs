@@ -17,7 +17,7 @@ use crate::fates::{SceneFate, ScenesToWrite};
 use crate::ffmpeg::FfmpegError;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::probe;
-use crate::scene_name::SceneNamePattern;
+use crate::scene_name::{EarlierNaming, SceneNamePattern};
 use crate::scenes::CutTimes;
 use crate::split::{self, SceneOutcome};
 use crate::test_videos::{
@@ -531,8 +531,8 @@ fn a_video_with_a_percent_sign_in_its_name_is_split() {
     assert_eq!(
         scene_files,
         vec![
-            video.folder().join("100% fun_scene_001.mp4"),
-            video.folder().join("100% fun_scene_002.mp4"),
+            video.folder().join("100% fun_scene_1_of_2.mp4"),
+            video.folder().join("100% fun_scene_2_of_2.mp4"),
         ]
     );
     assert!(verify::verify_scenes(&named_with_percent, &scene_files).is_ok());
@@ -621,8 +621,8 @@ fn a_split_with_a_dropped_scene_writes_the_others_and_always_keeps_the_original(
     assert_eq!(
         report.scene_files,
         vec![
-            video.folder().join("video_scene_001.mp4"),
-            video.folder().join("video_scene_002.mp4"),
+            video.folder().join("video_scene_1_of_2.mp4"),
+            video.folder().join("video_scene_2_of_2.mp4"),
         ]
     );
     assert_eq!(report.dropped_scenes, 1);
@@ -707,8 +707,8 @@ fn scene_files_take_the_name_chosen_and_are_found_again_under_it() {
     assert_eq!(
         report.scene_files,
         vec![
-            video.folder().join("001 of 2 video from 00h00m00s.mp4"),
-            video.folder().join("002 of 2 video from 00h00m04s.mp4"),
+            video.folder().join("1 of 2 video from 00h00m00s.mp4"),
+            video.folder().join("2 of 2 video from 00h00m04s.mp4"),
         ]
     );
     assert!(report.is_clean(), "{:?}", report.verification);
@@ -716,7 +716,7 @@ fn scene_files_take_the_name_chosen_and_are_found_again_under_it() {
     let found =
         split::scene_files_from_earlier_splits(&video.path, video.folder(), scene_name).unwrap();
     assert_eq!(found, report.scene_files);
-    // Files named another way are not taken for scenes of this split.
+    // Someone who never used that name does not take them for scenes.
     let found_by_default_name = split::scene_files_from_earlier_splits(
         &video.path,
         video.folder(),
@@ -724,6 +724,68 @@ fn scene_files_take_the_name_chosen_and_are_found_again_under_it() {
     )
     .unwrap();
     assert!(found_by_default_name.is_empty());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_split_under_a_new_name_removes_the_scenes_of_the_split_under_the_old_name() {
+    let video = TestVideo::two_scenes_with_a_black_screen("renamed_scenes");
+    let old_default = SceneNamePattern::default_before_the_count();
+    let every_scene = || {
+        SplitOrder::new(
+            ScenesToWrite::every_scene(cuts_at(&[BLACK_START])),
+            copying(OriginalPolicy::Keep),
+        )
+    };
+    // A split from before the default name said the count.
+    let earlier =
+        export::export_scenes(&video.path, &every_scene(), video.folder(), old_default).unwrap();
+    assert_eq!(
+        earlier.scene_files,
+        vec![
+            video.folder().join("video_scene_001.mp4"),
+            video.folder().join("video_scene_002.mp4"),
+        ]
+    );
+    // Other videos in the folder, whose names only look like scene names.
+    let neighbours = [
+        video.folder().join("video_scene_1_of_20_extended.mp4"),
+        video.folder().join("video_scene_2.mp4"),
+        video.folder().join("video_scene_3_of_2.mp4"),
+        video.folder().join("video two_scene_001.mp4"),
+    ];
+    for neighbour in &neighbours {
+        std::fs::copy(&video.path, neighbour).unwrap();
+    }
+
+    // The earlier split is found, and said to be named another way.
+    let found =
+        split::earlier_splits_in(&video.path, video.folder(), SceneNamePattern::default()).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].naming(), EarlierNaming::AnotherWay);
+    assert_eq!(found[0].files(), earlier.scene_files);
+
+    let report = export::export_scenes(
+        &video.path,
+        &every_scene(),
+        video.folder(),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        report.scene_files,
+        vec![
+            video.folder().join("video_scene_1_of_2.mp4"),
+            video.folder().join("video_scene_2_of_2.mp4"),
+        ]
+    );
+    assert!(report.is_clean(), "{:?}", report.verification);
+
+    // The scenes of the earlier split are gone, and nothing else is.
+    assert!(earlier.scene_files.iter().all(|scene| !scene.exists()));
+    assert!(neighbours.iter().all(|neighbour| neighbour.is_file()));
+    assert!(video.path.is_file());
+    assert_no_folder_is_left_in(video.folder());
 }
 
 /// The folder scenes are written into before they get their names is gone

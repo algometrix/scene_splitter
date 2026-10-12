@@ -72,7 +72,7 @@ use fates::ScenesToWrite;
 use folder_settings::{DetectionInUse, SettingsScope};
 use hardcut::HardCutSettings;
 use scene_list::{FrameRate, SceneList, SceneListFormat};
-use scene_name::SceneNamePattern;
+use scene_name::{EarlierNaming, EarlierSplit, SceneNamePattern};
 use scenes::CutTimes;
 use settings::Settings;
 use timecode::{format_timestamp, TimeSpan};
@@ -121,7 +121,8 @@ struct Arguments {
     /// {name} for the video's name and {number} for the scene's number,
     /// which both have to be there, and if you like {count}, {start} and
     /// {length}. The video's extension is added. The default is
-    /// "{name}_scene_{number}".
+    /// "{name}_scene_{number}_of_{count}", which names the first of five
+    /// scenes "<video name>_scene_1_of_5".
     #[arg(long, requires = "video", value_name = "PATTERN")]
     scene_name: Option<SceneNamePattern>,
 
@@ -368,12 +369,18 @@ fn scan_depth(arguments: &Arguments, settings: &Settings) -> ScanDepth {
 
 fn scan_ahead(path: &Path, arguments: &Arguments, settings: &Settings) -> Result<()> {
     let depth = scan_depth(arguments, settings);
-    let summary = prescan::scan_ahead(path, &settings.detection.scan, depth, |video_done| {
-        println!("{video_done}");
-        for stretch in &video_done.undecoded {
-            eprintln!("Warning: in {}, {stretch}", video_done.video.display());
-        }
-    })?;
+    let summary = prescan::scan_ahead(
+        path,
+        settings.scene_names(),
+        &settings.detection.scan,
+        depth,
+        |video_done| {
+            println!("{video_done}");
+            for stretch in &video_done.undecoded {
+                eprintln!("Warning: in {}, {stretch}", video_done.video.display());
+            }
+        },
+    )?;
     if summary.is_empty() {
         println!("No videos were found in {}.", path.display());
         return Ok(());
@@ -476,12 +483,19 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         return Ok(());
     }
 
-    // Splitting replaces files of the same name, so an earlier run's scenes
-    // are only overwritten when the user asked for that.
-    let scene_name = settings.export.scene_name;
-    let existing_scenes = split::scene_files_from_earlier_splits(video, &out_dir, scene_name)?;
-    if !arguments.overwrite && !existing_scenes.is_empty() {
-        bail!(earlier_scenes_in_the_way(&existing_scenes, &out_dir));
+    // Splitting replaces the scene files of earlier splits and removes
+    // those it has no use for, so it only goes ahead over them when the
+    // user asked for that.
+    let scene_names = settings.scene_names();
+    let earlier_splits = split::earlier_splits_in(video, &out_dir, scene_names)?;
+    if !arguments.overwrite && !earlier_splits.is_empty() {
+        bail!(earlier_scenes_in_the_way(&earlier_splits, &out_dir));
+    }
+    if !earlier_splits.is_empty() {
+        println!(
+            "{}",
+            earlier_scenes_being_replaced(&earlier_splits, &out_dir)
+        );
     }
 
     let started = Instant::now();
@@ -489,8 +503,16 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     if method == SplitMethod::ExactFrames {
         println!("{EXACT_CUT_NOTICE}");
     }
-    let report = export::export_scenes(video, &order, &out_dir, scene_name)
+    let report = export::export_scenes(video, &order, &out_dir, scene_names)
         .map_err(with_the_way_back_to_a_normal_cut)?;
+    // So that these scenes are still known as scenes of this video after
+    // the name for scene files is changed. The split itself is done, so a
+    // settings file that cannot be written is told and not a failure.
+    if let Err(error) = settings::remember_scene_name_used_for_a_split(scene_names.in_use()) {
+        eprintln!(
+            "Warning: the name of these scene files could not be noted in the settings: {error:#}"
+        );
+    }
     println!("{}", report.summary());
     if let Some(measurements) = report.exact_cut_measurements() {
         println!("{measurements}");
@@ -562,27 +584,56 @@ fn save_scene_list(
     export::save_scene_list(&list, format, list_file, if_exists)
 }
 
-/// Why the split does not start over the scene files of an earlier one.
-/// Every file is named: a file is taken for an earlier scene by its name
-/// alone, and the person should see each one before --overwrite replaces it
-/// or moves it to the Recycle Bin or Trash.
-fn earlier_scenes_in_the_way(existing_scenes: &[PathBuf], out_dir: &Path) -> String {
-    let count = match existing_scenes.len() {
-        1 => "1 scene file from an earlier split is".to_owned(),
-        several => format!("{several} scene files from an earlier split are"),
-    };
-    let names: Vec<String> = split::file_names_of(existing_scenes)
-        .into_iter()
-        .map(|name| format!("  {name}"))
-        .collect();
+/// Why the split does not start over the scene files of earlier ones.
+fn earlier_scenes_in_the_way(earlier_splits: &[EarlierSplit], out_dir: &Path) -> String {
     format!(
-        "{count} in {}:\n{}\nPass --overwrite to replace them, or choose another --out-dir. \
+        "{}\nPass --overwrite to replace them, or choose another --out-dir. \
          With --overwrite, those the new split has no use for go to the {}.",
-        out_dir.display(),
-        names.join("\n"),
+        earlier_scenes_listed(earlier_splits, out_dir),
         export::TRASH_NAME
     )
 }
+
+/// What a split with --overwrite says before it starts: nobody is asked,
+/// so the files that are about to go are at least named.
+fn earlier_scenes_being_replaced(earlier_splits: &[EarlierSplit], out_dir: &Path) -> String {
+    format!(
+        "{}\nThey are replaced, as --overwrite says. Those the new split has no use for go to \
+         the {}.",
+        earlier_scenes_listed(earlier_splits, out_dir),
+        export::TRASH_NAME
+    )
+}
+
+/// The scene files of earlier splits, every one named, split by split. A
+/// file is taken for an earlier scene by its name alone, and the person
+/// should see each one that --overwrite replaces or moves to the Recycle
+/// Bin or Trash. A split whose files are named another way than scenes are
+/// named now is said to be so, since none of its files is written over and
+/// all of them go.
+fn earlier_scenes_listed(earlier_splits: &[EarlierSplit], out_dir: &Path) -> String {
+    let count = match split::files_of(earlier_splits).len() {
+        1 => "1 scene file from an earlier split is".to_owned(),
+        several => format!("{several} scene files from an earlier split are"),
+    };
+    let mut lines = vec![format!("{count} in {}:", out_dir.display())];
+    for earlier_split in earlier_splits {
+        if earlier_split.naming() == EarlierNaming::AnotherWay {
+            lines.push(NAMED_ANOTHER_WAY_HEADING.to_owned());
+        }
+        lines.extend(
+            earlier_split
+                .file_names()
+                .into_iter()
+                .map(|name| format!("  {name}")),
+        );
+    }
+    lines.join("\n")
+}
+
+/// Stands above the files of an earlier split in that list, when they are
+/// not named as scenes are named now.
+const NAMED_ANOTHER_WAY_HEADING: &str = "Named another way than scenes are named now:";
 
 /// Said before an exact split starts, since it takes longer than a copy and
 /// does not do what the saved setting for originals may say.
@@ -638,25 +689,72 @@ mod tests {
     #[test]
     fn the_refusal_to_replace_earlier_scenes_names_every_one_of_them() {
         let out_dir = Path::new("videos");
-        let refusal = earlier_scenes_in_the_way(
-            &[out_dir.join("Rocky 001.mp4"), out_dir.join("Rocky 002.mp4")],
-            out_dir,
+        let two = scene_name::earlier_splits_for_test(
+            "Rocky.mp4",
+            &["Rocky_scene_1_of_2.mp4", "Rocky_scene_2_of_2.mp4"],
         );
+        let refusal = earlier_scenes_in_the_way(&two, out_dir);
         assert!(
             refusal.starts_with("2 scene files from an earlier split are in videos:"),
             "{refusal}"
         );
         assert!(
-            refusal.contains("\n  Rocky 001.mp4\n  Rocky 002.mp4\n"),
+            refusal.contains("\n  Rocky_scene_1_of_2.mp4\n  Rocky_scene_2_of_2.mp4\n"),
             "{refusal}"
         );
+        assert!(!refusal.contains(NAMED_ANOTHER_WAY_HEADING), "{refusal}");
         assert!(refusal.contains("--overwrite"), "{refusal}");
         assert!(refusal.contains(export::TRASH_NAME), "{refusal}");
 
-        let one = earlier_scenes_in_the_way(&[out_dir.join("Rocky 2.mp4")], out_dir);
+        let one = scene_name::earlier_splits_for_test("Rocky.mp4", &["Rocky_scene_2_of_3.mp4"]);
+        let one = earlier_scenes_in_the_way(&one, out_dir);
         assert!(
             one.starts_with("1 scene file from an earlier split is in videos:"),
             "{one}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_says_which_earlier_scenes_are_named_another_way() {
+        let out_dir = Path::new("videos");
+        let found = scene_name::earlier_splits_for_test(
+            "Rocky.mp4",
+            &[
+                "Rocky_scene_001.mp4",
+                "Rocky_scene_002.mp4",
+                "Rocky_scene_1_of_2.mp4",
+            ],
+        );
+        let refusal = earlier_scenes_in_the_way(&found, out_dir);
+        assert!(
+            refusal.starts_with("3 scene files from an earlier split are in videos:"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&format!(
+                "\n  Rocky_scene_1_of_2.mp4\n{NAMED_ANOTHER_WAY_HEADING}\n  \
+                 Rocky_scene_001.mp4\n  Rocky_scene_002.mp4\n"
+            )),
+            "{refusal}"
+        );
+
+        // With --overwrite nobody is asked, so the same files are named.
+        let notice = earlier_scenes_being_replaced(&found, out_dir);
+        assert!(
+            notice.starts_with(&earlier_scenes_listed(&found, out_dir)),
+            "{notice}"
+        );
+        assert!(notice.contains(export::TRASH_NAME), "{notice}");
+    }
+
+    #[test]
+    fn the_help_for_scene_names_shows_the_default() {
+        use clap::CommandFactory;
+        let help = Arguments::command().render_long_help().to_string();
+        assert!(
+            help.contains(scene_name::DEFAULT_PATTERN),
+            "the help does not name {}",
+            scene_name::DEFAULT_PATTERN
         );
     }
 }

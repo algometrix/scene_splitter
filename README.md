@@ -145,7 +145,7 @@ The window can be made as small as 900 by 600. The name, the split buttons, a li
 
 On a high-resolution screen the preview pictures and the player's picture are decoded larger, so they stay sharp.
 
-Scene files are named `<video name>_scene_001`, `_scene_002` and so on, with the extension of the original, unless you choose another name (see [Scene file names](#scene-file-names)).
+Scene files are named `<video name>_scene_1_of_5`, `_scene_2_of_5` and so on, with the extension of the original, so each one says how many scenes there are. You can choose another name (see [Scene file names](#scene-file-names)).
 
 "Scan again" ignores the stored scan of the video and looks for black screens afresh. What an earlier look for sudden picture changes found in the same file is kept.
 
@@ -265,8 +265,8 @@ Splitting from the command line always scans the video afresh. Only the window a
 | Option | Meaning |
 | --- | --- |
 | `--out-dir <folder>` | Where to write the scene files. The default is the saved setting: the video's own folder, unless you changed it. |
-| `--overwrite` | Replace scene files left in the output folder by an earlier run. Without it, the split stops if such files exist, and names them. With it, earlier scene files whose names the new split does not use go to the Recycle Bin or Trash. Also lets `--save-list` replace a file. |
-| `--scene-name <pattern>` | How to name the scene files, whatever the saved setting says. See [Scene file names](#scene-file-names). |
+| `--overwrite` | Replace scene files left in the output folder by an earlier run, also when another pattern named them (see [Scene files of an earlier split](#scene-files-of-an-earlier-split)). Without it, the split stops if such files exist, and names them. With it, earlier scene files whose names the new split does not use go to the Recycle Bin or Trash. Also lets `--save-list` replace a file. |
+| `--scene-name <pattern>` | How to name the scene files, whatever the saved setting says. The default is `{name}_scene_{number}_of_{count}`. See [Scene file names](#scene-file-names). |
 | `--save-list <file>` | Write the list of scenes to this file: their numbers, times, the names their files get and their chapter titles. With `--list-only` it writes the list and no scene files. See [Scene list](#scene-list). |
 | `--list-format <csv, chapters or edl>` | The format of the scene list. Left out, it follows the file's ending: `.csv`, `.txt` (or `.ffmetadata`) for chapters, `.edl`. |
 | `--keep-original` | Keep the original video, whatever the saved setting says. |
@@ -384,31 +384,47 @@ The review screen shows a short "How to use this screen" card. "Hide tips" remov
 
 ### Scene file names
 
-"Name scene files" in Settings, and `--scene-name` on the command line, take a pattern. The default, `{name}_scene_{number}`, gives the names the app has always written. The extension of the video is added to it.
+"Name scene files" in Settings, and `--scene-name` on the command line, take a pattern. The default is `{name}_scene_{number}_of_{count}`, so every scene file says how many scenes its split wrote: `holiday_scene_1_of_5.mp4`, or `holiday_scene_07_of_12.mp4`. The extension of the video is added to the pattern.
 
 | Placeholder | Stands for |
 | --- | --- |
 | `{name}` | The video's name without its extension. |
-| `{number}` | The scene's number, from 1, with leading zeros: at least three digits, and as many as the number of scenes has. |
-| `{count}` | How many scene files the split writes. |
+| `{number}` | The scene's number, from 1, with leading zeros, so the files of one split sort in scene order. In a pattern with `{count}` it has as many digits as the count: `1` of 5, `07` of 12. In a pattern without `{count}` it has three digits at least (`001`), and four in a split into a thousand scenes or more. |
+| `{count}` | How many scene files the split writes, without leading zeros. |
 | `{start}` | Where the scene starts in the video, as `00h03m12s`. |
 | `{length}` | How long the scene is, in the same form. |
 
-For example, `{name} part {number} of {count}` names the second of twelve scenes of `My video.mp4` as `My video part 002 of 12.mp4`. Under the box, the window shows an example of the name as you type, or says what is wrong with the pattern. A pattern that cannot be used changes nothing: the last good one stays in use.
+For example, `{name} part {number} of {count}` names the second of twelve scenes of `My video.mp4` as `My video part 02 of 12.mp4`, and `{name} part {number}` names it `My video part 002.mp4`. Under the box, the window shows an example of the name as you type, or says what is wrong with the pattern. A pattern that cannot be used changes nothing: the last good one stays in use.
+
+Earlier versions named scene files `{name}_scene_{number}` by default (`holiday_scene_001.mp4`), and gave every number three digits at least, also beside a count (`My video part 002 of 12.mp4`). Settings saved by such a version that still hold the old default get the new one. If you want the old names back, type `{name}_scene_{number}` into the box.
 
 A pattern must contain `{number}`, or every scene would get the same name, and `{name}`, or the scenes of two videos in one folder would replace each other. It cannot contain `/`, `\`, `<`, `>`, `:`, `"`, `|`, `?`, `*`, a line break or a tab, start with a space, end with a space or a dot, start with a name Windows keeps for itself (such as `CON` or `LPT1`), or be longer than 100 bytes, which is 100 plain letters and fewer with accents.
 
 Scenes that are written are numbered from 1 without gaps, also when scenes are dropped. `{count}` counts the files, not the scenes. The pattern names the files of an exact split in the same way.
 
-The check for scene files left by an earlier split uses the pattern in use now. Files written under another pattern are not counted, not replaced and not removed.
+#### Scene files of an earlier split
+
+Before a split, the app looks in the folder the scenes go to for scene files an earlier split of the same video left there. It knows them under:
+
+- the pattern in use now,
+- the default pattern, and the default of earlier versions (`holiday_scene_001.mp4`),
+- the patterns earlier splits were written with. The app notes the pattern in the settings file each time it writes a split, in the window and on the command line, and keeps the last eight. "Restore default settings" does not forget them. A pattern you used only before the app kept this note is not known, unless it is one of the defaults.
+- each of those as earlier versions wrote it, with three digits at least beside a count (`My video part 002 of 12.mp4`).
+
+So changing the pattern does not hide an earlier split. The warning in the window and the message of the command line name the files of each earlier split, so you see each one before you agree to replace them. Files that are named another way than scenes are named now are said to be so: the new split writes over none of them, and all of them go to the Recycle Bin or Trash. Your agreement is for the files that were named. If other files are found when the split starts, the app asks again.
 
 A file counts as a scene of an earlier split by its name alone, so the check is strict about names, and nothing it finds is deleted for good:
 
-- A scene number has at least three digits. With the pattern `{name} {number}`, `Rocky 2.mp4` beside `Rocky.mp4` is another video, not a scene.
-- A number with four digits or more only counts when the first scene with that many digits is there too (`film_0001.mp4`), as after a split into a thousand scenes or more. `Blade Runner 2049.mp4` beside `Blade Runner.mp4` is left alone.
-- On Windows and macOS, names that differ only in capitals are the same file, so the check ignores capitals there.
-- The warning in the window and the message of the command line name the files, so you see each one before you agree to replace them.
-- A new split writes over the earlier scene files whose names it uses. Earlier scene files with names it does not use (the higher numbers of a split into more scenes) go to the Recycle Bin or Trash, where you can get them back.
+- The whole name has to fit: the video's name where `{name}` stands, the same ending as the video, and nothing before, between or after the parts of the pattern. `holiday_scene_1_of_50_extended.mp4` beside `holiday.mp4` is another video, not a scene.
+- The video itself is never taken for one of its scenes.
+- Beside a count, the number has to be one that split wrote: from 1 up to the count, with exactly the digits that count gives it, and the count has no leading zeros. `holiday_scene_6_of_5.mp4`, `holiday_scene_0_of_5.mp4`, `holiday_scene_01_of_5.mp4` and `holiday_scene_1_of_12.mp4` are not scenes.
+- Without a count, a scene number has at least three digits and is not 0. With the pattern `{name} {number}`, `Rocky 2.mp4` beside `Rocky.mp4` is another video, and so is `holiday_scene_2.mp4` beside `holiday.mp4`.
+- Without a count, a number with four digits or more only counts when the first scene with that many digits is there too (`film_0001.mp4`), as after a split into a thousand scenes or more. `Blade Runner 2049.mp4` beside `Blade Runner.mp4` is left alone.
+- A pattern without `{count}` that is no longer in use counts only for a whole run of numbers from 1 with no gap (`IMG_001.mp4`, `IMG_002.mp4`, `IMG_003.mp4`). After you used `{name}_{number}` once, a single `IMG_007.mp4` beside `IMG.mp4` is left alone. The old default is the exception: its `_scene_` says enough.
+- On Windows and macOS, names that differ only in capitals are the same file, so the check ignores capitals there. On Linux capitals count, in the ending of the name too.
+- Files are told apart by the split that wrote them: the same pattern, the same count where the name says it, and numbers of the same length. Only files that belong to such a split are replaced or removed.
+- A new split writes over the earlier scene files whose names it uses. Earlier scene files with names it does not use go to the Recycle Bin or Trash, where you can get them back: the higher numbers of a split into more scenes, and every file of a split with another count or another pattern.
+- If a file that was not recognised as an earlier scene has the very name a new scene would get, the split stops before it writes anything, and names that file.
 
 ## ffmpeg
 
@@ -515,7 +531,7 @@ What differs between systems:
 - The hard-cut scan finds shot changes, not story scenes. Expect to merge its results by hand.
 - Audio and video sync in the player is loose. The player is for finding scene boundaries, not for watching.
 - Scene files contain the first video stream and the audio streams. Other streams, such as subtitles or cover art, are not copied. An original that holds such streams fails verification on purpose, so it is never recycled.
-- A folder you add leaves out scene files from an earlier split only if they have the default name (`<video name>_scene_001`, with three digits or more). With another name pattern, scene files in that folder are added like any other video.
+- A folder you add leaves out scene files from an earlier split if they have the default name (`<video name>_scene_1_of_5`), the default name of earlier versions (`<video name>_scene_001`, with three digits or more), or a name from a pattern with `{count}` that is in use or was used for a split. Scene files named by a pattern without `{count}`, such as `{name} part {number}`, are added like any other video, because such a name could be any video's. A video of your own that happens to be named like a scene, such as `Lecture 1 of 2.mp4` while the pattern `{name} {number} of {count}` is known, is left out too. Add it by itself: a file you name directly is always taken.
 - The player does not show which scenes are dropped. The review screen does.
 - Scene files do not carry chapters. An MP4 file written by ffmpeg keeps its chapters in a stream of their own, and other tools may do the same. That stream counts as one of the streams that are not copied. Such a video is split at its chapter marks like any other, but the check does not pass, so its original is kept. A Matroska (MKV) file keeps chapters beside its streams and passes the check.
 - The window has been run by hand on Windows only. See [Platforms](#platforms).

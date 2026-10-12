@@ -12,6 +12,7 @@ use crate::cache::{self, CacheUse, DetectionSource};
 use crate::detect::{self, Detection, ScanDepth, ScanSettings};
 use crate::library;
 use crate::scan::UndecodedFrames;
+use crate::scene_name::SceneNames;
 
 #[derive(Debug)]
 pub struct FailedScan {
@@ -107,14 +108,16 @@ impl fmt::Display for VideoDone<'_> {
 /// Scans the video at `path`, or every video directly inside that folder,
 /// and tells `on_video_done` about each one as it finishes. One video
 /// failing does not stop the rest. Fails outright only when the path itself
-/// cannot be read.
+/// cannot be read. In a folder, files that `scene_names` take for the scenes
+/// of an earlier split are left out.
 pub fn scan_ahead(
     path: &Path,
+    scene_names: SceneNames,
     settings: &ScanSettings,
     depth: ScanDepth,
     mut on_video_done: impl FnMut(&VideoDone),
 ) -> Result<ScanAheadSummary> {
-    let videos = library::videos_at(path)?;
+    let videos = library::videos_at(path, scene_names)?;
     let mut summary = ScanAheadSummary::default();
 
     for (position, video) in videos.iter().enumerate() {
@@ -243,6 +246,7 @@ mod tests {
         let settings = ScanSettings::default();
         let result = scan_ahead(
             Path::new("no/such/folder"),
+            SceneNames::from(crate::scene_name::SceneNamePattern::default()),
             &settings,
             ScanDepth::BlackScreens,
             |_video_done| {},

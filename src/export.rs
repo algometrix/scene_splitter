@@ -12,7 +12,7 @@ use crate::exact_verify::ExactCutProof;
 use crate::fates::ScenesToWrite;
 use crate::library::VIDEO_EXTENSIONS;
 use crate::scene_list::{SceneList, SceneListFormat};
-use crate::scene_name::SceneNamePattern;
+use crate::scene_name::{SceneNamePattern, SceneNames};
 use crate::split::{self, SceneLocation, SceneOutcome};
 use crate::timecode::format_timestamp;
 use crate::verify::{self, SceneToVerify};
@@ -431,17 +431,20 @@ fn counted_pictures(count: usize) -> String {
 
 /// Splits the video the way `order` says, and checks the scenes.
 ///
-/// Scene files are named by `scene_name`. The scenes that are written are
-/// numbered from one without gaps, whichever scenes were dropped.
+/// Scene files are named by the pattern `scene_names` have in use, and the
+/// scene files of earlier splits are found by every naming they know. The
+/// scenes that are written are numbered from one without gaps, whichever
+/// scenes were dropped.
 pub fn export_scenes(
     video: &Path,
     order: &SplitOrder,
     out_dir: &Path,
-    scene_name: SceneNamePattern,
+    scene_names: impl Into<SceneNames>,
 ) -> Result<ExportReport> {
+    let scene_names = scene_names.into();
     match order.cut_precision {
-        CutPrecision::NearestKeyframe => export_copied_scenes(video, order, out_dir, scene_name),
-        CutPrecision::ExactFrame => export_exact_scenes(video, order, out_dir, scene_name),
+        CutPrecision::NearestKeyframe => export_copied_scenes(video, order, out_dir, scene_names),
+        CutPrecision::ExactFrame => export_exact_scenes(video, order, out_dir, scene_names),
     }
 }
 
@@ -454,9 +457,9 @@ fn export_exact_scenes(
     video: &Path,
     order: &SplitOrder,
     out_dir: &Path,
-    scene_name: SceneNamePattern,
+    scene_names: SceneNames,
 ) -> Result<ExportReport> {
-    let split = exact_split::split_on_exact_frames(video, order.scenes(), out_dir, scene_name)?;
+    let split = exact_split::split_on_exact_frames(video, order.scenes(), out_dir, scene_names)?;
     let verification = Verification::PassedForExactCut(split.proof);
     let original = match decide_about_original(order.original, &verification) {
         OriginalDecision::AlwaysKeep(why) => OriginalOutcome::AlwaysKept(why),
@@ -481,13 +484,13 @@ fn export_copied_scenes(
     video: &Path,
     order: &SplitOrder,
     out_dir: &Path,
-    scene_name: SceneNamePattern,
+    scene_names: SceneNames,
 ) -> Result<ExportReport> {
     let outcomes = split::split_scenes(
         video,
         order.scenes(),
         out_dir,
-        scene_name,
+        scene_names,
         verify::record_dropped_scene,
     )?;
     let scene_files = split::written_files(&outcomes);

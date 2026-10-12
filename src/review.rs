@@ -31,6 +31,7 @@ use crate::review_session::{
 };
 use crate::scan::UndecodedFrames;
 use crate::scene_list::SceneListFormat;
+use crate::scene_name::EarlierNaming;
 use crate::selection::ClickKind;
 use crate::settings::{Settings, SettingsChange};
 use crate::settings_controls;
@@ -223,6 +224,13 @@ const TAKE_APART_LABEL: &str = "Take merged scenes apart";
 const TAKE_APART_HINT: &str = "Takes the selected merged scenes apart (U).";
 const TAKE_APART_HERE_HINT: &str = "Takes the merged scene apart at this point.";
 const REPLACE_EARLIER_FILES_LABEL: &str = "Replace them";
+/// What the warning says of an earlier split whose files are named as
+/// scenes are named now, after their number and before their names.
+const EARLIER_FILES_WOULD_BE_REPLACED: &str = "from an earlier split would be replaced";
+/// The same for an earlier split named another way. The name of the Recycle
+/// Bin or Trash follows.
+const EARLIER_FILES_NAMED_ANOTHER_WAY: &str =
+    "from an earlier split, named another way, would be moved to the";
 /// How many earlier scene files, or splits, a warning names before it says
 /// how many more there are. The hover names the rest.
 const MOST_NAMED_IN_A_WARNING: usize = 3;
@@ -1927,14 +1935,31 @@ fn first_of(named: &[String], most: usize) -> String {
     }
 }
 
-/// Which scene files a split would replace, by name, so that a file that
-/// only looks like a scene of this video is seen before it is gone.
+/// Which scene files a split would replace or remove, by name, so that a
+/// file that only looks like a scene of this video is seen before it is
+/// gone. Each earlier split gets a sentence of its own, and one whose files
+/// are named another way than scenes are named now is said to be so: the
+/// new split writes over none of those, and all of them go.
 fn earlier_files_warning(earlier_files: &EarlierSceneFiles) -> String {
-    format!(
-        "{} from an earlier split would be replaced: {}.",
-        counted(earlier_files.file_count(), "scene file"),
-        first_of(&earlier_files.file_names, MOST_NAMED_IN_A_WARNING)
-    )
+    let sentences: Vec<String> = earlier_files
+        .splits
+        .iter()
+        .map(|split| {
+            let file_names = split.file_names();
+            let what_happens = match split.naming() {
+                EarlierNaming::AsScenesAreNamedNow => EARLIER_FILES_WOULD_BE_REPLACED.to_owned(),
+                EarlierNaming::AnotherWay => {
+                    format!("{EARLIER_FILES_NAMED_ANOTHER_WAY} {TRASH_NAME}")
+                }
+            };
+            format!(
+                "{} {what_happens}: {}.",
+                counted(file_names.len(), "scene file"),
+                first_of(&file_names, MOST_NAMED_IN_A_WARNING)
+            )
+        })
+        .collect();
+    sentences.join(" ")
 }
 
 /// Every file of the warning, one to a line, and where they are.
@@ -1942,10 +1967,9 @@ fn earlier_files_hover(earlier_files: &EarlierSceneFiles) -> String {
     let mut lines = vec![format!("In {}:", earlier_files.scene_dir.display())];
     lines.extend(
         earlier_files
-            .file_names
-            .iter()
-            .take(MOST_NAMED_IN_A_HOVER)
-            .cloned(),
+            .file_names()
+            .into_iter()
+            .take(MOST_NAMED_IN_A_HOVER),
     );
     let more = earlier_files
         .file_count()
@@ -3695,35 +3719,74 @@ mod tests {
 
     #[test]
     fn the_warning_about_earlier_scene_files_names_them() {
-        let two = EarlierSceneFiles {
+        let found = |file_names: &[&str]| EarlierSceneFiles {
             scene_dir: PathBuf::from("videos"),
-            file_names: vec!["Rocky 001.mp4".to_owned(), "Rocky 002.mp4".to_owned()],
+            splits: crate::scene_name::earlier_splits_for_test("Rocky.mp4", file_names),
         };
+        let two = found(&["Rocky_scene_1_of_2.mp4", "Rocky_scene_2_of_2.mp4"]);
         assert_eq!(
             earlier_files_warning(&two),
             "2 scene files from an earlier split would be replaced: \
-             Rocky 001.mp4, Rocky 002.mp4."
+             Rocky_scene_1_of_2.mp4, Rocky_scene_2_of_2.mp4."
         );
-        let one = EarlierSceneFiles {
-            scene_dir: PathBuf::from("videos"),
-            file_names: vec!["Rocky 2.mp4".to_owned()],
-        };
+        let one = found(&["Rocky_scene_3_of_4.mp4"]);
         assert_eq!(
             earlier_files_warning(&one),
-            "1 scene file from an earlier split would be replaced: Rocky 2.mp4."
+            "1 scene file from an earlier split would be replaced: Rocky_scene_3_of_4.mp4."
         );
 
         let many = EarlierSceneFiles {
             scene_dir: PathBuf::from("videos"),
-            file_names: EarlierSceneFiles::numbered_names(12),
+            splits: EarlierSceneFiles::a_split_into(12),
         };
         let warning = earlier_files_warning(&many);
-        assert!(warning.ends_with("no_such_video_scene_003.mp4 and 9 more."));
+        assert!(
+            warning.ends_with("no_such_video_scene_03_of_12.mp4 and 9 more."),
+            "{warning}"
+        );
         // The hover names every one of them, and the folder.
         let hover = earlier_files_hover(&many);
         assert!(hover.starts_with("In videos:"), "{hover}");
-        assert!(hover.contains("no_such_video_scene_012.mp4"), "{hover}");
+        assert!(
+            hover.contains("no_such_video_scene_12_of_12.mp4"),
+            "{hover}"
+        );
         assert!(hover.contains(TRASH_NAME), "{hover}");
+    }
+
+    #[test]
+    fn the_warning_says_which_earlier_scene_files_are_named_another_way() {
+        let found = |file_names: &[&str]| EarlierSceneFiles {
+            scene_dir: PathBuf::from("videos"),
+            splits: crate::scene_name::earlier_splits_for_test("Rocky.mp4", file_names),
+        };
+        let from_before = found(&[
+            "Rocky_scene_001.mp4",
+            "Rocky_scene_002.mp4",
+            "Rocky_scene_003.mp4",
+            "Rocky_scene_004.mp4",
+            "Rocky_scene_005.mp4",
+        ]);
+        assert_eq!(
+            earlier_files_warning(&from_before),
+            format!(
+                "5 scene files from an earlier split, named another way, would be \
+                 moved to the {TRASH_NAME}: Rocky_scene_001.mp4, Rocky_scene_002.mp4, \
+                 Rocky_scene_003.mp4 and 2 more."
+            )
+        );
+
+        // Two earlier splits are told apart, the one named as now first.
+        let two_splits = found(&["Rocky_scene_001.mp4", "Rocky_scene_1_of_2.mp4"]);
+        assert_eq!(two_splits.file_count(), 2);
+        assert_eq!(
+            earlier_files_warning(&two_splits),
+            format!(
+                "1 scene file from an earlier split would be replaced: Rocky_scene_1_of_2.mp4. \
+                 1 scene file from an earlier split, named another way, would be \
+                 moved to the {TRASH_NAME}: Rocky_scene_001.mp4."
+            )
+        );
     }
 
     #[test]
