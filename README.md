@@ -51,6 +51,9 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 - **Hard cuts.** An optional slower scan finds scene changes that have no black screen.
 - **Review before writing.** Merge scenes by dragging, add a split by time, move a split to the next point where the video can be cut, move a part back out of a merged scene, undo, or reset.
 - **Review without the mouse.** Every step of a review has a key, and the window lists them.
+- **Drop scenes.** Mark adverts or credits as not to be written. The split leaves them out, numbers the other files without gaps, and always keeps the original.
+- **Your own file names.** Choose how scene files are named, with placeholders such as `{name}` and `{number}`.
+- **Scene list without splitting.** Save the scenes with their times as a table (CSV), as chapter marks for ffmpeg, or as an edit list (EDL).
 - **Built-in player.** Click a preview picture to play from there, step frame by frame with the mouse wheel, and split the scene at the current position.
 - **Verified before the original is removed.** After a split, the app checks every packet of the scene files against the original. Only then does it move the original to the Recycle Bin or Trash.
 - **Scan ahead.** Scan a whole folder from the command line, and review the results in the window later.
@@ -96,9 +99,12 @@ You can also run it through Cargo: `cargo run --release -- <arguments>`.
    - A merged scene with more than 6 parts shows its first two and last two. "Show all N parts" shows the rest, and "Show fewer parts" hides them again. The app remembers this for each scene while the review is open.
    - "Add a split at" takes a time such as `1:03:12`. The split lands on the nearest point where the video can be cut (a keyframe).
    - "Move split earlier" and "Move split later", at the two ends of the row between two cards, move the split between those scenes to the next point where the video can be cut. The line under the toolbar says the old and the new time. A split does not move onto or past the split beside it, into the parts of a merged scene, or to the ends of the video. The app says which of these stopped it.
-   - Undo takes back the last change, a moved split included. "Reset scenes" returns to the scenes as found, and puts moved splits back.
+   - "Drop this scene" on a card marks the scene as not to be written, for adverts or credits. X does the same for the selected scenes, and X again keeps them. A dropped scene turns grey, its card says "Dropped, not written" and offers "Keep this scene", and its timeline block is an empty outline with the word "dropped". The other cards then say which file they become ("File 2 of 3"), because files are numbered without the dropped scenes. Merging a dropped scene with a kept one keeps the whole merged scene. Merging dropped scenes with each other leaves the result dropped. The app refuses to drop every scene.
+   - Undo takes back the last change, a moved split or a dropped scene included. "Reset scenes" returns to the scenes as found, with moved splits back in place and every scene written.
 5. If the video has scene changes with no black screen, press "Scenes missed?" under the toolbar. Choose how much to detect (only obvious changes, most changes, or even subtle changes) and the shortest scene to allow, then press "Look for sudden picture changes". This scan looks at every picture and is much slower.
 6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
+
+   While any scene is dropped, the button reads "Split into 3 files, 1 scene dropped", and the choice about the original gives way to a sentence: the original stays where it is. A split with dropped scenes never moves the original, whatever is set, because the new files do not hold all of it. The app does not change your saved choice, and does not ask the one-time question for such a split.
 7. When the split is done, the app shows whether the check passed and what happened to the original. "Open folder" shows the scene files.
 
 When something goes wrong, the app says so in plain words and shows the technical reason under it. You can select that text, and "Copy details" puts all of it on the clipboard.
@@ -111,7 +117,17 @@ The window can be made as small as 900 by 600. Below the name and the toolbar, e
 
 On a high-resolution screen the preview pictures and the player's picture are decoded larger, so they stay sharp.
 
-Scene files are named `<video name>_scene_001`, `_scene_002` and so on, with the extension of the original.
+Scene files are named `<video name>_scene_001`, `_scene_002` and so on, with the extension of the original, unless you choose another name (see [Scene file names](#scene-file-names)).
+
+"Save the scene list", on the line under the toolbar, saves the scenes without splitting anything. Pick a format, then say where to save:
+
+| Format | What it holds |
+| --- | --- |
+| Table for a spreadsheet (CSV) | One row per scene: its number, start, end, length, and the name its file would get. |
+| Chapter marks for ffmpeg | An `;FFMETADATA1` file with one `[CHAPTER]` per scene. Add it to a video with `ffmpeg -i video.mp4 -i chapters.txt -map_metadata 1 -codec copy out.mp4`. |
+| Edit list for an editing program (EDL) | A CMX3600 list with one cut per scene, in timecodes at the video's frame rate, counted without drop frames. It holds at most 999 scenes. |
+
+Every format lists the scenes the split would write, numbered as their files are. Dropped scenes are left out. Times are those of the original video. In the edit list, the record side puts the kept scenes one after another. The app never writes a scene list over a video.
 
 "Scan again" ignores the stored scan of the video and looks for black screens afresh. What an earlier look for sudden picture changes found in the same file is kept.
 
@@ -133,6 +149,7 @@ On macOS, use Cmd where this page says Ctrl.
 | U | Take a merged scene apart again (the selected scenes or, with none selected, the scene with the frame) |
 | Alt+Left, Alt+Right | Move the split at the start of the scene to the point before or after it where the video can be cut |
 | Ctrl+Enter | Split into files. The same questions are asked as after the button |
+| X | Drop the selected scenes, or keep them again if all of them are dropped |
 | Ctrl+O | Add videos |
 | Ctrl+A | Select every scene |
 | Ctrl+Z | Undo the last change |
@@ -178,7 +195,10 @@ Splitting from the command line always scans the video afresh. Only the window a
 | Option | Meaning |
 | --- | --- |
 | `--out-dir <folder>` | Where to write the scene files. The default is the saved setting: the video's own folder, unless you changed it. |
-| `--overwrite` | Replace scene files left in the output folder by an earlier run. Without it, the split stops if such files exist. |
+| `--overwrite` | Replace scene files left in the output folder by an earlier run. Without it, the split stops if such files exist. Also lets `--save-list` replace a file. |
+| `--scene-name <pattern>` | How to name the scene files, whatever the saved setting says. See [Scene file names](#scene-file-names). |
+| `--save-list <file>` | Write the list of scenes to this file: their numbers, times and the names their files get. With `--list-only` it writes the list and no scene files. |
+| `--list-format <csv, chapters or edl>` | The format of the scene list. Left out, it follows the file's ending: `.csv`, `.txt` (or `.ffmetadata`) for chapters, `.edl`. |
 | `--keep-original` | Keep the original video, whatever the saved setting says. |
 | `--hard-cuts` | Also look for hard cuts (scene changes with no black screen). This decodes every frame and is much slower. It uses the saved sensitivity and shortest scene. |
 | `--scan suspicious` | Decode only where packet sizes hint at a black screen. |
@@ -194,12 +214,22 @@ A command line split exits with an error code when the scenes could not be verif
 
 Which options work together:
 
-- `--scan-only` cannot be combined with `--review`, `--list-only`, `--out-dir`, `--overwrite` or `--keep-original`.
-- `--review` cannot be combined with `--list-only`, `--out-dir`, `--overwrite` or `--keep-original`.
+- `--scan-only` cannot be combined with `--review`, `--list-only`, `--out-dir`, `--overwrite`, `--keep-original`, `--scene-name` or `--save-list`.
+- `--review` cannot be combined with `--list-only`, `--out-dir`, `--overwrite`, `--keep-original`, `--scene-name` or `--save-list`.
 - `--list-only` cannot be combined with `--keep-original`.
 - `--hard-cuts` works with every command. With `--review` or a folder, the window opens with the hard-cut scan already chosen for the queued videos.
-- The detection options (`--scan`, `--min-black`, `--max-luma`, `--black-fraction`) and `--keep-original` apply to a command line run. The app refuses them when the command opens the window, where the Settings section does that job.
-- A folder without `--scan-only` opens the window. The app refuses `--list-only`, `--out-dir` and `--overwrite` with a folder, since they work on a single video.
+- The detection options (`--scan`, `--min-black`, `--max-luma`, `--black-fraction`), `--keep-original` and `--scene-name` apply to a command line run. The app refuses them when the command opens the window, where the Settings section does that job.
+- A folder without `--scan-only` opens the window. The app refuses `--list-only`, `--out-dir`, `--overwrite` and `--save-list` with a folder, since they work on a single video.
+- `--list-format` needs `--save-list`.
+
+To save the scenes of a video without splitting it:
+
+```
+scene_splitter film.mp4 --list-only --save-list film.csv
+scene_splitter film.mp4 --list-only --hard-cuts --save-list chapters.txt
+```
+
+The command line has no review, so it cannot drop scenes. Do that in the window.
 
 ### Scanning ahead of time
 
@@ -220,6 +250,7 @@ The Settings section is at the bottom of the left panel. It holds:
 
 - Whether the original is moved to the Recycle Bin or Trash after the check.
 - Whether scenes are written beside the video or in a new `<video name>_scenes` folder next to it.
+- "Name scene files": how scene files are named. See [Scene file names](#scene-file-names).
 - Whether the tips are shown on the review screen.
 - For missed scenes: how much to detect, and the shortest scene to allow.
 - Under "Advanced: what counts as a black screen": the shortest black screen, how dark counts as black, how much of the picture must be black, and "Check every picture", the slow scan for grainy black screens.
@@ -234,6 +265,26 @@ Command line options override the saved settings for that run and are never save
 If the settings file cannot be read, the app says so, uses the defaults, and keeps originals until you save settings again. It does not fall back to recycling them.
 
 The review screen shows a short "How to use this screen" card. "Hide tips" removes it, and the Settings section brings it back.
+
+### Scene file names
+
+"Name scene files" in Settings, and `--scene-name` on the command line, take a pattern. The default, `{name}_scene_{number}`, gives the names the app has always written. The extension of the video is added to it.
+
+| Placeholder | Stands for |
+| --- | --- |
+| `{name}` | The video's name without its extension. |
+| `{number}` | The scene's number, from 1, with leading zeros: at least three digits, and as many as the number of scenes has. |
+| `{count}` | How many scene files the split writes. |
+| `{start}` | Where the scene starts in the video, as `00h03m12s`. |
+| `{length}` | How long the scene is, in the same form. |
+
+For example, `{name} part {number} of {count}` names the second of twelve scenes of `My video.mp4` as `My video part 002 of 12.mp4`. Under the box, the window shows an example of the name as you type, or says what is wrong with the pattern. A pattern that cannot be used changes nothing: the last good one stays in use.
+
+A pattern must contain `{number}`, or every scene would get the same name, and `{name}`, or the scenes of two videos in one folder would replace each other. It cannot contain `/`, `\`, `<`, `>`, `:`, `"`, `|`, `?`, `*`, a line break or a tab, start with a space, end with a space or a dot, start with a name Windows keeps for itself (such as `CON` or `LPT1`), or be longer than 100 bytes, which is 100 plain letters and fewer with accents.
+
+Scenes that are written are numbered from 1 without gaps, also when scenes are dropped. `{count}` counts the files, not the scenes.
+
+The check for scene files left by an earlier split uses the pattern in use now. Files written under another pattern are not counted, not replaced and not removed.
 
 ## ffmpeg
 
@@ -289,6 +340,8 @@ Inside each, the app uses a `scene_splitter` folder:
 
 Only when all three pass does the original go to the Recycle Bin (the Trash on macOS and Linux). If verification or the move fails, the original stays where it is and the report says why. Recycling is the default. Turn it off with `--keep-original`, on the review screen, or in the settings.
 
+**Dropped scenes.** ffmpeg cuts the whole video in one pass, so a split with dropped scenes first writes every scene into the `unfinished_` folder, the dropped ones too. It notes the size and checksum of every packet of each dropped scene, moves only the kept scenes to their names, and removes the rest with the folder. The check then joins, in scene order, the packets read back from the kept files and the packets noted for the dropped scenes, and compares the result with the original. It passes only when every kept file holds exactly the packets of its own stretch of the original. Such a split needs as much free room while it runs as a split of every scene. The original is always kept after it.
+
 **Cache.** The app stores each scan as a JSON file in the scan cache. It reuses a stored scan only when the video's path, size, modified time and the detection settings all match. The stored hard-cut data lets you change sensitivity and shortest scene later without another slow scan. If the system clears the temp folder, the only cost is a rescan.
 
 ## Platforms
@@ -307,6 +360,8 @@ What differs between systems:
 - The hard-cut scan finds shot changes, not story scenes. Expect to merge its results by hand.
 - Audio and video sync in the player is loose. The player is for finding scene boundaries, not for watching.
 - Scene files contain the first video stream and the audio streams. Other streams, such as subtitles or cover art, are not copied. An original that holds such streams fails verification on purpose, so it is never recycled.
+- A folder you add leaves out scene files from an earlier split only if they have the default name (`<video name>_scene_001`). With another name pattern, scene files in that folder are queued like any other video.
+- The player does not show which scenes are dropped. The review screen does.
 - The window has been run by hand on Windows only. See [Platforms](#platforms).
 
 ## Running the tests

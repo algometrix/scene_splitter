@@ -7,7 +7,7 @@ use crate::timecode::TimeSpan;
 /// The times at which one video is cut: in ascending order, each time once,
 /// and each strictly inside the video. Whatever writes scene files takes
 /// this, so a cut outside the video cannot reach it.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CutTimes {
     whole_video: TimeSpan,
     times: Vec<f64>,

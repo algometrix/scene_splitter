@@ -1,6 +1,7 @@
 //! The choices a person makes once and expects the app to remember: how
-//! black screens are detected, how hard cuts are thinned, and where scenes
-//! go. The window and the command line read the same file.
+//! black screens are detected, how hard cuts are thinned, where scenes go
+//! and what their files are called. The window and the command line read
+//! the same file.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -203,6 +204,7 @@ mod tests {
     use super::*;
     use crate::detect::ScanMode;
     use crate::hardcut::Sensitivity;
+    use crate::scene_name::SceneNamePattern;
     use crate::split::SceneLocation;
 
     /// A settings file of its own for one test, removed when the test ends.
@@ -233,6 +235,7 @@ mod tests {
         settings.scan.criteria.min_seconds = 0.5;
         settings.export.scene_location = SceneLocation::NewFolder;
         settings.export.original_policy = OriginalPolicy::Keep;
+        settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
         settings.hard_cuts.sensitivity = Sensitivity::High;
         settings.hard_cuts.min_scene_seconds = 300.0;
         settings.show_tips = false;
@@ -287,6 +290,39 @@ mod tests {
         assert_eq!(loaded.recycling_question, RecyclingQuestion::NotAskedYet);
         assert!(loaded.must_ask_before_recycling());
         assert!(!loaded.show_tips);
+    }
+
+    #[test]
+    fn a_file_from_before_scene_names_could_be_chosen_keeps_the_names_it_had() {
+        let file = SettingsFile::for_test("before_scene_names");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file.0,
+            r#"{ "export": { "scene_location": "NewFolder", "original_policy": "Keep" } }"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.export.scene_name, SceneNamePattern::default());
+        assert_eq!(loaded.export.scene_name.as_str(), "{name}_scene_{number}");
+    }
+
+    #[test]
+    fn a_saved_scene_name_that_would_leave_the_folder_is_an_error() {
+        let file = SettingsFile::for_test("scene_name_with_folder");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file.0,
+            r#"{ "export": { "scene_name": "../{name}_{number}" } }"#,
+        )
+        .unwrap();
+        assert!(Settings::load_from(&file.0).is_err());
+    }
+
+    #[test]
+    fn restoring_the_defaults_brings_back_the_usual_scene_names() {
+        let restored = changed_settings().restored_to_defaults();
+        assert_eq!(restored.export.scene_name, SceneNamePattern::default());
     }
 
     #[test]
@@ -358,6 +394,7 @@ mod tests {
         let export = ExportOptions {
             scene_location: SceneLocation::NewFolder,
             original_policy: OriginalPolicy::Keep,
+            scene_name: SceneNamePattern::new("{number} {name}").unwrap(),
         };
         let changed = before.changed_by(SettingsChange::ExportOptions(export));
         assert_eq!(changed, Settings { export, ..before });

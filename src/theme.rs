@@ -38,6 +38,12 @@ pub const TEXT: Color32 = Color32::from_rgb(0x1F, 0x23, 0x37);
 /// here (at least 5 to 1 against each).
 pub const MUTED_TEXT: Color32 = Color32::from_rgb(0x5B, 0x61, 0x78);
 
+/// A scene that will not be written has no colour of its own: its badge and
+/// outline are this grey, which is dark enough for white text on it.
+pub const DROPPED: Color32 = MUTED_TEXT;
+/// The card and the timeline block of a scene that will not be written.
+pub const DROPPED_FILL: Color32 = Color32::from_rgb(0xE7, 0xE9, 0xF2);
+
 /// Backgrounds of the tiles that show the key numbers.
 pub const MINT_TILE: Color32 = Color32::from_rgb(0xE3, 0xF8, 0xF3);
 pub const LAVENDER_TILE: Color32 = PRIMARY_TINT;
@@ -465,7 +471,7 @@ mod tests {
 
     #[test]
     fn white_text_can_be_read_on_every_scene_colour() {
-        for color in SCENE_COLORS.into_iter().chain([PRIMARY, DANGER]) {
+        for color in SCENE_COLORS.into_iter().chain([PRIMARY, DANGER, DROPPED]) {
             assert!(contrast(Color32::WHITE, color) >= READABLE, "{color:?}");
         }
     }
@@ -480,6 +486,7 @@ mod tests {
             PEACH_TILE,
             ROSE_TILE,
             LAVENDER_TILE,
+            DROPPED_FILL,
         ];
         for background in backgrounds {
             assert!(

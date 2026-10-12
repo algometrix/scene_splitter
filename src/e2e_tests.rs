@@ -9,16 +9,18 @@ use std::sync::Mutex;
 
 use crate::black::BlackCriteria;
 use crate::detect::{self, Detection, ScanDepth, ScanMode, ScanProgress, ScanSettings, ScanStage};
-use crate::export::{self, OriginalOutcome, OriginalPolicy, Verification};
+use crate::export::{self, OriginalOutcome, OriginalPolicy, SplitOrder, Verification};
+use crate::fates::{SceneFate, ScenesToWrite};
 use crate::ffmpeg::FfmpegError;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::probe;
+use crate::scene_name::SceneNamePattern;
 use crate::scenes::CutTimes;
-use crate::split;
+use crate::split::{self, SceneOutcome};
 use crate::test_videos::{TestVideo, BLACK_SECONDS, FRAME_RATE, FRAME_SECONDS, SCENE_SECONDS};
 use crate::thumbnails::{self, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH};
 use crate::timecode::TimeSpan;
-use crate::verify;
+use crate::verify::{self, SceneToVerify};
 
 const BYTES_PER_RGB_PIXEL: usize = 3;
 /// Where the black screen of the test video begins and ends.
@@ -269,11 +271,15 @@ fn splitting_writes_one_file_per_scene_and_they_pass_verification() {
     let video = TestVideo::two_scenes_with_a_black_screen("split");
     let detection = scan(&video, ScanMode::EveryFrame, ScanDepth::BlackScreens);
 
+    let order = SplitOrder::new(
+        ScenesToWrite::every_scene(detected_cuts(&detection)),
+        OriginalPolicy::Keep,
+    );
     let report = export::export_scenes(
         &video.path,
-        &detected_cuts(&detection),
+        &order,
         video.folder(),
-        OriginalPolicy::Keep,
+        SceneNamePattern::default(),
     )
     .unwrap();
 
@@ -347,7 +353,12 @@ fn splitting_again_into_fewer_scenes_leaves_no_old_files_behind() {
     let scene_files =
         split::split_at_keyframes(&video.path, &cuts_at(&[BLACK_START]), video.folder()).unwrap();
 
-    let found = split::scene_files_from_earlier_splits(&video.path, video.folder()).unwrap();
+    let found = split::scene_files_from_earlier_splits(
+        &video.path,
+        video.folder(),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
     assert_eq!(found, scene_files);
     assert!(verify::verify_scenes(&video.path, &scene_files).is_ok());
 }
@@ -398,13 +409,171 @@ fn a_split_that_fails_leaves_the_scenes_of_an_earlier_split_as_they_were() {
         "{error:#}"
     );
 
-    let scenes_now = split::scene_files_from_earlier_splits(&video.path, video.folder()).unwrap();
+    let scenes_now = split::scene_files_from_earlier_splits(
+        &video.path,
+        video.folder(),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
     assert_eq!(scenes_now, earlier_scenes);
     for (scene, bytes) in earlier_scenes.iter().zip(&earlier_bytes) {
         assert_eq!(&std::fs::read(scene).unwrap(), bytes, "{}", scene.display());
     }
     // Nothing half-written stays behind, in a folder or otherwise.
     assert_no_folder_is_left_in(video.folder());
+}
+
+/// The test video cut into its first scene, its black screen and its second
+/// scene, with the black screen dropped.
+fn without_the_black_screen() -> ScenesToWrite {
+    let fates = vec![SceneFate::Keep, SceneFate::Drop, SceneFate::Keep];
+    ScenesToWrite::new(cuts_at(&[BLACK_START, BLACK_END]), fates).unwrap()
+}
+
+/// Splits the video without its black screen, and returns every scene the
+/// way the check takes it.
+fn split_without_the_black_screen(video: &TestVideo) -> Vec<SceneToVerify> {
+    split::split_scenes(
+        &video.path,
+        &without_the_black_screen(),
+        video.folder(),
+        SceneNamePattern::default(),
+        verify::record_dropped_scene,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|outcome| match outcome {
+        SceneOutcome::Written(scene_file) => SceneToVerify::InFile(scene_file),
+        SceneOutcome::Dropped(packets) => SceneToVerify::Dropped(packets),
+    })
+    .collect()
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_split_with_a_dropped_scene_writes_the_others_and_always_keeps_the_original() {
+    let video = TestVideo::two_scenes_with_a_black_screen("dropped_scene");
+    // The person chose to have originals moved to the Recycle Bin or Trash.
+    let order = SplitOrder::new(
+        without_the_black_screen(),
+        OriginalPolicy::RecycleOnceVerified,
+    );
+
+    let report = export::export_scenes(
+        &video.path,
+        &order,
+        video.folder(),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+
+    // The kept scenes are numbered without a gap where the dropped one was.
+    assert_eq!(
+        report.scene_files,
+        vec![
+            video.folder().join("video_scene_001.mp4"),
+            video.folder().join("video_scene_002.mp4"),
+        ]
+    );
+    assert_eq!(report.dropped_scenes, 1);
+    assert!(
+        matches!(report.verification, Verification::Passed),
+        "{:?}",
+        report.verification
+    );
+    assert!(matches!(
+        report.original,
+        OriginalOutcome::KeptBecauseScenesDropped
+    ));
+    assert!(video.path.is_file());
+    assert!(report.is_clean());
+
+    // Neither file holds the black screen.
+    for scene in &report.scene_files {
+        let length = probe::read_packet_index(scene).unwrap().video.seconds();
+        assert_close(length, SCENE_SECONDS);
+    }
+    // The dropped scene is gone with the folder it was written into.
+    assert_no_folder_is_left_in(video.folder());
+    let files_left = std::fs::read_dir(video.folder()).unwrap().count();
+    assert_eq!(files_left, 3);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn kept_scenes_pass_the_check_only_as_the_right_parts_in_the_right_order() {
+    let video = TestVideo::two_scenes_with_a_black_screen("dropped_verify");
+    let mut scenes = split_without_the_black_screen(&video);
+    verify::verify_scenes_with_dropped(&video.path, &scenes).unwrap();
+
+    // The two scene files change places around the dropped scene.
+    scenes.swap(0, 2);
+    assert!(verify::verify_scenes_with_dropped(&video.path, &scenes).is_err());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn the_check_fails_when_a_kept_scene_of_a_split_with_dropped_scenes_is_cut_short() {
+    let video = TestVideo::two_scenes_with_a_black_screen("dropped_cut_short");
+    let scenes = split_without_the_black_screen(&video);
+
+    let SceneToVerify::InFile(last_scene) = &scenes[2] else {
+        panic!("the last scene was kept, so it is in a file");
+    };
+    let bytes = std::fs::read(last_scene).unwrap();
+    std::fs::write(last_scene, &bytes[..bytes.len() / 2]).unwrap();
+
+    assert!(verify::verify_scenes_with_dropped(&video.path, &scenes).is_err());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn the_kept_scenes_alone_do_not_pass_for_the_whole_video() {
+    let video = TestVideo::two_scenes_with_a_black_screen("dropped_not_whole");
+    let kept_files: Vec<PathBuf> = split_without_the_black_screen(&video)
+        .into_iter()
+        .filter_map(|scene| match scene {
+            SceneToVerify::InFile(scene_file) => Some(scene_file),
+            SceneToVerify::Dropped(_) => None,
+        })
+        .collect();
+
+    // The check that guards an original before it is recycled.
+    let error = verify::verify_scenes(&video.path, &kept_files).unwrap_err();
+    assert!(format!("{error:#}").contains("packets"), "{error:#}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn scene_files_take_the_name_chosen_and_are_found_again_under_it() {
+    let video = TestVideo::two_scenes_with_a_black_screen("scene_name");
+    let scene_name = SceneNamePattern::new("{number} of {count} {name} from {start}").unwrap();
+    let order = SplitOrder::new(
+        ScenesToWrite::every_scene(cuts_at(&[BLACK_START])),
+        OriginalPolicy::Keep,
+    );
+
+    let report = export::export_scenes(&video.path, &order, video.folder(), scene_name).unwrap();
+    assert_eq!(
+        report.scene_files,
+        vec![
+            video.folder().join("001 of 2 video from 00h00m00s.mp4"),
+            video.folder().join("002 of 2 video from 00h00m04s.mp4"),
+        ]
+    );
+    assert!(report.is_clean(), "{:?}", report.verification);
+
+    let found =
+        split::scene_files_from_earlier_splits(&video.path, video.folder(), scene_name).unwrap();
+    assert_eq!(found, report.scene_files);
+    // Files named another way are not taken for scenes of this split.
+    let found_by_default_name = split::scene_files_from_earlier_splits(
+        &video.path,
+        video.folder(),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+    assert!(found_by_default_name.is_empty());
 }
 
 /// The folder scenes are written into before they get their names is gone

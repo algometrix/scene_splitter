@@ -18,12 +18,14 @@ use eframe::egui;
 
 use crate::detect::ScanKind;
 use crate::export::{ExportOptions, TRASH_NAME};
+use crate::fates::SceneFate;
 use crate::focus::{self, PicturePosition, PictureStep, SceneStep};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::{CutIndex, NudgeDirection, SceneIndex, SceneLayout, SegmentIndex, SplitPlan};
-use crate::review_session::{counted, ExportObstacle, ReviewRequest, ReviewSession};
+use crate::review_session::{counted, ExportObstacle, ReviewRequest, ReviewSession, SceneListNote};
 use crate::scan::UndecodedFrames;
+use crate::scene_list::SceneListFormat;
 use crate::selection::ClickKind;
 use crate::settings::{Settings, SettingsChange};
 use crate::settings_controls;
@@ -156,6 +158,24 @@ const LOOK_HARDER_EXPLANATION: &str =
      This is much slower than the first scan.";
 const RESCAN_WARNING: &str = "Scanning again removes the merges and splits you made on this video.";
 
+const DROP_SCENE_LABEL: &str = "Drop this scene";
+const DROP_SCENE_HINT: &str = "Leaves this scene out of the split, so no file is written for it. \
+     X does the same for the selected scenes.";
+const KEEP_SCENE_LABEL: &str = "Keep this scene";
+const KEEP_SCENE_HINT: &str =
+    "Writes this scene to a file after all. X does the same for the selected scenes.";
+/// On the card and in the hover text of a scene that is not written.
+const DROPPED_BADGE: &str = "Dropped, not written";
+/// On a timeline block too narrow to name its scene as well.
+const DROPPED_SHORT_LABEL: &str = "Dropped";
+const DROPPED_TILE_CAPTION: &str = "dropped, not written";
+const SAVE_SCENE_LIST_LABEL: &str = "Save the scene list";
+const SAVE_SCENE_LIST_HINT: &str =
+    "Saves the scenes with their times to a file, without splitting the video: \
+     as a table, as chapter marks, or as an edit list.";
+const SAVE_SCENE_LIST_DIALOG_TITLE: &str = "Save the scene list";
+const SCENE_LIST_NOT_SAVED: &str = "The scene list was not saved.";
+
 /// Previews are drawn as wide as the card allows, within these limits.
 const PREVIEWS_PER_ROW: f32 = 4.0;
 const MIN_PREVIEW_WIDTH: f32 = 96.0;
@@ -249,6 +269,61 @@ struct ScenePart<'layout> {
     position_in_scene: usize,
 }
 
+/// What the split does with one scene, as its card says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CardFate {
+    /// Written, and no scene of the video is dropped, so the file has the
+    /// number of the scene and nothing more needs saying.
+    Written,
+    /// Written, as this one of the files. Said once a scene is dropped,
+    /// since from then on files and scenes are numbered differently.
+    WrittenAsFile {
+        number: usize,
+        of: usize,
+    },
+    Dropped,
+}
+
+impl CardFate {
+    fn is_dropped(self) -> bool {
+        self == Self::Dropped
+    }
+}
+
+/// What each scene's card says about its file, in scene order. The scenes
+/// that are written are numbered from one without gaps.
+fn card_fates(fates: &[SceneFate]) -> Vec<CardFate> {
+    let file_count = fates
+        .iter()
+        .filter(|&&fate| fate == SceneFate::Keep)
+        .count();
+    if file_count == fates.len() {
+        return vec![CardFate::Written; fates.len()];
+    }
+    let mut files_before = 0;
+    fates
+        .iter()
+        .map(|fate| match fate {
+            SceneFate::Drop => CardFate::Dropped,
+            SceneFate::Keep => {
+                files_before += 1;
+                CardFate::WrittenAsFile {
+                    number: files_before,
+                    of: file_count,
+                }
+            }
+        })
+        .collect()
+}
+
+/// One scene as its card is drawn.
+#[derive(Clone, Copy)]
+struct SceneCard<'layout> {
+    scene: SceneIndex,
+    layout: &'layout SceneLayout,
+    fate: CardFate,
+}
+
 /// Everything the height of a scene's card depends on. A card that is out of
 /// sight is not laid out, only given the height a card of the same shape had
 /// when it was last drawn.
@@ -259,6 +334,9 @@ struct CardShape {
     rows: usize,
     /// In whole points. Previews wrap onto more rows in a narrower card.
     width: u32,
+    /// A dropped scene and a file number add to the heading, which may
+    /// then wrap onto another row.
+    fate: CardFate,
 }
 
 /// The timeline is one area that takes clicks, whatever the number of scenes.
@@ -308,6 +386,8 @@ struct SceneListInput {
     /// The scene to join with the one after it.
     join_with_next: Option<SceneIndex>,
     split_to_move: Option<SplitToMove>,
+    /// A scene the person wants dropped, or written after all.
+    fate_wanted: Option<(SceneIndex, SceneFate)>,
 }
 
 /// A split the person wants at the next point, earlier or later, where the
@@ -536,7 +616,12 @@ impl ReviewScreen {
         let mut requests = Vec::new();
         requests.extend(show_title_and_main_action(ui, session));
         requests.extend(show_export_obstacle(ui, session));
-        requests.extend(show_export_options(ui, session.video(), settings.export));
+        requests.extend(show_export_options(
+            ui,
+            session.video(),
+            settings.export,
+            session.dropped_count(),
+        ));
         requests.extend(self.show_timeline(ui, session, playhead));
         ui.horizontal_wrapped(|ui| {
             requests.extend(show_merge_controls(ui, session));
@@ -552,7 +637,11 @@ impl ReviewScreen {
                 requests.push(ReviewRequest::ChangeSettings(SettingsChange::ShowTips));
             }
         });
+        if let Some(refusal) = session.drop_refusal() {
+            ui.colored_label(theme::WARNING_TEXT, refusal.to_string());
+        }
         requests.extend(self.show_scan_row(ui, session, settings.hard_cuts));
+        show_scene_list_note(ui, session);
         requests.extend(show_rescan_consent(ui, session));
         requests
     }
@@ -593,6 +682,7 @@ impl ReviewScreen {
             if ui.link(keys_label).on_hover_text(KEYS_LINK_HINT).clicked() {
                 self.toggle_keys_list();
             }
+            requests.extend(show_save_scene_list_menu(ui, session.video()));
         });
         if self.missed_scenes_open {
             requests.extend(show_hard_cut_scan_controls(ui, hard_cuts));
@@ -615,6 +705,7 @@ impl ReviewScreen {
         let plan = session.plan();
         let whole_video = plan.whole_video();
         let layouts = plan.scene_layouts();
+        let fates = plan.scene_fates();
         let size = egui::vec2(ui.available_width(), TIMELINE_HEIGHT);
         let (_, bar) = ui.allocate_space(size);
         let response = ui.interact(bar, timeline_id(), egui::Sense::click());
@@ -625,9 +716,14 @@ impl ReviewScreen {
         );
 
         let painter = ui.painter();
-        for ((scene, layout), &across) in with_scene_indices(&layouts).zip(&blocks) {
+        for (((scene, layout), &across), &fate) in
+            with_scene_indices(&layouts).zip(&blocks).zip(&fates)
+        {
             let block = egui::Rect::from_x_y_ranges(across, bar.y_range());
-            paint_timeline_block(painter, block, scene, layout);
+            match fate {
+                SceneFate::Keep => paint_timeline_block(painter, block, scene, layout),
+                SceneFate::Drop => paint_dropped_timeline_block(painter, block, scene),
+            }
             // A faint line where two detected pieces were merged.
             for &cut_index in &layout.merged_cuts {
                 let cut_x = x_at_time(plan.cut_time(cut_index), whole_video, bar.x_range());
@@ -645,10 +741,11 @@ impl ReviewScreen {
             .hover_pos()
             .and_then(|pointer| scene_at_x(&blocks, pointer.x))?;
         let layout = layouts.get(scene.position())?;
+        let fate = fates.get(scene.position()).copied().unwrap_or_default();
         let clicked = response.clicked();
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text_at_pointer(scene_description(scene, layout));
+            .on_hover_text_at_pointer(scene_description(scene, layout, fate));
         if !clicked {
             return None;
         }
@@ -669,8 +766,14 @@ impl ReviewScreen {
         let heights_last_frame = std::mem::take(&mut self.card_heights);
         let mut input = SceneListInput::default();
         let layouts = session.plan().scene_layouts();
-        for (scene, layout) in with_scene_indices(&layouts) {
-            let shape = self.card_shape(layout, ui.available_width());
+        let fates = card_fates(&session.scene_fates());
+        for ((scene, layout), &fate) in with_scene_indices(&layouts).zip(&fates) {
+            let scene_card = SceneCard {
+                scene,
+                layout,
+                fate,
+            };
+            let shape = self.card_shape(scene_card, ui.available_width());
             // A card far from the part of the list in view is not laid out.
             // It only keeps its room, so the scroll bar and every card after
             // it stay where they are. A card of a shape not drawn before is
@@ -689,7 +792,7 @@ impl ReviewScreen {
                     if let Some(&card_last_frame) = cards_last_frame.get(scene.position()) {
                         self.note_card_input(ui, scene, card_last_frame, &mut input);
                     }
-                    self.show_scene(ui, session, scene, layout, drop_target, &mut input)
+                    self.show_scene(ui, session, scene_card, drop_target, &mut input)
                 }
             };
             self.card_heights.insert(shape, card.height());
@@ -744,12 +847,14 @@ impl ReviewScreen {
         row.asked
     }
 
-    fn card_shape(&self, layout: &SceneLayout, width: f32) -> CardShape {
+    fn card_shape(&self, scene_card: SceneCard, width: f32) -> CardShape {
+        let layout = scene_card.layout;
         CardShape {
             scene_starts: millisecond(layout.span.start),
             scene_ends: millisecond(layout.span.end),
             rows: part_rows(layout.segments.len(), self.parts_view(layout)).len(),
             width: width.round() as u32,
+            fate: scene_card.fate,
         }
     }
 
@@ -811,22 +916,33 @@ impl ReviewScreen {
         &mut self,
         ui: &mut egui::Ui,
         session: &ReviewSession,
-        scene: SceneIndex,
-        layout: &SceneLayout,
+        scene_card: SceneCard,
         drop_target: Option<SceneIndex>,
         input: &mut SceneListInput,
     ) -> egui::Rect {
+        let SceneCard {
+            scene,
+            layout,
+            fate,
+        } = scene_card;
+        // A dropped scene gives up its colour, on its card as on the
+        // timeline, and says in words that it is not written.
+        let (own_color, plain_fill) = if fate.is_dropped() {
+            (theme::DROPPED, theme::DROPPED_FILL)
+        } else {
+            (scene_color(scene.position()), theme::CARD)
+        };
         let (color, fill, outline) = match self.highlight(session, scene, drop_target) {
             Highlight::None => {
-                let color = scene_color(scene.position());
+                let color = own_color;
                 (
                     color,
-                    theme::CARD,
+                    plain_fill,
                     egui::Stroke::new(1.0_f32, theme::CARD_BORDER),
                 )
             }
             Highlight::Selected => {
-                let color = scene_color(scene.position());
+                let color = own_color;
                 (
                     color,
                     tinted_card(color, SELECTED_TINT_STRENGTH),
@@ -855,7 +971,9 @@ impl ReviewScreen {
             .inner_margin(CARD_MARGIN)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                show_scene_heading(ui, scene, layout, color);
+                if let Some(wanted) = show_scene_heading(ui, scene_card, color) {
+                    input.fate_wanted = Some((scene, wanted));
+                }
                 let room_for_previews = if layout.is_merged() {
                     ui.available_width() - MERGED_PART_CONTROLS_WIDTH
                 } else {
@@ -1045,6 +1163,11 @@ impl ReviewScreen {
                 scene: split.scene_after,
                 direction: split.direction,
             }];
+        }
+        match input.fate_wanted {
+            Some((scene, SceneFate::Drop)) => return vec![ReviewRequest::DropScene(scene)],
+            Some((scene, SceneFate::Keep)) => return vec![ReviewRequest::KeepScene(scene)],
+            None => {}
         }
         let mut requests = Vec::new();
         if let Some(scene) = input.clicked_scene {
@@ -1312,6 +1435,31 @@ fn paint_timeline_block(
     }
 }
 
+/// The block of a scene that is not written: an outline with no colour in
+/// it, where every written scene is a block of solid colour, and the word
+/// for it. A block too narrow for the word is struck through instead, so
+/// the difference never rests on colour alone.
+fn paint_dropped_timeline_block(painter: &egui::Painter, block: egui::Rect, scene: SceneIndex) {
+    let outline = egui::Stroke::new(1.0_f32, theme::DROPPED);
+    painter.rect_filled(block, TIMELINE_ROUNDING, theme::DROPPED_FILL);
+    painter.rect_stroke(block, TIMELINE_ROUNDING, outline);
+    if block.width() >= TIMELINE_MIN_LABELLED_WIDTH {
+        let font = theme::semibold_font(TIMELINE_LABEL_FONT_SIZE);
+        let labels = [
+            format!("{} dropped", scene_name(scene)),
+            DROPPED_SHORT_LABEL.to_owned(),
+        ];
+        for label in labels {
+            let text = painter.layout_no_wrap(label, font.clone(), theme::MUTED_TEXT);
+            if label_fits(text.size().x, block.width()) {
+                painter.galley(block.center() - text.size() / 2.0, text, theme::MUTED_TEXT);
+                return;
+            }
+        }
+    }
+    painter.line_segment([block.left_bottom(), block.right_top()], outline);
+}
+
 fn scene_name(scene: SceneIndex) -> String {
     format!("Scene {}", scene.number())
 }
@@ -1511,11 +1659,12 @@ fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<Review
     if !keyboard.lets_screens_use_keys(ctx) {
         return Vec::new();
     }
-    let (merge, select_all, undo) = ctx.input(|input| {
+    let (merge, select_all, undo, drop_or_keep) = ctx.input(|input| {
         (
             input.key_pressed(egui::Key::M),
             input.modifiers.command && input.key_pressed(egui::Key::A),
             input.modifiers.command && input.key_pressed(egui::Key::Z),
+            !input.modifiers.command && input.key_pressed(egui::Key::X),
         )
     });
     // This screen is behind everything else, so it is the last to be
@@ -1526,6 +1675,7 @@ fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<Review
         (clear, ReviewRequest::ClearSelection),
         (undo, ReviewRequest::Undo),
         (merge, ReviewRequest::MergeSelected),
+        (drop_or_keep, ReviewRequest::DropOrKeepSelected),
     ]
     .into_iter()
     .filter(|(pressed, _)| *pressed)
@@ -1542,7 +1692,8 @@ fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Opt
         // the name takes whatever room is left.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let scene_count = session.scene_count();
-            let label = format!("Split into {}", counted(scene_count, "file"));
+            let dropped_count = session.dropped_count();
+            let label = split_button_label(scene_count - dropped_count, dropped_count);
             // One scene is the untouched video, there is nothing to write.
             let export_button = ui
                 .add_enabled(scene_count > 1, theme::primary_button(label))
@@ -1565,6 +1716,27 @@ fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Opt
         });
     });
     request
+}
+
+/// What the split button says: how many files it writes and, when scenes
+/// are dropped, how many scenes it leaves out.
+fn split_button_label(file_count: usize, dropped_count: usize) -> String {
+    let files = format!("Split into {}", counted(file_count, "file"));
+    if dropped_count == 0 {
+        return files;
+    }
+    format!("{files}, {} dropped", counted(dropped_count, "scene"))
+}
+
+/// Said in place of the choice about the original while scenes are dropped,
+/// so the person knows before the split that this one will not move it.
+fn original_kept_note(dropped_count: usize) -> String {
+    let scenes_are = if dropped_count == 1 {
+        "1 scene is".to_owned()
+    } else {
+        format!("{dropped_count} scenes are")
+    };
+    format!("The original stays where it is, because {scenes_are} dropped and would be in no file.")
 }
 
 /// Why the split has not started, with the way past it when there is one.
@@ -1602,25 +1774,36 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
 /// What happens to the original and where the scenes go, right under the
 /// button they belong to. `export_options` are the saved ones. A change is
 /// returned for the app to save.
+///
+/// A split that drops scenes never moves the original, whatever is saved.
+/// So while scenes are dropped the choice about it gives way to a sentence
+/// that says so. The saved choice is left as it is.
 fn show_export_options(
     ui: &mut egui::Ui,
     video: &Path,
     export_options: ExportOptions,
+    dropped_count: usize,
 ) -> Option<ReviewRequest> {
     let mut wanted = export_options;
     ui.horizontal_wrapped(|ui| {
-        let recycle_label = format!(
-            "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
-        );
-        settings_controls::show_original_policy_checkbox(
-            ui,
-            &mut wanted.original_policy,
-            recycle_label,
-        )
-        .on_hover_text(format!(
-            "The check compares the new files with the original. If anything is missing \
-             or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
-        ));
+        if dropped_count > 0 {
+            ui.label(original_kept_note(dropped_count)).on_hover_text(
+                "The check still compares every new file with its part of the original.",
+            );
+        } else {
+            let recycle_label = format!(
+                "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
+            );
+            settings_controls::show_original_policy_checkbox(
+                ui,
+                &mut wanted.original_policy,
+                recycle_label,
+            )
+            .on_hover_text(format!(
+                "The check compares the new files with the original. If anything is missing \
+                 or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
+            ));
+        }
         settings_controls::show_scene_location_checkbox(ui, &mut wanted.scene_location);
         if let Ok(dir) = split::scene_dir(video, wanted.scene_location) {
             let destination = dir.display().to_string();
@@ -1726,6 +1909,82 @@ fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<Re
         ui.label(words);
     }
     requests
+}
+
+/// The quiet way to save the list of scenes without splitting: a link that
+/// opens the three formats, then the system's dialog for where to save.
+fn show_save_scene_list_menu(ui: &mut egui::Ui, video: &Path) -> Option<ReviewRequest> {
+    let mut request = None;
+    let link_color = ui.visuals().hyperlink_color;
+    ui.scope(|ui| {
+        // Drawn without a frame, in the colour of a link and no taller than
+        // its text, to sit level with the links beside it. A full button
+        // for a rare action would look out of place on this line.
+        ui.visuals_mut().button_frame = false;
+        ui.spacing_mut().button_padding = egui::Vec2::ZERO;
+        ui.spacing_mut().interact_size.y = 0.0;
+        let label = egui::RichText::new(SAVE_SCENE_LIST_LABEL).color(link_color);
+        ui.menu_button(label, |ui| {
+            for format in SceneListFormat::ALL {
+                if ui.button(format.label()).clicked() {
+                    request = ask_where_to_save_scene_list(video, format)
+                        .map(|path| ReviewRequest::SaveSceneList { format, path });
+                    ui.close_menu();
+                }
+            }
+        })
+        .response
+        .on_hover_text(SAVE_SCENE_LIST_HINT);
+    });
+    request
+}
+
+/// Opens the system's dialog for saving a file, which also asks before an
+/// existing file is replaced. It blocks until it is closed, which is what a
+/// person expects of it. Returns `None` when they backed out.
+fn ask_where_to_save_scene_list(video: &Path, format: SceneListFormat) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new()
+        .set_title(SAVE_SCENE_LIST_DIALOG_TITLE)
+        .add_filter(format.label(), &[format.extension()])
+        .set_file_name(scene_list_file_name(video, format));
+    if let Some(folder) = video
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+    {
+        dialog = dialog.set_directory(folder);
+    }
+    dialog.save_file()
+}
+
+/// The name offered for a scene list: "<video name> scenes.csv".
+fn scene_list_file_name(video: &Path, format: SceneListFormat) -> String {
+    let video_name = video
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{video_name} scenes.{}", format.extension())
+}
+
+/// How the last saving of the scene list went.
+fn show_scene_list_note(ui: &mut egui::Ui, session: &ReviewSession) {
+    match session.scene_list_note() {
+        None => {}
+        Some(SceneListNote::Saved(path)) => {
+            let saved_to = path.display().to_string();
+            ui.add(
+                egui::Label::new(theme::muted(format!("Saved the scene list to {saved_to}")))
+                    .truncate(),
+            )
+            .on_hover_text(saved_to);
+        }
+        Some(SceneListNote::NotSaved(reason)) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(theme::WARNING_TEXT, SCENE_LIST_NOT_SAVED);
+                ui.add(theme::selectable(theme::caption(reason)));
+                theme::copy_details_button(ui, reason);
+            });
+        }
+    }
 }
 
 /// Asks before a scan throws away the person's edits.
@@ -1834,6 +2093,16 @@ fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
             "longest scene",
             tint,
             value_color,
+        );
+    }
+    let dropped_count = plan.scenes_to_write().dropped_count();
+    if dropped_count > 0 {
+        theme::stat_tile(
+            ui,
+            &dropped_count.to_string(),
+            DROPPED_TILE_CAPTION,
+            theme::DROPPED_FILL,
+            theme::MUTED_TEXT,
         );
     }
     if piece_count > scenes.len() {
@@ -2170,22 +2439,34 @@ fn is_long_scene(span: TimeSpan) -> bool {
     span.seconds() > LONG_SCENE_SECONDS
 }
 
-fn scene_description(scene: SceneIndex, layout: &SceneLayout) -> String {
-    format!(
+fn scene_description(scene: SceneIndex, layout: &SceneLayout, fate: SceneFate) -> String {
+    let description = format!(
         "Scene {}   {}   ({} to {})",
         scene.number(),
         format_length(layout.span.seconds()),
         format_timestamp(layout.span.start),
         format_timestamp(layout.span.end)
-    )
+    );
+    match fate {
+        SceneFate::Keep => description,
+        SceneFate::Drop => format!("{description}   {DROPPED_BADGE}"),
+    }
 }
 
+/// The first row of a scene's card: which scene it is, how long, and what
+/// the split does with it. Returns what the person asked to be done with
+/// the scene instead, when they pressed the button for that.
 fn show_scene_heading(
     ui: &mut egui::Ui,
-    scene: SceneIndex,
-    layout: &SceneLayout,
+    scene_card: SceneCard,
     color: egui::Color32,
-) {
+) -> Option<SceneFate> {
+    let SceneCard {
+        scene,
+        layout,
+        fate,
+    } = scene_card;
+    let mut fate_wanted = None;
     ui.horizontal_wrapped(|ui| {
         let badge = theme::semibold(scene_name(scene), 13.0).color(egui::Color32::WHITE);
         theme::pill_at_least(ui, badge, color, SCENE_BADGE_MIN_WIDTH);
@@ -2215,7 +2496,29 @@ fn show_scene_heading(
                 .color(theme::PRIMARY);
             theme::pill(ui, note, theme::PRIMARY_TINT);
         }
+        match fate {
+            CardFate::Written => {}
+            CardFate::WrittenAsFile { number, of } => {
+                ui.label(theme::muted(format!("File {number} of {of}")))
+                    .on_hover_text(
+                        "Dropped scenes are not written, so the files are numbered without them.",
+                    );
+            }
+            CardFate::Dropped => {
+                let badge = theme::semibold(DROPPED_BADGE, 13.0).color(egui::Color32::WHITE);
+                theme::pill(ui, badge, theme::DROPPED);
+            }
+        }
+        let (label, hint, wanted) = if fate.is_dropped() {
+            (KEEP_SCENE_LABEL, KEEP_SCENE_HINT, SceneFate::Keep)
+        } else {
+            (DROP_SCENE_LABEL, DROP_SCENE_HINT, SceneFate::Drop)
+        };
+        if ui.button(label).on_hover_text(hint).clicked() {
+            fate_wanted = Some(wanted);
+        }
     });
+    fate_wanted
 }
 
 /// Shown beside each part of a merged scene. Returns true when clicked.
@@ -2879,6 +3182,210 @@ mod tests {
         screen.press(egui::Key::M, egui::Modifiers::NONE);
         assert_eq!(screen.scene_ends(), vec![20.0, 60.0, 80.0, 100.0]);
         assert_eq!(screen.selected_scenes(), vec![1]);
+    }
+
+    const SMALLEST_WINDOW_MAIN_PANEL: egui::Vec2 = egui::vec2(630.0, 600.0);
+
+    fn dropped_scenes(screen: &Screen) -> Vec<usize> {
+        screen
+            .session
+            .scene_fates()
+            .iter()
+            .enumerate()
+            .filter(|(_, &fate)| fate == SceneFate::Drop)
+            .map(|(position, _)| position)
+            .collect()
+    }
+
+    #[test]
+    fn x_drops_the_selected_scenes_and_x_again_keeps_them() {
+        let mut screen = Screen::with_five_scenes();
+        screen.click_scene(1, egui::Modifiers::NONE);
+        screen.click_scene(2, egui::Modifiers::SHIFT);
+
+        screen.press(egui::Key::X, egui::Modifiers::NONE);
+        assert_eq!(dropped_scenes(&screen), vec![1, 2]);
+        // The scenes are still there and still selected, only not written.
+        assert_eq!(screen.session.scene_count(), 5);
+        assert_eq!(screen.selected_scenes(), vec![1, 2]);
+
+        screen.press(egui::Key::X, egui::Modifiers::NONE);
+        assert_eq!(dropped_scenes(&screen), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn ctrl_z_brings_a_dropped_scene_back() {
+        let mut screen = Screen::with_five_scenes();
+        screen.click_scene(3, egui::Modifiers::NONE);
+        screen.press(egui::Key::X, egui::Modifiers::NONE);
+        assert_eq!(dropped_scenes(&screen), vec![3]);
+
+        screen.press_ctrl_z();
+        assert_eq!(dropped_scenes(&screen), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn ctrl_x_is_not_taken_for_the_drop_key() {
+        let mut screen = Screen::with_five_scenes();
+        screen.click_scene(1, egui::Modifiers::NONE);
+        screen.press(egui::Key::X, egui::Modifiers::COMMAND);
+        assert_eq!(dropped_scenes(&screen), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn x_with_every_scene_selected_drops_none_and_says_why() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press(egui::Key::A, egui::Modifiers::COMMAND);
+        screen.press(egui::Key::X, egui::Modifiers::NONE);
+
+        assert_eq!(dropped_scenes(&screen), Vec::<usize>::new());
+        assert!(screen.session.drop_refusal().is_some());
+    }
+
+    #[test]
+    fn the_button_on_a_card_asks_to_drop_or_keep_that_scene() {
+        let mut screen = Screen::with_five_scenes();
+        let drop_the_third = SceneListInput {
+            fate_wanted: Some((SceneIndex::new(2), SceneFate::Drop)),
+            ..Default::default()
+        };
+        assert_eq!(
+            screen
+                .view
+                .edits_from_scene_list(&screen.ctx, &drop_the_third),
+            vec![ReviewRequest::DropScene(SceneIndex::new(2))]
+        );
+        let keep_the_third = SceneListInput {
+            fate_wanted: Some((SceneIndex::new(2), SceneFate::Keep)),
+            ..Default::default()
+        };
+        assert_eq!(
+            screen
+                .view
+                .edits_from_scene_list(&screen.ctx, &keep_the_third),
+            vec![ReviewRequest::KeepScene(SceneIndex::new(2))]
+        );
+    }
+
+    #[test]
+    fn a_review_with_dropped_scenes_is_drawn_in_the_smallest_window_and_still_works() {
+        let mut screen = Screen::showing(test_sessions::five_scenes(), SMALLEST_WINDOW_MAIN_PANEL);
+        screen.session.apply(
+            ReviewRequest::DropScene(SceneIndex::new(1)),
+            &test_sessions::nothing_in_the_way,
+        );
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+
+        // Drawing changes nothing, and the cards are all there.
+        assert_eq!(dropped_scenes(&screen), vec![1]);
+        assert_eq!(screen.view.scene_cards.len(), 5);
+        screen.press_ctrl_z();
+        assert_eq!(dropped_scenes(&screen), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_card_laid_out_as_dropped_is_another_shape_than_the_same_card_kept() {
+        let screen = Screen::with_five_scenes();
+        let layouts = screen.session.plan().scene_layouts();
+        let card = |fate| SceneCard {
+            scene: SceneIndex::new(0),
+            layout: &layouts[0],
+            fate,
+        };
+        assert_ne!(
+            screen.view.card_shape(card(CardFate::Written), 600.0),
+            screen.view.card_shape(card(CardFate::Dropped), 600.0)
+        );
+    }
+
+    #[test]
+    fn cards_say_nothing_about_files_while_every_scene_is_written() {
+        assert_eq!(
+            card_fates(&[SceneFate::Keep, SceneFate::Keep]),
+            vec![CardFate::Written, CardFate::Written]
+        );
+    }
+
+    #[test]
+    fn once_a_scene_is_dropped_each_kept_card_names_its_file_without_gaps() {
+        let fates = [
+            SceneFate::Drop,
+            SceneFate::Keep,
+            SceneFate::Drop,
+            SceneFate::Keep,
+        ];
+        assert_eq!(
+            card_fates(&fates),
+            vec![
+                CardFate::Dropped,
+                CardFate::WrittenAsFile { number: 1, of: 2 },
+                CardFate::Dropped,
+                CardFate::WrittenAsFile { number: 2, of: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_split_button_counts_the_files_and_the_scenes_left_out() {
+        assert_eq!(split_button_label(4, 0), "Split into 4 files");
+        assert_eq!(
+            split_button_label(3, 1),
+            "Split into 3 files, 1 scene dropped"
+        );
+        assert_eq!(
+            split_button_label(1, 2),
+            "Split into 1 file, 2 scenes dropped"
+        );
+    }
+
+    #[test]
+    fn the_window_says_before_the_split_that_the_original_stays() {
+        assert_eq!(
+            original_kept_note(1),
+            "The original stays where it is, because 1 scene is dropped and would be in no file."
+        );
+        assert_eq!(
+            original_kept_note(3),
+            "The original stays where it is, because 3 scenes are dropped and would be in no file."
+        );
+    }
+
+    #[test]
+    fn a_dropped_scene_says_so_when_pointed_at_on_the_timeline() {
+        let screen = Screen::with_five_scenes();
+        let layouts = screen.session.plan().scene_layouts();
+        let second = SceneIndex::new(1);
+        let kept = scene_description(second, &layouts[1], SceneFate::Keep);
+        let dropped = scene_description(second, &layouts[1], SceneFate::Drop);
+        assert!(!kept.contains("Dropped"));
+        assert_eq!(dropped, format!("{kept}   Dropped, not written"));
+    }
+
+    #[test]
+    fn a_scene_list_is_offered_a_name_made_from_the_video() {
+        assert_eq!(
+            scene_list_file_name(Path::new("videos/holiday.mp4"), SceneListFormat::Csv),
+            "holiday scenes.csv"
+        );
+        assert_eq!(
+            scene_list_file_name(Path::new("holiday.v2.mkv"), SceneListFormat::Edl),
+            "holiday.v2 scenes.edl"
+        );
+    }
+
+    #[test]
+    fn a_review_that_saved_or_could_not_save_its_scene_list_is_drawn() {
+        let mut screen = Screen::with_five_scenes();
+        let notes = [
+            SceneListNote::Saved(PathBuf::from("videos/holiday scenes.csv")),
+            SceneListNote::NotSaved("access denied".to_owned()),
+        ];
+        for note in notes {
+            screen.session.note_scene_list(note.clone());
+            screen.frame(Vec::new(), egui::Modifiers::NONE);
+            assert_eq!(screen.session.scene_list_note(), Some(&note));
+        }
     }
 
     #[test]

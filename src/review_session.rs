@@ -12,12 +12,14 @@ use std::sync::Arc;
 
 use crate::cache::{DetectionSource, SourcedDetection};
 use crate::detect::ScanKind;
+use crate::fates::{NothingToWrite, SceneFate, ScenesToWrite};
 use crate::focus::{self, PictureStep, ReviewFocus, SceneStep};
 use crate::plan::{
     AddCutError, CutChoice, CutIndex, MovedCut, NudgeCutError, NudgeDirection, PlanSnapshot,
     SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
 };
 use crate::scan::UndecodedFrames;
+use crate::scene_list::SceneListFormat;
 use crate::scenes::CutTimes;
 use crate::selection::{ClickKind, SceneSelection};
 use crate::settings::SettingsChange;
@@ -85,6 +87,14 @@ impl SplitFeedback {
     }
 }
 
+/// How saving the scene list went, for the review screen to say.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SceneListNote {
+    Saved(PathBuf),
+    /// Why nothing was saved, in words for the person.
+    NotSaved(String),
+}
+
 /// What the person asked for on the review screen. Scenes, segments and cuts
 /// are named by their place in the plan as the screen drew it.
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +135,19 @@ pub enum ReviewRequest {
     /// start.
     PlayFocused,
     JoinFocusedWithNext,
+    /// Do not write this scene to a file.
+    DropScene(SceneIndex),
+    /// Write this scene after all.
+    KeepScene(SceneIndex),
+    /// Drop the selected scenes, or keep them again when every one of them
+    /// is dropped already.
+    DropOrKeepSelected,
+    /// Save the list of scenes to this file, in this format, without
+    /// splitting anything.
+    SaveSceneList {
+        format: SceneListFormat,
+        path: PathBuf,
+    },
     Undo,
     ResetScenes,
     Split,
@@ -149,13 +172,19 @@ pub enum ReviewRequest {
 
 /// What a request leaves for the rest of the app to do. The session itself
 /// can neither write files, nor scan, nor play, nor keep settings.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FollowUp {
     Export,
     Skip,
     Rescan(ScanKind),
     PlayFrom(f64),
     ChangeSettings(SettingsChange),
+    /// Write the list of scenes to this file. How that went comes back
+    /// through `ReviewSession::note_scene_list`.
+    SaveSceneList {
+        format: SceneListFormat,
+        path: PathBuf,
+    },
 }
 
 /// Looks where the scenes of this video would go now, for scene files an
@@ -186,6 +215,11 @@ pub struct ReviewSession {
     /// How the last split added or moved on the review screen went, once
     /// one was tried.
     new_split_feedback: Option<SplitFeedback>,
+    /// Why the last try to drop scenes changed nothing, until the plan
+    /// changes again.
+    drop_refusal: Option<NothingToWrite>,
+    /// How the last saving of the scene list went, once one was tried.
+    scene_list_note: Option<SceneListNote>,
     export_obstacle: Option<ExportObstacle>,
     /// A scan the person asked for that would throw away their edits, until
     /// they confirm or cancel it.
@@ -235,6 +269,8 @@ impl ReviewSession {
             frame_seconds,
             new_split_time: String::new(),
             new_split_feedback: None,
+            drop_refusal: None,
+            scene_list_note: None,
             export_obstacle: None,
             rescan_awaiting_consent: None,
         }
@@ -282,6 +318,36 @@ impl ReviewSession {
         self.export_obstacle.as_ref()
     }
 
+    /// Why the scenes the person last tried to drop are still written.
+    pub fn drop_refusal(&self) -> Option<&NothingToWrite> {
+        self.drop_refusal.as_ref()
+    }
+
+    pub fn scene_list_note(&self) -> Option<&SceneListNote> {
+        self.scene_list_note.as_ref()
+    }
+
+    /// The app saves the scene list, since the session writes no files, and
+    /// tells the session how it went.
+    pub fn note_scene_list(&mut self, note: SceneListNote) {
+        self.scene_list_note = Some(note);
+    }
+
+    /// What the split does with each scene, in scene order.
+    pub fn scene_fates(&self) -> Vec<SceneFate> {
+        self.plan.scene_fates()
+    }
+
+    /// The cuts and the scenes to write, as a split takes them.
+    pub fn scenes_to_write(&self) -> ScenesToWrite {
+        self.plan.scenes_to_write()
+    }
+
+    /// How many scenes the person dropped. A split writes the others.
+    pub fn dropped_count(&self) -> usize {
+        self.scenes_to_write().dropped_count()
+    }
+
     /// A warning about earlier scene files was given for one folder and one
     /// plan. Whoever changes where the scenes go calls this, and so does a
     /// review that is taken up again after its split failed.
@@ -320,6 +386,7 @@ impl ReviewSession {
         self.plan.scenes()
     }
 
+    #[cfg(test)]
     pub fn accepted_cuts(&self) -> CutTimes {
         self.plan.accepted_cuts()
     }
@@ -417,6 +484,12 @@ impl ReviewSession {
                 return self.focused_play_time().map(FollowUp::PlayFrom);
             }
             ReviewRequest::JoinFocusedWithNext => self.join_focused_with_next(),
+            ReviewRequest::DropScene(scene) => self.set_fate_of(vec![scene], SceneFate::Drop),
+            ReviewRequest::KeepScene(scene) => self.set_fate_of(vec![scene], SceneFate::Keep),
+            ReviewRequest::DropOrKeepSelected => self.drop_or_keep_selected(),
+            ReviewRequest::SaveSceneList { format, path } => {
+                return Some(FollowUp::SaveSceneList { format, path });
+            }
             ReviewRequest::Undo => self.undo(),
             ReviewRequest::ResetScenes => self.edit_plan(SplitPlan::reset_to_detected),
             ReviewRequest::Split => return self.ask_to_split(look_for_earlier_scene_files()),
@@ -582,10 +655,53 @@ impl ReviewSession {
 
     /// Scene numbers shift when the plan changes, so a selection made
     /// before would point at other scenes. A warning about existing files
-    /// was likewise given for the plan as it was.
+    /// was likewise given for the plan as it was, and so was the word that
+    /// a scene could not be dropped or that the scene list was saved.
     fn forget_what_depended_on_the_old_plan(&mut self) {
         self.selection.clear();
         self.export_obstacle = None;
+        self.drop_refusal = None;
+        self.scene_list_note = None;
+    }
+
+    /// Drops the selected scenes. When every one of them is dropped
+    /// already, the same key brings them back.
+    fn drop_or_keep_selected(&mut self) {
+        let selected: Vec<SceneIndex> = self.selection.scenes().collect();
+        if selected.is_empty() {
+            return;
+        }
+        let fates = self.plan.scene_fates();
+        let all_dropped = selected
+            .iter()
+            .all(|scene| fates.get(scene.position()) == Some(&SceneFate::Drop));
+        let wanted = if all_dropped {
+            SceneFate::Keep
+        } else {
+            SceneFate::Drop
+        };
+        self.set_fate_of(selected, wanted);
+    }
+
+    /// Marks all of `scenes` as written or dropped, or none of them: when
+    /// that would leave no scene to write, nothing changes and the person
+    /// is told why.
+    fn set_fate_of(&mut self, scenes: Vec<SceneIndex>, fate: SceneFate) {
+        // Dropping a scene moves no scene to another place in the list, so
+        // what was selected still is.
+        let selection = std::mem::take(&mut self.selection);
+        let outcome = self.edit_plan(|plan| {
+            let plan_before = plan.snapshot();
+            for scene in scenes {
+                if let Err(refusal) = plan.set_scene_fate(scene, fate) {
+                    plan.restore(plan_before);
+                    return Err(refusal);
+                }
+            }
+            Ok(())
+        });
+        self.selection = selection;
+        self.drop_refusal = outcome.err();
     }
 
     fn merge_scenes(&mut self, scenes: RangeInclusive<SceneIndex>) {
@@ -876,6 +992,203 @@ mod tests {
             session.scan_summary(),
             "Found 3 scene changes: 0 black screens, 1 sudden picture change."
         );
+    }
+
+    fn fates(session: &Session) -> Vec<SceneFate> {
+        session.0.scene_fates()
+    }
+
+    const KEEP: SceneFate = SceneFate::Keep;
+    const DROP: SceneFate = SceneFate::Drop;
+
+    #[test]
+    fn a_dropped_scene_is_not_written_and_the_others_are() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(1)));
+
+        assert_eq!(fates(&session), [KEEP, DROP, KEEP, KEEP, KEEP]);
+        assert_eq!(session.0.dropped_count(), 1);
+        assert_eq!(session.0.scene_count(), 5);
+        assert_eq!(session.0.scenes_to_write().kept_scenes().len(), 4);
+        assert!(session.0.is_edited());
+    }
+
+    #[test]
+    fn dropping_a_scene_can_be_undone() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(1)));
+        session.ask(ReviewRequest::Undo);
+
+        assert_eq!(session.0.dropped_count(), 0);
+        assert!(!session.0.is_edited());
+    }
+
+    #[test]
+    fn a_dropped_scene_can_be_kept_again() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(1)));
+        session.ask(ReviewRequest::KeepScene(scene(1)));
+        assert_eq!(session.0.dropped_count(), 0);
+        // Two changes were made, and each can be taken back.
+        session.ask(ReviewRequest::Undo);
+        assert_eq!(session.0.dropped_count(), 1);
+    }
+
+    #[test]
+    fn keeping_a_scene_that_is_kept_already_is_not_a_change() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::KeepScene(scene(1)));
+        assert!(!session.0.can_undo());
+    }
+
+    #[test]
+    fn dropping_a_scene_leaves_the_selection_as_it_was() {
+        let mut session = Session::five_scenes();
+        session.ask(click(1, ClickKind::Single));
+        session.ask(click(3, ClickKind::Toggle));
+        session.ask(ReviewRequest::DropScene(scene(1)));
+        assert_eq!(session.selected(), vec![1, 3]);
+    }
+
+    #[test]
+    fn the_key_drops_the_selected_scenes_and_then_keeps_them_again() {
+        let mut session = Session::five_scenes();
+        session.ask(click(1, ClickKind::Single));
+        session.ask(click(3, ClickKind::Toggle));
+
+        session.ask(ReviewRequest::DropOrKeepSelected);
+        assert_eq!(fates(&session), [KEEP, DROP, KEEP, DROP, KEEP]);
+        session.ask(ReviewRequest::DropOrKeepSelected);
+        assert_eq!(fates(&session), [KEEP, KEEP, KEEP, KEEP, KEEP]);
+    }
+
+    #[test]
+    fn the_key_drops_the_rest_of_a_selection_that_is_partly_dropped() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(1)));
+        session.ask(click(1, ClickKind::Single));
+        session.ask(click(2, ClickKind::Toggle));
+
+        session.ask(ReviewRequest::DropOrKeepSelected);
+        assert_eq!(fates(&session), [KEEP, DROP, DROP, KEEP, KEEP]);
+    }
+
+    #[test]
+    fn the_key_does_nothing_without_a_selection() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropOrKeepSelected);
+        assert!(!session.0.can_undo());
+        assert_eq!(session.0.drop_refusal(), None);
+    }
+
+    #[test]
+    fn dropping_every_scene_is_refused_and_drops_none_of_them() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::SelectAllScenes);
+        session.ask(ReviewRequest::DropOrKeepSelected);
+
+        assert_eq!(session.0.dropped_count(), 0);
+        assert!(!session.0.can_undo());
+        assert_eq!(
+            session.0.drop_refusal(),
+            Some(&NothingToWrite::EverySceneDropped)
+        );
+        assert_eq!(
+            session.0.drop_refusal().unwrap().to_string(),
+            "At least one scene has to be written."
+        );
+    }
+
+    #[test]
+    fn dropping_the_last_scene_that_is_written_is_refused() {
+        let mut session = Session(test_sessions::scenes_of_twenty_seconds(2));
+        session.ask(ReviewRequest::DropScene(scene(0)));
+        session.ask(ReviewRequest::DropScene(scene(1)));
+
+        assert_eq!(fates(&session), [DROP, KEEP]);
+        assert_eq!(
+            session.0.drop_refusal(),
+            Some(&NothingToWrite::EverySceneDropped)
+        );
+        // The refusal goes away with the next change.
+        session.ask(ReviewRequest::KeepScene(scene(0)));
+        assert_eq!(session.0.drop_refusal(), None);
+    }
+
+    #[test]
+    fn a_dropped_scene_merged_with_a_kept_one_is_written_again() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(1)));
+        session.ask(ReviewRequest::MergeScenes(scenes(1, 2)));
+
+        assert_eq!(fates(&session), [KEEP, KEEP, KEEP, KEEP]);
+        // Undoing the merge brings the dropped scene back as it was.
+        session.ask(ReviewRequest::Undo);
+        assert_eq!(fates(&session), [KEEP, DROP, KEEP, KEEP, KEEP]);
+    }
+
+    #[test]
+    fn dropped_scenes_merged_with_each_other_stay_dropped() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(1)));
+        session.ask(ReviewRequest::DropScene(scene(2)));
+        session.ask(ReviewRequest::MergeScenes(scenes(1, 2)));
+
+        assert_eq!(fates(&session), [KEEP, DROP, KEEP, KEEP]);
+    }
+
+    #[test]
+    fn resetting_the_scenes_writes_every_scene_again() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(4)));
+        session.ask(ReviewRequest::ResetScenes);
+        assert_eq!(session.0.dropped_count(), 0);
+    }
+
+    #[test]
+    fn a_scan_that_would_forget_dropped_scenes_asks_first() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::DropScene(scene(4)));
+
+        assert_eq!(
+            session.ask(ReviewRequest::Rescan(ScanKind::BlackScreens)),
+            None
+        );
+        assert!(session.0.is_asking_before_rescan());
+    }
+
+    #[test]
+    fn dropping_a_scene_takes_back_the_warning_about_earlier_files() {
+        let mut session = Session::five_scenes();
+        session.0.apply(ReviewRequest::Split, &three_earlier_files);
+        assert!(session.0.export_obstacle().is_some());
+
+        session.ask(ReviewRequest::DropScene(scene(0)));
+        assert_eq!(session.0.export_obstacle(), None);
+    }
+
+    #[test]
+    fn saving_the_scene_list_is_left_to_the_app_and_its_outcome_is_kept() {
+        let mut session = Session::five_scenes();
+        let save = ReviewRequest::SaveSceneList {
+            format: SceneListFormat::Csv,
+            path: PathBuf::from("scenes.csv"),
+        };
+        assert_eq!(
+            session.ask(save),
+            Some(FollowUp::SaveSceneList {
+                format: SceneListFormat::Csv,
+                path: PathBuf::from("scenes.csv"),
+            })
+        );
+        assert_eq!(session.0.scene_list_note(), None);
+
+        let saved = SceneListNote::Saved(PathBuf::from("scenes.csv"));
+        session.0.note_scene_list(saved.clone());
+        assert_eq!(session.0.scene_list_note(), Some(&saved));
+        // The list was of the scenes as they were. A change makes it old.
+        session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
+        assert_eq!(session.0.scene_list_note(), None);
     }
 
     #[test]
