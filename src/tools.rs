@@ -38,8 +38,6 @@ enum Program {
 }
 
 impl Program {
-    const ALL: [Self; 2] = [Self::Ffmpeg, Self::Ffprobe];
-
     /// The name to run when the program is on the PATH.
     fn command_name(self) -> &'static str {
         match self {
@@ -187,27 +185,26 @@ pub enum Availability {
 
 /// Looks for the programs, first in the app's own folder, then on the PATH.
 /// The app's own copy comes first because it is the tested version.
+///
+/// A program only counts when it actually runs. A file cut short by a crash
+/// or a power failure would otherwise be found on every start and fail
+/// every scan, with no way back to the download.
 pub fn find_installed() -> Availability {
     if TOOLS.get().is_some() {
         return Availability::Ready;
     }
-    let own_copy = Tools {
-        ffmpeg: tools_dir().join(Program::Ffmpeg.file_name()),
-        ffprobe: tools_dir().join(Program::Ffprobe.file_name()),
+    let own_copy = tools_dir().map(|folder| Tools {
+        ffmpeg: folder.join(Program::Ffmpeg.file_name()),
+        ffprobe: folder.join(Program::Ffprobe.file_name()),
+    });
+    let on_the_path = Tools {
+        ffmpeg: PathBuf::from(Program::Ffmpeg.command_name()),
+        ffprobe: PathBuf::from(Program::Ffprobe.command_name()),
     };
-    let found = if own_copy.ffmpeg.is_file() && own_copy.ffprobe.is_file() {
-        Some(own_copy)
-    } else if Program::ALL
-        .iter()
-        .all(|program| runs(program.command_name()))
-    {
-        Some(Tools {
-            ffmpeg: PathBuf::from(Program::Ffmpeg.command_name()),
-            ffprobe: PathBuf::from(Program::Ffprobe.command_name()),
-        })
-    } else {
-        None
-    };
+    let found = own_copy
+        .into_iter()
+        .chain([on_the_path])
+        .find(|tools| runs(&tools.ffmpeg) && runs(&tools.ffprobe));
     match found {
         Some(tools) => {
             remember(tools);
@@ -223,8 +220,8 @@ fn remember(tools: Tools) {
     let _ = TOOLS.set(tools);
 }
 
-fn runs(command_name: &str) -> bool {
-    Command::new(command_name)
+fn runs(program: &Path) -> bool {
+    Command::new(program)
         .arg("-version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -234,11 +231,15 @@ fn runs(command_name: &str) -> bool {
 }
 
 /// The app keeps its copy of the programs with its other per-user data.
-fn tools_dir() -> PathBuf {
-    folders::data_dir()
-        .join(APP_FOLDER)
-        .join(TOOLS_FOLDER)
-        .join(format!("ffmpeg-{FFMPEG_VERSION}"))
+/// `None` on a system with no per-user folder. A shared folder such as the
+/// temporary one will not do, since another user could put a program there.
+fn tools_dir() -> Option<PathBuf> {
+    Some(
+        folders::data_dir()?
+            .join(APP_FOLDER)
+            .join(TOOLS_FOLDER)
+            .join(format!("ffmpeg-{FFMPEG_VERSION}")),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -256,6 +257,13 @@ impl DownloadProgress {
     }
 }
 
+/// The size of the download for this machine, or zero where there is none.
+pub fn download_bytes() -> u64 {
+    downloads_for(std::env::consts::OS, std::env::consts::ARCH).map_or(0, |downloads| {
+        downloads.iter().map(|download| download.bytes).sum()
+    })
+}
+
 /// Downloads ffmpeg and ffprobe into the app's own folder. Nothing is
 /// retried here: the caller reports the failure and the person decides
 /// whether to try again.
@@ -267,7 +275,12 @@ pub fn download(mut on_progress: impl FnMut(DownloadProgress)) -> Result<()> {
              Install ffmpeg yourself and make sure it is on the PATH."
         );
     };
-    let folder = tools_dir();
+    let Some(folder) = tools_dir() else {
+        bail!(
+            "ffmpeg and ffprobe were not found, and this system has no per-user folder to download them into. \
+             Install ffmpeg yourself and make sure it is on the PATH."
+        );
+    };
     std::fs::create_dir_all(&folder)
         .with_context(|| format!("could not create {}", folder.display()))?;
 
@@ -297,7 +310,9 @@ fn fetch_program(
     on_received: impl FnMut(u64),
 ) -> Result<()> {
     let destination = folder.join(download.program.file_name());
-    let archive_path = destination.with_extension("gz.part");
+    // Named after this process, so two copies of the app downloading at
+    // once never write into each other's files.
+    let archive_path = destination.with_extension(format!("gz.{}.part", std::process::id()));
     let outcome = download_archive(download, &archive_path, on_received)
         .and_then(|()| unpack_program(&archive_path, &destination));
     // The archive is only needed for unpacking. Failing to remove it wastes
@@ -356,18 +371,45 @@ fn hex(bytes: &[u8]) -> String {
 /// Unzips the program under a temporary name, then moves it into place, so
 /// a half-written program is never found by a later run.
 fn unpack_program(archive_path: &Path, destination: &Path) -> Result<()> {
+    let unfinished = destination.with_extension(format!("{}.part", std::process::id()));
+    let outcome = write_unpacked(archive_path, &unfinished)
+        .and_then(|()| allow_running(&unfinished))
+        .and_then(|()| move_into_place(&unfinished, destination));
+    if outcome.is_err() {
+        // Nothing reads this file again, so leaving it would only waste space.
+        let _ = std::fs::remove_file(&unfinished);
+    }
+    outcome
+}
+
+fn write_unpacked(archive_path: &Path, unfinished: &Path) -> Result<()> {
     let archive = File::open(archive_path)
         .with_context(|| format!("could not open {}", archive_path.display()))?;
-    let unfinished = destination.with_extension("part");
-    let mut output = File::create(&unfinished)
+    let mut output = File::create(unfinished)
         .with_context(|| format!("could not create {}", unfinished.display()))?;
     std::io::copy(&mut GzDecoder::new(archive), &mut output)
-        .with_context(|| format!("could not unpack {}", destination.display()))?;
-    drop(output);
+        .with_context(|| format!("could not unpack {}", unfinished.display()))?;
+    // On disk before it gets its real name, so a power failure cannot leave
+    // a program that is there but empty.
+    output
+        .sync_all()
+        .with_context(|| format!("could not finish writing {}", unfinished.display()))
+}
 
-    allow_running(&unfinished)?;
-    std::fs::rename(&unfinished, destination)
-        .with_context(|| format!("could not write {}", destination.display()))
+fn move_into_place(unfinished: &Path, destination: &Path) -> Result<()> {
+    match std::fs::rename(unfinished, destination) {
+        Ok(()) => Ok(()),
+        // Another copy of the app got there first and may be running the
+        // program already, which stops Windows replacing it. Its copy
+        // passed the same checksum, so it is as good as this one.
+        Err(_) if destination.is_file() => {
+            let _ = std::fs::remove_file(unfinished);
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("could not write {}", destination.display()))
+        }
+    }
 }
 
 /// Outside Windows a downloaded file is not a program until it is marked as

@@ -23,6 +23,7 @@ pub enum ScanMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ScanSettings {
     pub mode: ScanMode,
     pub criteria: BlackCriteria,

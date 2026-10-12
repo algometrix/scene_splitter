@@ -114,18 +114,34 @@ struct Arguments {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let settings = settings_for_this_run(&arguments)?;
+    let loaded = Settings::load();
+    if let Some(problem) = &loaded.problem {
+        eprintln!("{problem}");
+    }
 
     let Some(path) = &arguments.video else {
-        return app::run(settings, None, ScanDepth::BlackScreens);
+        refuse_overrides_for_the_window(&arguments)?;
+        return app::run(loaded, None, ScanDepth::BlackScreens);
     };
     if !path.exists() {
         bail!("{} does not exist", path.display());
     }
+    let for_one_video_only =
+        arguments.list_only || arguments.overwrite || arguments.out_dir.is_some();
+    if path.is_dir() && !arguments.scan_only && for_one_video_only {
+        bail!(
+            "{} is a folder. --list-only, --out-dir and --overwrite work on a single video. \
+             Use --scan-only to scan a folder, or give the folder alone to open it in the window.",
+            path.display()
+        );
+    }
+
     // The window gets the tools itself, with a progress bar.
     if !arguments.scan_only && (arguments.review || path.is_dir()) {
-        return app::run(settings, Some(path.clone()), scan_depth(&arguments));
+        refuse_overrides_for_the_window(&arguments)?;
+        return app::run(loaded, Some(path.clone()), scan_depth(&arguments));
     }
+    let settings = settings_for_this_run(loaded.settings, &arguments)?;
 
     get_tools_if_missing()?;
     if arguments.scan_only {
@@ -157,9 +173,25 @@ fn get_tools_if_missing() -> Result<()> {
     Ok(())
 }
 
+/// The window saves its settings whenever one changes. An option given for
+/// one run would be saved along with them, so the window takes none.
+fn refuse_overrides_for_the_window(arguments: &Arguments) -> Result<()> {
+    let overrides_given = arguments.scan.is_some()
+        || arguments.min_black.is_some()
+        || arguments.max_luma.is_some()
+        || arguments.black_fraction.is_some()
+        || arguments.keep_original;
+    if overrides_given {
+        bail!(
+            "--scan, --min-black, --max-luma, --black-fraction and --keep-original apply to a \
+             command line run. For the window, change them in its Settings section."
+        );
+    }
+    Ok(())
+}
+
 /// The saved settings, with whatever the command line overrides.
-fn settings_for_this_run(arguments: &Arguments) -> Result<Settings> {
-    let mut settings = Settings::load();
+fn settings_for_this_run(mut settings: Settings, arguments: &Arguments) -> Result<Settings> {
     if let Some(mode) = arguments.scan {
         settings.scan.mode = mode;
     }
@@ -191,6 +223,10 @@ fn scan_depth(arguments: &Arguments) -> ScanDepth {
 
 fn scan_ahead(path: &Path, arguments: &Arguments, settings: &Settings) -> Result<()> {
     let summary = prescan::scan_ahead(path, &settings.scan, scan_depth(arguments))?;
+    if summary.is_empty() {
+        println!("No videos were found in {}.", path.display());
+        return Ok(());
+    }
     println!("{}", summary.describe());
     if !summary.failed.is_empty() {
         for failed in &summary.failed {
@@ -253,6 +289,11 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         "Writing and verifying took {:.2}s.",
         started.elapsed().as_secs_f64()
     );
+    // A script that goes on after this must be able to tell that the scenes
+    // were not verified, or that the original is still there.
+    if !report.is_clean() {
+        bail!("the scenes were written, but see the note above before relying on them");
+    }
     Ok(())
 }
 

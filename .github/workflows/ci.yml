@@ -2,12 +2,19 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     name: Lint and test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # The tests wait on ffmpeg, so a hung child must not hold a runner for
+    # the six hours GitHub would otherwise allow.
+    timeout-minutes: 30
     strategy:
       # One system failing should not hide the result of the others.
       fail-fast: false
@@ -16,8 +23,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Sound output and the window need these headers to build on Linux.
-      # ffmpeg is for the end-to-end tests, which split a generated video.
+      # Sound output, the window and the file picker need these headers to
+      # build on Linux. ffmpeg is for the end-to-end tests, which split a
+      # generated video.
       - name: Install Linux packages
         if: runner.os == 'Linux'
         run: |
@@ -32,6 +40,8 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install ffmpeg -y --no-progress
 
+      # The latest stable toolchain, on purpose: a new lint then shows up
+      # here first, and not on a contributor's machine.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -42,8 +52,8 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint
-        run: cargo clippy --release --all-targets -- -D warnings
+        run: cargo clippy --locked --release --all-targets -- -D warnings
 
       # No display is needed: the window is driven with simulated input.
       - name: Test, including the end-to-end tests that run ffmpeg
-        run: cargo test --release -- --include-ignored
+        run: cargo test --locked --release -- --include-ignored

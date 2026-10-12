@@ -14,11 +14,18 @@ pub const CARD_BORDER: Color32 = Color32::from_rgb(0xE7, 0xE9, 0xF2);
 pub const PRIMARY: Color32 = Color32::from_rgb(0x4F, 0x46, 0xC8);
 pub const PRIMARY_TINT: Color32 = Color32::from_rgb(0xEC, 0xE9, 0xFD);
 pub const ACCENT: Color32 = Color32::from_rgb(0xFF, 0x7A, 0x50);
-pub const SUCCESS: Color32 = Color32::from_rgb(0x1F, 0xA9, 0x7C);
-pub const DANGER: Color32 = Color32::from_rgb(0xE0, 0x3E, 0x52);
+pub const SUCCESS: Color32 = Color32::from_rgb(0x13, 0x80, 0x5D);
+/// Dark enough for white text on it, and for use as text on the page.
+pub const DANGER: Color32 = Color32::from_rgb(0xC8, 0x32, 0x3F);
+/// The accent is too light to read as text, this is its readable relative.
+pub const WARNING_TEXT: Color32 = Color32::from_rgb(0xC2, 0x41, 0x0C);
+/// The outline of buttons and boxes, visible against the page and cards.
+const CONTROL_OUTLINE: Color32 = Color32::from_rgb(0xC3, 0xC7, 0xD9);
 
 pub const TEXT: Color32 = Color32::from_rgb(0x1F, 0x23, 0x37);
-pub const MUTED_TEXT: Color32 = Color32::from_rgb(0x8A, 0x90, 0xA6);
+/// Grey, but dark enough to read at caption size on every background used
+/// here (at least 5 to 1 against each).
+pub const MUTED_TEXT: Color32 = Color32::from_rgb(0x5B, 0x61, 0x78);
 
 /// Backgrounds of the tiles that show the key numbers.
 pub const MINT_TILE: Color32 = Color32::from_rgb(0xE3, 0xF8, 0xF3);
@@ -27,27 +34,28 @@ pub const PEACH_TILE: Color32 = Color32::from_rgb(0xFF, 0xEE, 0xE4);
 pub const ROSE_TILE: Color32 = Color32::from_rgb(0xFD, 0xE6, 0xEA);
 
 /// Each scene gets one of these colours, on its card and on the timeline, so
-/// it is plain which strips of previews belong to which scene. Neighbouring
-/// scenes always differ.
+/// it is plain which previews belong to which scene. Neighbouring scenes
+/// always differ, and each is dark enough for white text on it.
 pub const SCENE_COLORS: [Color32; 8] = [
     Color32::from_rgb(0x4F, 0x46, 0xC8),
-    Color32::from_rgb(0xFF, 0x7A, 0x50),
-    Color32::from_rgb(0x1F, 0xA9, 0x7C),
-    Color32::from_rgb(0xD9, 0x46, 0x8A),
-    Color32::from_rgb(0x2E, 0x90, 0xD9),
-    Color32::from_rgb(0xE0, 0xA1, 0x1B),
+    Color32::from_rgb(0xC4, 0x50, 0x1F),
+    Color32::from_rgb(0x13, 0x80, 0x5D),
+    Color32::from_rgb(0xC2, 0x34, 0x7A),
+    Color32::from_rgb(0x1D, 0x6F, 0xB8),
+    Color32::from_rgb(0x8F, 0x64, 0x00),
     Color32::from_rgb(0x8E, 0x4F, 0xD6),
     Color32::from_rgb(0x4B, 0x5B, 0x73),
 ];
 
 pub const CARD_ROUNDING: f32 = 12.0;
 pub const CONTROL_ROUNDING: f32 = 8.0;
+/// The height of buttons, text boxes and the rows they sit in.
+pub const CONTROL_HEIGHT: f32 = 32.0;
 pub const PANEL_MARGIN: f32 = 16.0;
 const PILL_ROUNDING: f32 = 10.0;
-const TILE_MIN_WIDTH: f32 = 128.0;
-const TILE_VALUE_SIZE: f32 = 22.0;
+const TILE_VALUE_SIZE: f32 = 20.0;
 const CAPTION_SIZE: f32 = 12.0;
-const PRIMARY_BUTTON_HEIGHT: f32 = 36.0;
+pub const PRIMARY_BUTTON_HEIGHT: f32 = 36.0;
 
 const SEMIBOLD_FAMILY: &str = "semibold";
 /// The app borrows a font from the system when it is there, since the font
@@ -110,6 +118,11 @@ pub fn apply(ctx: &egui::Context) {
         style.visuals = visuals();
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.window_margin = egui::Margin::same(16.0);
+        // Every row is as tall as a button from the start. A label placed
+        // before a taller control would otherwise sit above its middle,
+        // since a row only grows when the taller control arrives.
+        style.spacing.interact_size = egui::vec2(40.0, CONTROL_HEIGHT);
         // Text in this app is for reading, not selecting. Left selectable,
         // every label would swallow the drags meant for the card under it.
         style.interaction.selectable_labels = false;
@@ -133,9 +146,14 @@ fn visuals() -> egui::Visuals {
     visuals.window_shadow = soft_shadow();
     visuals.popup_shadow = soft_shadow();
     visuals.extreme_bg_color = CARD;
+    // The topmost floating window would otherwise get a grey title bar,
+    // which is not one of this app's colours.
+    visuals.window_highlight_topmost = false;
     visuals.selection.bg_fill = PRIMARY_TINT;
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, PRIMARY);
-    visuals.warn_fg_color = ACCENT;
+    visuals.warn_fg_color = WARNING_TEXT;
+    // Links are secondary actions set in a line of text, in the app's own colour.
+    visuals.hyperlink_color = PRIMARY;
     visuals.error_fg_color = DANGER;
 
     let widgets = &mut visuals.widgets;
@@ -144,7 +162,7 @@ fn visuals() -> egui::Visuals {
     widgets.inactive.fg_stroke.color = TEXT;
     widgets.inactive.weak_bg_fill = Color32::from_rgb(0xEE, 0xEF, 0xF8);
     widgets.inactive.bg_fill = Color32::from_rgb(0xEE, 0xEF, 0xF8);
-    widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, CARD_BORDER);
+    widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, CONTROL_OUTLINE);
     widgets.hovered.weak_bg_fill = Color32::from_rgb(0xE2, 0xE3, 0xF6);
     widgets.hovered.bg_fill = Color32::from_rgb(0xE2, 0xE3, 0xF6);
     widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, PRIMARY);
@@ -249,6 +267,19 @@ pub fn panel(fill: Color32) -> egui::Frame {
         .inner_margin(egui::Margin::same(PANEL_MARGIN))
 }
 
+/// The frame of the review screen's fixed header. No gap below it, since
+/// the list underneath brings its own.
+pub fn header_panel() -> egui::Frame {
+    egui::Frame::none()
+        .fill(BACKGROUND)
+        .inner_margin(egui::Margin {
+            left: PANEL_MARGIN,
+            right: PANEL_MARGIN,
+            top: PANEL_MARGIN,
+            bottom: 4.0,
+        })
+}
+
 /// A pastel tile with one big number and a small caption under it.
 pub fn stat_tile(
     ui: &mut egui::Ui,
@@ -262,7 +293,6 @@ pub fn stat_tile(
         .rounding(CARD_ROUNDING)
         .inner_margin(egui::Margin::symmetric(16.0, 10.0))
         .show(ui, |ui| {
-            ui.set_min_width(TILE_MIN_WIDTH);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.label(semibold(value, TILE_VALUE_SIZE).color(value_color));
@@ -279,6 +309,31 @@ pub fn pill(ui: &mut egui::Ui, text: RichText, fill: Color32) -> egui::Response 
         .inner_margin(egui::Margin::symmetric(9.0, 2.0))
         .show(ui, |ui| ui.label(text))
         .response
+}
+
+/// A pill that keeps a minimum width, so pills in a column line up.
+pub fn pill_at_least(
+    ui: &mut egui::Ui,
+    text: RichText,
+    fill: Color32,
+    min_width: f32,
+) -> egui::Response {
+    egui::Frame::none()
+        .fill(fill)
+        .rounding(PILL_ROUNDING)
+        .inner_margin(egui::Margin::symmetric(9.0, 2.0))
+        .show(ui, |ui| {
+            ui.set_min_width(min_width);
+            ui.label(text)
+        })
+        .response
+}
+
+/// A button for something that cannot be taken back, such as replacing files.
+pub fn danger_button(text: impl Into<String>) -> egui::Button<'static> {
+    egui::Button::new(semibold(text, 14.0).color(Color32::WHITE))
+        .fill(DANGER)
+        .rounding(CONTROL_ROUNDING)
 }
 
 /// The one button on a screen that carries out its main action.
@@ -301,6 +356,63 @@ mod tests {
     fn neighbouring_scenes_never_share_a_colour() {
         for scene in 0..SCENE_COLORS.len() * 2 {
             assert_ne!(scene_color(scene), scene_color(scene + 1));
+        }
+    }
+
+    /// Relative luminance and contrast as WCAG 2 defines them.
+    fn luminance(color: Color32) -> f64 {
+        let channel = |value: u8| {
+            let share = f64::from(value) / 255.0;
+            if share <= 0.03928 {
+                share / 12.92
+            } else {
+                ((share + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+    }
+
+    fn contrast(one: Color32, other: Color32) -> f64 {
+        let (lighter, darker) = if luminance(one) > luminance(other) {
+            (luminance(one), luminance(other))
+        } else {
+            (luminance(other), luminance(one))
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    const READABLE: f64 = 4.5;
+
+    #[test]
+    fn white_text_can_be_read_on_every_scene_colour() {
+        for color in SCENE_COLORS.into_iter().chain([PRIMARY, DANGER]) {
+            assert!(contrast(Color32::WHITE, color) >= READABLE, "{color:?}");
+        }
+    }
+
+    #[test]
+    fn grey_text_can_be_read_on_every_background() {
+        let backgrounds = [
+            CARD,
+            SIDEBAR,
+            BACKGROUND,
+            MINT_TILE,
+            PEACH_TILE,
+            ROSE_TILE,
+            LAVENDER_TILE,
+        ];
+        for background in backgrounds {
+            assert!(
+                contrast(MUTED_TEXT, background) >= READABLE,
+                "{background:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coloured_text_can_be_read_on_a_card() {
+        for color in [TEXT, PRIMARY, DANGER, WARNING_TEXT, SUCCESS] {
+            assert!(contrast(color, CARD) >= READABLE, "{color:?}");
         }
     }
 

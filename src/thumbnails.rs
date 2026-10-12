@@ -8,8 +8,8 @@ use anyhow::{bail, Context, Result};
 use crate::black::TimeSpan;
 use crate::tools;
 
-pub const THUMBNAIL_WIDTH: usize = 160;
-pub const THUMBNAIL_HEIGHT: usize = 90;
+pub const THUMBNAIL_WIDTH: usize = 320;
+pub const THUMBNAIL_HEIGHT: usize = 180;
 const BYTES_PER_RGB_PIXEL: usize = 3;
 
 pub const PREVIEWS_PER_SEGMENT: usize = 4;

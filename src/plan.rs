@@ -469,4 +469,279 @@ mod tests {
         let mut plan = plan_with_cuts(&[]);
         assert_eq!(plan.add_cut_near(0.5), Err(AddCutError::NoKeyframeToCutOn));
     }
+
+    #[test]
+    fn a_plan_with_no_cuts_is_one_scene_of_the_whole_video() {
+        let plan = plan_with_cuts(&[]);
+
+        assert!(plan.is_as_detected());
+        assert!(plan.accepted_cuts().is_empty());
+        assert_eq!(
+            plan.scene_layouts(),
+            vec![SceneLayout {
+                span: VIDEO,
+                segments: vec![VIDEO],
+                first_segment: 0,
+                merged_cuts: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn moving_the_only_segment_out_changes_nothing() {
+        let mut plan = plan_with_cuts(&[]);
+        plan.isolate_segment(0);
+        assert_eq!(plan.scenes(), vec![VIDEO]);
+    }
+
+    #[test]
+    fn merging_past_the_last_scene_stops_at_the_last_scene() {
+        const SCENE_BEYOND_THE_LAST: usize = 9;
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+
+        plan.merge_scenes(3..=SCENE_BEYOND_THE_LAST);
+        assert_eq!(
+            plan.scenes(),
+            vec![
+                span(0.0, 2.0),
+                span(2.0, 4.0),
+                span(4.0, 6.0),
+                span(6.0, 10.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn merging_a_single_scene_changes_nothing() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.merge_scenes(2..=2);
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn scene_layouts_number_segments_and_cuts_across_the_whole_plan() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.merge_scenes(0..=1);
+        // The scenes are now 0-4, 4-6, 6-8 and 8-10.
+        plan.merge_scenes(2..=3);
+
+        assert_eq!(
+            plan.scene_layouts(),
+            vec![
+                SceneLayout {
+                    span: span(0.0, 4.0),
+                    segments: vec![span(0.0, 2.0), span(2.0, 4.0)],
+                    first_segment: 0,
+                    merged_cuts: vec![0],
+                },
+                SceneLayout {
+                    span: span(4.0, 6.0),
+                    segments: vec![span(4.0, 6.0)],
+                    first_segment: 2,
+                    merged_cuts: vec![],
+                },
+                SceneLayout {
+                    span: span(6.0, 10.0),
+                    segments: vec![span(6.0, 8.0), span(8.0, 10.0)],
+                    first_segment: 3,
+                    merged_cuts: vec![3],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reset_after_merging_and_moving_a_segment_out_gives_the_detected_scenes() {
+        let detected_cuts = [2.0, 4.0, 6.0, 8.0];
+        let mut plan = plan_with_cuts(&detected_cuts);
+        plan.merge_scenes(0..=4);
+        plan.isolate_segment(2);
+
+        plan.reset_to_detected();
+        assert_eq!(plan.scenes(), plan_with_cuts(&detected_cuts).scenes());
+    }
+
+    #[test]
+    fn moving_the_only_merged_segment_back_out_returns_to_the_detected_plan() {
+        let mut plan = plan_with_cuts(&[4.0, 8.0]);
+        plan.merge_scenes(0..=1);
+        assert!(!plan.is_as_detected());
+
+        plan.isolate_segment(0);
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn an_added_cut_that_is_merged_away_still_differs_from_the_detected_plan() {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        plan.add_cut_near(5.75).unwrap();
+        // The added cut at 6 separates scenes 1 and 2.
+        plan.merge_scenes(1..=2);
+
+        assert_eq!(plan.accepted_cuts(), vec![2.0, 8.0]);
+        assert!(!plan.is_as_detected());
+    }
+
+    #[test]
+    fn putting_saved_cuts_back_removes_a_cut_added_since() {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        let saved = plan.cuts().to_vec();
+
+        plan.add_cut_near(5.75).unwrap();
+        plan.restore_cuts(saved.clone());
+        assert_eq!(plan.cuts(), saved);
+    }
+
+    #[test]
+    fn a_cut_added_inside_a_merged_scene_splits_it_and_keeps_the_other_merges() {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        plan.merge_scenes(0..=2);
+
+        assert_eq!(plan.add_cut_near(5.75), Ok(6.0));
+        // The new cut sits between the two detected ones, so the cut at 8
+        // moves from index 1 to index 2.
+        assert_eq!(
+            plan.scene_layouts(),
+            vec![
+                SceneLayout {
+                    span: span(0.0, 6.0),
+                    segments: vec![span(0.0, 2.0), span(2.0, 6.0)],
+                    first_segment: 0,
+                    merged_cuts: vec![0],
+                },
+                SceneLayout {
+                    span: span(6.0, 10.0),
+                    segments: vec![span(6.0, 8.0), span(8.0, 10.0)],
+                    first_segment: 2,
+                    merged_cuts: vec![2],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn restoring_splits_leaves_the_cuts_on_the_edges_of_the_span_merged() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.merge_scenes(0..=4);
+
+        plan.restore_splits_within(span(2.0, 6.0));
+        assert_eq!(plan.accepted_cuts(), vec![4.0]);
+    }
+
+    #[test]
+    fn a_time_before_the_first_keyframe_lands_on_that_keyframe() {
+        let keyframes_starting_late = vec![2.0, 4.0];
+        let mut plan = SplitPlan::from_detected_cuts(&[], keyframes_starting_late, VIDEO);
+        assert_eq!(plan.add_cut_near(0.5), Ok(2.0));
+    }
+
+    #[test]
+    fn a_time_after_the_last_keyframe_lands_on_that_keyframe() {
+        let mut plan = plan_with_cuts(&[]);
+        assert_eq!(plan.add_cut_near(9.5), Ok(8.0));
+    }
+
+    #[test]
+    fn a_time_midway_between_two_keyframes_lands_on_the_earlier_one() {
+        let plan = plan_with_cuts(&[]);
+        assert_eq!(plan.cut_time_near(5.0), Ok(4.0));
+    }
+
+    #[test]
+    fn a_video_without_keyframes_cannot_take_a_cut() {
+        let mut plan = SplitPlan::from_detected_cuts(&[], Vec::new(), VIDEO);
+        assert_eq!(plan.add_cut_near(5.0), Err(AddCutError::NoKeyframeToCutOn));
+        assert!(plan.cuts().is_empty());
+    }
+
+    #[test]
+    fn a_time_outside_the_video_is_explained() {
+        assert_eq!(
+            AddCutError::OutsideVideo.to_string(),
+            "That time is outside the video."
+        );
+    }
+
+    #[test]
+    fn a_missing_keyframe_is_explained() {
+        assert_eq!(
+            AddCutError::NoKeyframeToCutOn.to_string(),
+            "There is no keyframe near that time to cut on."
+        );
+    }
+
+    #[test]
+    fn a_repeated_cut_is_explained_with_the_time_it_is_already_at() {
+        assert_eq!(
+            AddCutError::AlreadyProposed { at: 4.0 }.to_string(),
+            "There is already a split point at 00:00:04.000."
+        );
+    }
+
+    /// Runs edits of every kind on one plan, and calls `check` on the plan
+    /// before the first edit and after each one.
+    fn check_after_every_edit(check: impl Fn(&SplitPlan)) {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        let detected = plan.cuts().to_vec();
+        check(&plan);
+
+        plan.add_cut_near(5.75).unwrap();
+        check(&plan);
+        plan.merge_scenes(0..=2);
+        check(&plan);
+        plan.isolate_segment(1);
+        check(&plan);
+        plan.merge_scenes(1..=3);
+        check(&plan);
+        plan.add_cut_near(4.25).unwrap();
+        check(&plan);
+        plan.restore_splits_within(span(4.0, 10.0));
+        check(&plan);
+        plan.restore_cuts(detected);
+        check(&plan);
+        plan.reset_to_detected();
+        check(&plan);
+    }
+
+    #[test]
+    fn scenes_always_cover_the_whole_video_without_gaps() {
+        check_after_every_edit(|plan| {
+            let scenes = plan.scenes();
+            assert_eq!(scenes.first().map(|scene| scene.start), Some(VIDEO.start));
+            assert_eq!(scenes.last().map(|scene| scene.end), Some(VIDEO.end));
+            for neighbours in scenes.windows(2) {
+                assert_eq!(neighbours[0].end, neighbours[1].start);
+            }
+        });
+    }
+
+    #[test]
+    fn there_is_always_one_more_segment_than_cuts() {
+        check_after_every_edit(|plan| {
+            assert_eq!(plan.segments().len(), plan.cuts().len() + 1);
+        });
+    }
+
+    #[test]
+    fn scene_layouts_always_match_the_scenes_and_hold_every_segment_once() {
+        check_after_every_edit(|plan| {
+            let layouts = plan.scene_layouts();
+
+            let spans: Vec<TimeSpan> = layouts.iter().map(|layout| layout.span).collect();
+            assert_eq!(spans, plan.scenes());
+
+            let segments: Vec<TimeSpan> = layouts
+                .iter()
+                .flat_map(|layout| layout.segments.iter().copied())
+                .collect();
+            assert_eq!(segments, plan.segments());
+
+            let mut segments_before = 0;
+            for layout in &layouts {
+                assert_eq!(layout.first_segment, segments_before);
+                assert_eq!(layout.merged_cuts.len() + 1, layout.segments.len());
+                segments_before += layout.segments.len();
+            }
+        });
+    }
 }

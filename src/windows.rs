@@ -19,6 +19,12 @@ pub type FrameWindow = Range<usize>;
 /// in the small B-frames of ordinary quiet shots and gave 271.
 const TINY_PACKET_DIVISOR: u32 = 8;
 
+/// A packet this small is suspicious whatever the rest of the video looks
+/// like. Without it a video that is mostly black, or mostly still, has so
+/// small a median that nothing stands out against it and its black screens
+/// go unseen. Such a video is simply decoded in full.
+const ALWAYS_TINY_BYTES: u32 = 64;
+
 /// Tiny runs this close together are treated as one stretch. Black screens
 /// often contain a few larger packets (a keyframe, a flicker of noise).
 const MAX_GAP_INSIDE_STRETCH_SECONDS: f64 = 0.5;
@@ -32,7 +38,7 @@ const PADDING_SECONDS: f64 = 0.5;
 /// Still footage (title cards, frozen frames) also produces small packets.
 /// Those windows cost a little decoding time and are then rejected.
 pub fn suspicious_windows(packets: &[VideoPacket], min_black_seconds: f64) -> Vec<FrameWindow> {
-    let tiny_limit = median_packet_size(packets) / TINY_PACKET_DIVISOR;
+    let tiny_limit = (median_packet_size(packets) / TINY_PACKET_DIVISOR).max(ALWAYS_TINY_BYTES);
     let tiny_runs = runs_of_tiny_packets(packets, tiny_limit);
 
     let stretches = merge_windows(tiny_runs, |earlier, later| {
@@ -204,5 +210,139 @@ mod tests {
         for window in &windows {
             assert!(packets[window.start].is_keyframe);
         }
+    }
+
+    const NORMAL_BYTES: u32 = 4000;
+    const BLACK_BYTES: u32 = 25;
+    const MIN_BLACK_SECONDS: f64 = 0.3;
+    /// Half of it is one second, which is eight frame intervals.
+    const LONG_MIN_BLACK_SECONDS: f64 = 2.0;
+
+    fn without_keyframes(mut packets: Vec<VideoPacket>) -> Vec<VideoPacket> {
+        for packet in &mut packets {
+            packet.is_keyframe = false;
+        }
+        packets
+    }
+
+    #[test]
+    fn a_video_without_packets_has_no_suspicious_windows() {
+        assert!(suspicious_windows(&[], MIN_BLACK_SECONDS).is_empty());
+    }
+
+    #[test]
+    fn a_packet_exactly_at_the_tiny_limit_is_suspicious() {
+        let mut sizes = vec![NORMAL_BYTES; 100];
+        sizes[40..50].fill(NORMAL_BYTES / TINY_PACKET_DIVISOR);
+        let packets = packets_with_sizes(&sizes);
+        assert_eq!(
+            suspicious_windows(&packets, MIN_BLACK_SECONDS),
+            vec![36..54]
+        );
+    }
+
+    #[test]
+    fn a_video_that_is_black_throughout_is_decoded_in_full() {
+        // Next to its own median nothing stands out, but packets this small
+        // are suspicious on their own.
+        let packets = packets_with_sizes(&[BLACK_BYTES; 100]);
+        assert_eq!(
+            suspicious_windows(&packets, MIN_BLACK_SECONDS),
+            vec![0..100]
+        );
+    }
+
+    #[test]
+    fn a_tiny_run_lasting_exactly_half_the_minimum_is_kept() {
+        // Three frames span two frame intervals, a quarter of a second.
+        const TWICE_THE_RUN_SECONDS: f64 = 0.5;
+        let packets = footage_with_tiny_frames(100, &[40, 41, 42]);
+        assert_eq!(
+            suspicious_windows(&packets, TWICE_THE_RUN_SECONDS),
+            vec![36..47]
+        );
+    }
+
+    #[test]
+    fn tiny_runs_exactly_the_maximum_gap_apart_count_as_one_stretch() {
+        // Frames 43 and 47 are half a second apart. Each run alone lasts
+        // 0.375 seconds, too short to keep. Joined they last 1.25 seconds.
+        let tiny: Vec<usize> = (40..44).chain(47..51).collect();
+        let packets = footage_with_tiny_frames(100, &tiny);
+        assert_eq!(
+            suspicious_windows(&packets, LONG_MIN_BLACK_SECONDS),
+            vec![36..55]
+        );
+    }
+
+    #[test]
+    fn tiny_runs_just_over_the_maximum_gap_apart_are_judged_separately() {
+        // Frames 43 and 48 are 0.625 seconds apart, so neither short run
+        // gets the other's length added to its own.
+        let tiny: Vec<usize> = (40..44).chain(48..52).collect();
+        let packets = footage_with_tiny_frames(100, &tiny);
+        assert!(suspicious_windows(&packets, LONG_MIN_BLACK_SECONDS).is_empty());
+    }
+
+    #[test]
+    fn windows_that_touch_after_padding_become_one() {
+        // The runs are too far apart to be one stretch, but four frames of
+        // padding on each side make 16..34 and 34..52.
+        let tiny: Vec<usize> = (20..30).chain(38..48).collect();
+        let packets = footage_with_tiny_frames(100, &tiny);
+        assert_eq!(
+            suspicious_windows(&packets, MIN_BLACK_SECONDS),
+            vec![16..52]
+        );
+    }
+
+    #[test]
+    fn windows_one_frame_apart_after_padding_stay_separate() {
+        let tiny: Vec<usize> = (20..30).chain(39..49).collect();
+        let packets = footage_with_tiny_frames(100, &tiny);
+        assert_eq!(
+            suspicious_windows(&packets, MIN_BLACK_SECONDS),
+            vec![16..34, 35..53]
+        );
+    }
+
+    #[test]
+    fn the_median_of_an_even_count_is_the_upper_of_the_two_middle_sizes() {
+        let packets = packets_with_sizes(&[40, 10, 30, 20]);
+        assert_eq!(median_packet_size(&packets), 30);
+    }
+
+    #[test]
+    fn a_video_without_packets_has_no_whole_video_windows() {
+        assert!(whole_video_windows(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn asking_for_zero_windows_gives_one_window_over_everything() {
+        let packets = footage_with_tiny_frames(95, &[]);
+        assert_eq!(whole_video_windows(&packets, 0), vec![0..95]);
+    }
+
+    #[test]
+    fn a_window_runs_on_to_the_next_keyframe() {
+        let packets = footage_with_tiny_frames(30, &[]);
+        // Half the frames would end the first window at frame 15, between
+        // the keyframes at 10 and 20.
+        assert_eq!(whole_video_windows(&packets, 2), vec![0..20, 20..30]);
+    }
+
+    #[test]
+    fn a_video_without_keyframes_is_one_window() {
+        let packets = without_keyframes(footage_with_tiny_frames(95, &[]));
+        assert_eq!(whole_video_windows(&packets, 4), vec![0..95]);
+    }
+
+    #[test]
+    fn asking_for_more_windows_than_keyframes_gives_one_window_per_keyframe() {
+        let packets = footage_with_tiny_frames(25, &[]);
+        assert_eq!(
+            whole_video_windows(&packets, 100),
+            vec![0..10, 10..20, 20..25]
+        );
     }
 }

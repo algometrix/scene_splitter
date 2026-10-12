@@ -17,15 +17,18 @@ use crate::export::{ExportOptions, OriginalPolicy, TRASH_NAME};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::plan::{AddCutError, CutChoice, ProposedCut, SceneLayout, SplitPlan};
 use crate::selection::{ClickKind, SceneSelection};
+use crate::settings::Settings;
 use crate::split::{self, SceneLocation};
 use crate::theme::{self, scene_color};
 use crate::thumbnails::{self, Thumbnail, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH};
-use crate::timecode::{format_duration, format_timestamp, parse_timestamp};
+use crate::timecode::{format_clock, format_duration, format_timestamp, parse_timestamp};
 
 const NEW_CUT_FIELD_WIDTH: f32 = 90.0;
+/// The room the "Add a split at" label, box and button take together.
+const NEW_CUT_CONTROLS_WIDTH: f32 = 340.0;
 const PREVIEW_ROUNDING: f32 = 6.0;
 const SPACE_BETWEEN_SCENES: f32 = 10.0;
-const FILE_NAME_FONT_SIZE: f32 = 18.0;
+const FILE_NAME_FONT_SIZE: f32 = 16.0;
 const SECONDS_PER_MINUTE: f64 = 60.0;
 /// The range offered for the shortest scene a hard-cut scan may produce.
 const MIN_SCENE_MINUTES: std::ops::RangeInclusive<f64> = 0.5..=60.0;
@@ -60,9 +63,38 @@ const LONG_SCENE_OUTLINE_WIDTH: f32 = 3.0;
 const AUTO_SCROLL_EDGE: f32 = 48.0;
 const AUTO_SCROLL_STEP: f32 = 14.0;
 const DRAG_HINT_OFFSET: egui::Vec2 = egui::vec2(16.0, 16.0);
-const HOW_TO_USE: &str =
-    "Drag a scene onto another to merge them and everything between. Click a preview to play from there. \
-     Shift-click or Ctrl-click to select several, M merges, Ctrl+Z undoes.";
+/// What each tip is about, and the tip itself. Three, because a first-time
+/// user reads three lines and skips eight.
+const TIPS: [(&str, &str); 3] = [
+    (
+        "Join",
+        "Drag one scene onto another, or press Join between two scenes.",
+    ),
+    (
+        "Cut",
+        "Click a picture to play from there, then press S where the scene should end.",
+    ),
+    (
+        "Undo",
+        "Ctrl+Z takes back the last change. Reset scenes goes back to the scenes as found.",
+    ),
+];
+const TIP_TOPIC_WIDTH: f32 = 56.0;
+const TIP_COLUMN_GAP: f32 = 24.0;
+const MIN_TIP_WIDTH: f32 = 120.0;
+const NOTHING_FOUND_HINT: &str = "Only one scene was found, so there is nothing to split yet. \
+     If this video changes scene without a black screen, press \"Scenes missed?\" above. \
+     You can also click a picture and press S in the player to split by hand.";
+const RESCAN_WARNING: &str = "Scanning again removes the merges and splits you made on this video.";
+
+/// Previews are drawn as wide as the card allows, within these limits.
+const PREVIEWS_PER_ROW: f32 = 4.0;
+const MIN_PREVIEW_WIDTH: f32 = 96.0;
+const MAX_PREVIEW_WIDTH: f32 = 240.0;
+const PREVIEW_ASPECT: f32 = 9.0 / 16.0;
+/// Room kept beside the previews of a merged scene for its length and button.
+const MERGED_PART_CONTROLS_WIDTH: f32 = 200.0;
+const SCENE_BADGE_MIN_WIDTH: f32 = 56.0;
 
 /// What the person asked for on the review screen.
 pub enum ReviewRequest {
@@ -123,6 +155,8 @@ struct SceneListInput {
     segment_to_isolate: Option<usize>,
     /// The time of a preview the person clicked, to play the video from.
     play_from: Option<f64>,
+    /// The scene to join with the one after it.
+    join_with_next: Option<usize>,
 }
 
 impl SceneListInput {
@@ -162,6 +196,29 @@ pub struct Review {
     new_cut_text: String,
     new_cut_feedback: String,
     export_obstacle: Option<ExportObstacle>,
+    /// Whether the options for finding missed scenes are shown.
+    missed_scenes_open: bool,
+    /// A scan the person asked for that would throw away their edits, until
+    /// they confirm or cancel it.
+    rescan_awaiting_consent: Option<Rescan>,
+    /// How the scan read the video, for the curious.
+    scan_details: String,
+}
+
+/// The two ways of scanning a video again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Rescan {
+    BlackScreens,
+    WithSuddenChanges,
+}
+
+impl Rescan {
+    fn request(self) -> ReviewRequest {
+        match self {
+            Self::BlackScreens => ReviewRequest::ScanAgain,
+            Self::WithSuddenChanges => ReviewRequest::FindHardCuts,
+        }
+    }
 }
 
 impl Review {
@@ -169,11 +226,21 @@ impl Review {
     /// detection: its black-screen cuts, or those plus its hard cuts.
     pub fn new(video: Arc<Path>, detection: Detection, cuts: Vec<f64>, scan_note: &str) -> Self {
         let frame_seconds = detection.video.seconds() / detection.frame_count.max(1) as f64;
-        let scan_summary = format!(
-            "{} black screens found, {} of {} frames decoded. {scan_note}",
-            detection.black_screens.len(),
-            detection.decoded_frames,
-            detection.frame_count
+        let black_screens = counted(detection.black_screens.len(), "black screen");
+        let sudden_changes = cuts.len().saturating_sub(detection.cuts.len());
+        let found = if sudden_changes > 0 {
+            format!(
+                "Found {}: {black_screens}, {}.",
+                counted(cuts.len(), "scene change"),
+                counted(sudden_changes, "sudden picture change")
+            )
+        } else {
+            format!("Found {black_screens}.")
+        };
+        let scan_summary = format!("{found} {scan_note}");
+        let scan_details = format!(
+            "{} of {} frames were decoded to find them.",
+            detection.decoded_frames, detection.frame_count
         );
         let plan = SplitPlan::from_detected_cuts(&cuts, detection.keyframe_times, detection.video);
         let (loaded_previews_sender, loaded_previews) = mpsc::channel();
@@ -194,6 +261,9 @@ impl Review {
             new_cut_text: String::new(),
             new_cut_feedback: String::new(),
             export_obstacle: None,
+            missed_scenes_open: false,
+            rescan_awaiting_consent: None,
+            scan_details,
         }
     }
 
@@ -220,22 +290,24 @@ impl Review {
     }
 
     /// `playhead` is where the player is in this video, if it is playing it.
+    ///
+    /// The header stays put and holds only what is needed all the time: the
+    /// name, the main action, the timeline and the editing buttons. The
+    /// numbers, hints and tips scroll with the scenes, so the scenes always
+    /// have room however small the window is.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        export_options: &mut ExportOptions,
-        hard_cut_settings: &mut HardCutSettings,
+        settings: &mut Settings,
         playhead: Option<f64>,
     ) -> Option<ReviewRequest> {
         self.receive_loaded_previews(ctx);
         self.handle_shortcuts(ctx);
 
         let request = egui::TopBottomPanel::top("review_header")
-            .frame(theme::panel(theme::BACKGROUND))
+            .frame(theme::header_panel())
             .show_separator_line(false)
-            .show(ctx, |ui| {
-                self.show_header(ui, export_options, hard_cut_settings, playhead)
-            })
+            .show(ctx, |ui| self.show_header(ui, settings, playhead))
             .inner;
         let input = egui::CentralPanel::default()
             .frame(theme::panel(theme::BACKGROUND))
@@ -245,7 +317,10 @@ impl Review {
                     .auto_shrink([false, false])
                     // Dragging moves scenes, the wheel and scroll bar scroll.
                     .drag_to_scroll(false)
-                    .show(ui, |ui| self.show_scenes(ui))
+                    .show(ui, |ui| {
+                        self.show_overview(ui, &mut settings.show_tips);
+                        self.show_scenes(ui)
+                    })
                     .inner
             })
             .inner;
@@ -258,57 +333,160 @@ impl Review {
     fn show_header(
         &mut self,
         ui: &mut egui::Ui,
-        export_options: &mut ExportOptions,
-        hard_cut_settings: &mut HardCutSettings,
+        settings: &mut Settings,
         playhead: Option<f64>,
     ) -> Option<ReviewRequest> {
-        let mut request = None;
-        // Wrapped, because a long file name on one line would push the whole
-        // header wider than the window.
-        ui.horizontal_wrapped(|ui| {
-            ui.label(theme::semibold(file_name(&self.video), FILE_NAME_FONT_SIZE));
-            ui.label(theme::caption(&self.scan_summary));
-            if ui.small_button("Scan again").clicked() {
-                request = Some(ReviewRequest::ScanAgain);
-            }
-        });
-        if show_hard_cut_controls(ui, hard_cut_settings) {
-            request = Some(ReviewRequest::FindHardCuts);
-        }
-
-        ui.horizontal(|ui| {
-            self.show_key_numbers(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Laid out from the right, so the main action comes first.
-                let scene_count = self.scene_count();
-                let label = format!("Split into {}", counted(scene_count, "file"));
-                // One scene is the untouched video, there is nothing to write.
-                let export_button = ui.add_enabled(scene_count > 1, theme::primary_button(label));
-                if export_button.clicked() {
-                    request = self.request_export(export_options);
-                }
-                if ui.button("Skip this video").clicked() {
-                    request = Some(ReviewRequest::Skip);
-                }
-            });
-        });
+        let mut request = self.show_title_and_main_action(ui, &settings.export);
         if self.show_export_obstacle(ui) {
             request = Some(ReviewRequest::Export);
         }
-
+        if self.show_export_options(ui, &mut settings.export) {
+            self.export_obstacle = None;
+        }
         self.show_timeline(ui, playhead);
-
         ui.horizontal_wrapped(|ui| {
             self.show_merge_controls(ui);
             self.show_undo_and_reset(ui);
             ui.separator();
+            // The label, box and button stay together: when they do not all
+            // fit on this row they start the next one.
+            if ui.available_size_before_wrap().x < NEW_CUT_CONTROLS_WIDTH {
+                ui.end_row();
+            }
             self.show_new_cut_controls(ui);
+            if !settings.show_tips && ui.button("Show tips").clicked() {
+                settings.show_tips = true;
+            }
         });
-        if self.show_export_options(ui, export_options) {
-            self.export_obstacle = None;
-        }
-        ui.label(theme::caption(HOW_TO_USE));
+        request.or(self.show_scan_row(ui, &mut settings.hard_cuts))
+    }
+
+    /// The video's name, cut short if it is long, with the two things that
+    /// end the review at the right edge where they are always in view.
+    fn show_title_and_main_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        export_options: &ExportOptions,
+    ) -> Option<ReviewRequest> {
+        let mut request = None;
+        ui.horizontal(|ui| {
+            // Laid out from the right, so the buttons keep their place and
+            // the name takes whatever room is left.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let scene_count = self.scene_count();
+                let label = format!("Split into {}", counted(scene_count, "file"));
+                // One scene is the untouched video, there is nothing to write.
+                let export_button = ui
+                    .add_enabled(scene_count > 1, theme::primary_button(label))
+                    .on_disabled_hover_text(
+                        "There is only one scene, so there is nothing to split.",
+                    );
+                if export_button.clicked() {
+                    request = self.request_export(export_options);
+                }
+                let skip_button = ui
+                    .button("Skip this video")
+                    .on_hover_text("Leaves this video as it is. Nothing is written.");
+                if skip_button.clicked() {
+                    request = Some(ReviewRequest::Skip);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let name = file_name(&self.video);
+                    ui.add(
+                        egui::Label::new(theme::semibold(&name, FILE_NAME_FONT_SIZE)).truncate(),
+                    )
+                    .on_hover_text(name);
+                });
+            });
+        });
         request
+    }
+
+    /// What the scan found, and the ways to scan again.
+    fn show_scan_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        hard_cuts: &mut HardCutSettings,
+    ) -> Option<ReviewRequest> {
+        let mut wanted = None;
+        ui.horizontal_wrapped(|ui| {
+            // Same text size as the links beside it, so the line reads level.
+            ui.label(theme::muted(&self.scan_summary))
+                .on_hover_text(&self.scan_details);
+            let scan_again = ui
+                .link("Scan again")
+                .on_hover_text("Looks for black screens again, with the current settings.");
+            if scan_again.clicked() {
+                wanted = Some(Rescan::BlackScreens);
+            }
+            let missed_label = if self.missed_scenes_open {
+                "Hide the options for missed scenes"
+            } else {
+                "Scenes missed?"
+            };
+            let missed = ui
+                .link(missed_label)
+                .on_hover_text("For videos that change scene without a black screen.");
+            if missed.clicked() {
+                self.missed_scenes_open = !self.missed_scenes_open;
+            }
+        });
+        if self.missed_scenes_open && show_sudden_change_controls(ui, hard_cuts) {
+            wanted = Some(Rescan::WithSuddenChanges);
+        }
+
+        // A scan replaces the scenes, so edits are not thrown away unasked.
+        if let Some(rescan) = wanted {
+            if self.is_edited() {
+                self.rescan_awaiting_consent = Some(rescan);
+            } else {
+                return Some(rescan.request());
+            }
+        }
+        self.show_rescan_consent(ui)
+    }
+
+    fn show_rescan_consent(&mut self, ui: &mut egui::Ui) -> Option<ReviewRequest> {
+        let rescan = self.rescan_awaiting_consent?;
+        let mut request = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(theme::WARNING_TEXT, RESCAN_WARNING);
+            if ui.add(theme::danger_button("Scan again anyway")).clicked() {
+                self.rescan_awaiting_consent = None;
+                request = Some(rescan.request());
+            }
+            if ui.button("Cancel").clicked() {
+                self.rescan_awaiting_consent = None;
+            }
+        });
+        request
+    }
+
+    fn is_edited(&self) -> bool {
+        !self.undo_history.is_empty() || !self.plan.is_as_detected()
+    }
+
+    /// The part that scrolls away above the scenes: the key numbers, what
+    /// deserves attention, and the tips.
+    fn show_overview(&self, ui: &mut egui::Ui, show_tips: &mut bool) {
+        ui.horizontal_wrapped(|ui| self.show_key_numbers(ui));
+        if self.scene_count() == 1 {
+            show_note(ui, NOTHING_FOUND_HINT, theme::PEACH_TILE);
+        }
+        for (scene, span) in self.plan.scenes().into_iter().enumerate() {
+            if is_long_scene(span) {
+                let warning = format!(
+                    "Scene {} is {} long. A scene change may have been missed inside it.",
+                    scene + 1,
+                    format_duration(span.seconds())
+                );
+                show_note(ui, &warning, theme::ROSE_TILE);
+            }
+        }
+        if *show_tips {
+            show_tips_card(ui, show_tips);
+        }
+        ui.add_space(SPACE_BETWEEN_SCENES);
     }
 
     /// The numbers a person wants at a glance: how many scenes the split
@@ -354,7 +532,7 @@ impl Review {
             theme::stat_tile(
                 ui,
                 &piece_count.to_string(),
-                "detected pieces, now merged",
+                "parts, merged into these scenes",
                 theme::BACKGROUND,
                 theme::MUTED_TEXT,
             );
@@ -453,9 +631,9 @@ impl Review {
         let mut confirmed = false;
         match &self.export_obstacle {
             Some(ExportObstacle::ExistingFiles(warning)) => {
-                ui.horizontal(|ui| {
-                    ui.colored_label(theme::ACCENT, warning);
-                    confirmed = ui.button("Replace them").clicked();
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(theme::WARNING_TEXT, warning);
+                    confirmed = ui.add(theme::danger_button("Replace them")).clicked();
                 });
             }
             Some(ExportObstacle::Error(error)) => {
@@ -466,14 +644,20 @@ impl Review {
         confirmed
     }
 
-    /// Returns true when the person changed where the scenes go.
+    /// What happens to the original and where the scenes go, right under
+    /// the button they belong to. Returns true when the place changed.
     fn show_export_options(&self, ui: &mut egui::Ui, export_options: &mut ExportOptions) -> bool {
         let mut location_changed = false;
         ui.horizontal_wrapped(|ui| {
             let mut recycle = export_options.original_policy == OriginalPolicy::RecycleOnceVerified;
-            let recycle_label =
-                format!("Move the original to the {TRASH_NAME} once the scenes are verified");
-            if ui.checkbox(&mut recycle, recycle_label).changed() {
+            let recycle_label = format!(
+                "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
+            );
+            let recycle_box = ui.checkbox(&mut recycle, recycle_label).on_hover_text(format!(
+                "The check compares the new files with the original. If anything is missing \
+                 or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
+            ));
+            if recycle_box.changed() {
                 export_options.original_policy = if recycle {
                     OriginalPolicy::RecycleOnceVerified
                 } else {
@@ -494,7 +678,13 @@ impl Review {
                 location_changed = true;
             }
             if let Ok(dir) = split::scene_dir(&self.video, export_options.scene_location) {
-                ui.label(theme::caption(format!("Scenes go to {}", dir.display())));
+                let destination = dir.display().to_string();
+                ui.add(
+                    // Body size, so it lines up with the checkbox text before it.
+                    egui::Label::new(theme::muted(format!("Scenes go to {destination}")))
+                        .truncate(),
+                )
+                .on_hover_text(destination);
             }
         });
         location_changed
@@ -506,40 +696,45 @@ impl Review {
             Some(span) => merge_description(span),
             None => "Merge selected".to_owned(),
         };
-        let merge_button = egui::Button::new(merge_label);
-        if ui
-            .add_enabled(span_to_merge.is_some(), merge_button)
-            .clicked()
-        {
+        let merge_button = ui
+            .add_enabled(span_to_merge.is_some(), egui::Button::new(merge_label))
+            .on_hover_text("Joins the selected scenes into one (M).")
+            .on_disabled_hover_text(
+                "Click a scene, then Shift-click another, to choose the scenes to merge.",
+            );
+        if merge_button.clicked() {
             if let Some(span) = span_to_merge {
                 self.merge_scenes(span);
             }
         }
 
         let merged_scenes_selected = self.selected_layouts().iter().any(is_merged);
-        let split_apart_button = egui::Button::new("Split selected apart");
-        if ui
-            .add_enabled(merged_scenes_selected, split_apart_button)
-            .clicked()
-        {
+        let undo_merge_button = ui
+            .add_enabled(merged_scenes_selected, egui::Button::new("Undo merge"))
+            .on_hover_text("Takes the selected merged scenes apart again.")
+            .on_disabled_hover_text("Select a merged scene to take it apart again.");
+        if undo_merge_button.clicked() {
             self.split_selected_apart();
         }
     }
 
     fn show_undo_and_reset(&mut self, ui: &mut egui::Ui) {
-        let undo_button = egui::Button::new("Undo");
         let undo_clicked = ui
-            .add_enabled(!self.undo_history.is_empty(), undo_button)
-            .on_hover_text("Take back the last change (Ctrl+Z).")
+            .add_enabled(!self.undo_history.is_empty(), egui::Button::new("Undo"))
+            .on_hover_text("Takes back the last change (Ctrl+Z).")
+            .on_disabled_hover_text("Nothing to take back yet.")
             .clicked();
         if undo_clicked {
             self.undo();
         }
 
-        let reset_button = egui::Button::new("Reset");
         let reset_clicked = ui
-            .add_enabled(!self.plan.is_as_detected(), reset_button)
-            .on_hover_text("Undo every merge and remove the splits you added.")
+            .add_enabled(
+                !self.plan.is_as_detected(),
+                egui::Button::new("Reset scenes"),
+            )
+            .on_hover_text("Undoes every merge and removes the splits you added.")
+            .on_disabled_hover_text("The scenes are as the scan found them.")
             .clicked();
         if reset_clicked {
             self.edit_plan(SplitPlan::reset_to_detected);
@@ -547,17 +742,22 @@ impl Review {
     }
 
     fn show_new_cut_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label("Add a split at");
-        let field = ui.add(
-            egui::TextEdit::singleline(&mut self.new_cut_text)
-                .hint_text("1:03:12")
-                .desired_width(NEW_CUT_FIELD_WIDTH),
-        );
-        let pressed_enter =
-            field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if ui.button("Add").clicked() || pressed_enter {
-            self.add_requested_cut();
-        }
+        // One unit, so a narrow window wraps all three together.
+        ui.horizontal(|ui| {
+            ui.label("Add a split at");
+            // A hint that is a real time in this video, not one beyond its end.
+            let example_time = format_clock(self.plan.video().seconds() / 2.0);
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.new_cut_text)
+                    .hint_text(example_time)
+                    .desired_width(NEW_CUT_FIELD_WIDTH),
+            );
+            let pressed_enter =
+                field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if ui.button("Add split").clicked() || pressed_enter {
+                self.add_requested_cut();
+            }
+        });
         ui.label(theme::muted(&self.new_cut_feedback));
     }
 
@@ -679,14 +879,21 @@ impl Review {
         let drop_target = self.drop_target(ui.ctx());
         let cards_last_frame = std::mem::take(&mut self.scene_cards);
         let mut input = SceneListInput::default();
-        for (scene, layout) in self.plan.scene_layouts().iter().enumerate() {
+        let layouts = self.plan.scene_layouts();
+        for (scene, layout) in layouts.iter().enumerate() {
             let card_last_frame = cards_last_frame.get(scene).copied();
             let card = self.show_scene(ui, scene, layout, card_last_frame, drop_target, &mut input);
             if self.scene_to_scroll_to == Some(scene) {
                 ui.scroll_to_rect(card, Some(egui::Align::TOP));
             }
             self.scene_cards.push(card);
-            ui.add_space(SPACE_BETWEEN_SCENES);
+
+            let is_last_scene = scene + 1 == layouts.len();
+            if is_last_scene {
+                ui.add_space(SPACE_BETWEEN_SCENES);
+            } else if show_join_button(ui, scene) {
+                input.join_with_next = Some(scene);
+            }
         }
         self.scene_to_scroll_to = None;
         input
@@ -771,10 +978,18 @@ impl Review {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 show_scene_heading(ui, scene, layout, color);
+                let room_for_previews = if is_merged(layout) {
+                    ui.available_width() - MERGED_PART_CONTROLS_WIDTH
+                } else {
+                    ui.available_width()
+                };
+                let preview_size = preview_size_for(room_for_previews, ui.spacing().item_spacing.x);
                 for (segment_index, segment) in layout.segments.iter().enumerate() {
-                    ui.horizontal(|ui| {
+                    // Wrapped, so a narrow card shows two rows of pictures
+                    // instead of cutting the last ones off.
+                    ui.horizontal_wrapped(|ui| {
                         for time in thumbnails::preview_times(*segment) {
-                            if self.show_preview(ui, time) {
+                            if self.show_preview(ui, time, preview_size) {
                                 input.note_preview_click(scene, time, ui);
                             }
                         }
@@ -790,8 +1005,11 @@ impl Review {
                     });
                     if let Some(&cut_index) = layout.merged_cuts.get(segment_index) {
                         let cut_time = self.plan.cuts()[cut_index].time;
-                        let label = format!("Split here ({})", format_timestamp(cut_time));
-                        if ui.small_button(label).clicked() {
+                        let label = format!("Separate here ({})", format_clock(cut_time));
+                        let separate = ui
+                            .button(label)
+                            .on_hover_text("Splits the merged scene in two at this point again.");
+                        if separate.clicked() {
                             input.cut_to_split_again = Some(cut_index);
                         }
                     }
@@ -817,7 +1035,11 @@ impl Review {
     fn drop_target(&self, ctx: &egui::Context) -> Option<usize> {
         let source = self.dragged_scene?;
         let pointer = ctx.pointer_latest_pos()?;
-        if !self.list_area.contains(pointer) {
+        // A floating window, such as the player, may be covering the list.
+        let over_the_list_itself = ctx
+            .layer_id_at(pointer)
+            .is_some_and(|layer| layer.order == egui::Order::Background);
+        if !self.list_area.contains(pointer) || !over_the_list_itself {
             return None;
         }
         self.scene_cards
@@ -849,6 +1071,10 @@ impl Review {
         }
         if let Some(cut_index) = input.cut_to_split_again {
             self.edit_plan(|plan| plan.set_choice(cut_index, CutChoice::Split));
+            return;
+        }
+        if let Some(scene) = input.join_with_next {
+            self.merge_scenes(scene..=scene + 1);
             return;
         }
         if let Some(scene) = input.clicked_scene {
@@ -895,29 +1121,31 @@ impl Review {
 
     /// Draws one preview. Returns true when it was clicked, which plays the
     /// video from that moment.
-    fn show_preview(&mut self, ui: &mut egui::Ui, time: f64) -> bool {
-        let size = egui::vec2(THUMBNAIL_WIDTH as f32, THUMBNAIL_HEIGHT as f32);
+    fn show_preview(&mut self, ui: &mut egui::Ui, time: f64, size: egui::Vec2) -> bool {
         let key = preview_key(time);
-        if !self.previews.contains_key(&key) {
+        // Only previews that can be seen are fetched, so opening a video of
+        // sixty scenes does not start hundreds of ffmpeg runs at once.
+        let about_to_be_drawn_at = egui::Rect::from_min_size(ui.cursor().min, size);
+        if !self.previews.contains_key(&key) && ui.is_rect_visible(about_to_be_drawn_at) {
             self.start_loading_preview(ui.ctx(), key, time);
         }
 
         // Previews take clicks but not drags, so a drag that starts on a
         // preview still moves the whole scene card underneath.
-        let response = match &self.previews[&key] {
-            Preview::Ready(texture) => ui.add(
+        let response = match self.previews.get(&key) {
+            Some(Preview::Ready(texture)) => ui.add(
                 egui::Image::new((texture.id(), size))
                     .rounding(PREVIEW_ROUNDING)
                     .sense(egui::Sense::click()),
             ),
-            Preview::Loading => show_placeholder(ui, size, "Loading"),
-            Preview::Failed => show_placeholder(ui, size, "No preview"),
+            Some(Preview::Failed) => show_placeholder(ui, size, "No preview"),
+            Some(Preview::Loading) | None => show_placeholder(ui, size, "Loading"),
         };
         let clicked = response.clicked();
         if self.dragged_scene.is_none() {
             response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(format!("Play from {}", format_timestamp(time)));
+                .on_hover_text(format!("Play from {}", format_clock(time)));
         }
         clicked
     }
@@ -965,29 +1193,81 @@ impl Review {
     }
 }
 
-/// The controls of the slower scan, which a person chooses per video.
-/// Returns true when they asked for it.
-fn show_hard_cut_controls(ui: &mut egui::Ui, settings: &mut HardCutSettings) -> bool {
+/// How to use the review screen, for someone seeing it for the first time.
+/// It scrolls away with the scenes, can be hidden, and the choice is kept.
+fn show_tips_card(ui: &mut egui::Ui, show_tips: &mut bool) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::semibold("How to use this screen", 14.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Hide tips").clicked() {
+                    *show_tips = false;
+                }
+            });
+        });
+        // A grid cell does not wrap unless it is told how wide it may be.
+        let room_for_a_tip =
+            (ui.available_width() - TIP_TOPIC_WIDTH - TIP_COLUMN_GAP).max(MIN_TIP_WIDTH);
+        egui::Grid::new("tips")
+            .num_columns(2)
+            // Rows of text need not be as tall as rows of buttons.
+            .min_row_height(0.0)
+            .min_col_width(TIP_TOPIC_WIDTH)
+            .max_col_width(room_for_a_tip)
+            .show(ui, |ui| {
+                for (topic, tip) in TIPS {
+                    ui.label(theme::semibold(topic, 13.0).color(theme::PRIMARY));
+                    ui.add(egui::Label::new(tip).wrap());
+                    ui.end_row();
+                }
+            });
+    });
+}
+
+/// A line of advice on a tinted band, as wide as the list.
+fn show_note(ui: &mut egui::Ui, text: &str, tint: egui::Color32) {
+    egui::Frame::none()
+        .fill(tint)
+        .rounding(theme::CONTROL_ROUNDING)
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(text);
+        });
+}
+
+/// The small button between two scene cards. Returns true when clicked.
+fn show_join_button(ui: &mut egui::Ui, scene: usize) -> bool {
+    let label = format!("Join scenes {} and {}", scene + 1, scene + 2);
+    ui.vertical_centered(|ui| {
+        ui.add(egui::Button::new(theme::caption(label)).frame(false))
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Makes these two scenes one. You can also drag one onto the other.")
+            .clicked()
+    })
+    .inner
+}
+
+/// The options of the slower scan, for videos that change scene without a
+/// black screen. Returns true when the person asked for that scan.
+fn show_sudden_change_controls(ui: &mut egui::Ui, settings: &mut HardCutSettings) -> bool {
     let mut requested = false;
     ui.horizontal_wrapped(|ui| {
-        ui.label(theme::caption("No black screens between scenes?"));
-        requested = ui
-            .small_button("Find hard cuts")
-            .on_hover_text(
-                "Looks at every frame for abrupt picture changes. This takes far longer than the normal scan.",
-            )
-            .clicked();
-
-        ui.label(theme::caption("sensitivity"));
-        egui::ComboBox::from_id_salt("hard_cut_sensitivity")
+        ui.label("Detect");
+        egui::ComboBox::from_id_salt("sudden_change_sensitivity")
             .selected_text(settings.sensitivity.label())
             .show_ui(ui, |ui| {
                 for sensitivity in Sensitivity::ALL {
-                    ui.selectable_value(&mut settings.sensitivity, sensitivity, sensitivity.label());
+                    ui.selectable_value(
+                        &mut settings.sensitivity,
+                        sensitivity,
+                        sensitivity.label(),
+                    );
                 }
             });
 
-        ui.label(theme::caption("shortest scene"));
+        ui.label("and ignore scenes shorter than");
         let mut minutes = settings.min_scene_seconds / SECONDS_PER_MINUTE;
         let shortest_scene = egui::DragValue::new(&mut minutes)
             .range(MIN_SCENE_MINUTES)
@@ -997,8 +1277,25 @@ fn show_hard_cut_controls(ui: &mut egui::Ui, settings: &mut HardCutSettings) -> 
         if ui.add(shortest_scene).changed() {
             settings.min_scene_seconds = minutes * SECONDS_PER_MINUTE;
         }
+
+        requested = ui
+            .button("Look for sudden picture changes")
+            .on_hover_text(
+                "Looks at every picture of the video for places where it changes abruptly. \
+                 This takes much longer than the first scan.",
+            )
+            .clicked();
     });
     requested
+}
+
+/// How big to draw a preview so that a full row fits the width given.
+fn preview_size_for(available_width: f32, gap: f32) -> egui::Vec2 {
+    let gaps = gap * (PREVIEWS_PER_ROW - 1.0);
+    let width = ((available_width - gaps) / PREVIEWS_PER_ROW)
+        .floor()
+        .clamp(MIN_PREVIEW_WIDTH, MAX_PREVIEW_WIDTH);
+    egui::vec2(width, (width * PREVIEW_ASPECT).round())
 }
 
 /// A white card with a wash of the scene's colour over it.
@@ -1067,40 +1364,48 @@ fn scene_description(scene: usize, layout: &SceneLayout) -> String {
 }
 
 fn show_scene_heading(ui: &mut egui::Ui, scene: usize, layout: &SceneLayout, color: egui::Color32) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let badge =
             theme::semibold(format!("Scene {}", scene + 1), 13.0).color(egui::Color32::WHITE);
-        theme::pill(ui, badge, color);
+        theme::pill_at_least(ui, badge, color, SCENE_BADGE_MIN_WIDTH);
 
         let length = theme::semibold(
             format_duration(layout.span.seconds()),
             SCENE_LENGTH_FONT_SIZE,
         );
         if is_long_scene(layout.span) {
-            theme::pill(ui, length.color(egui::Color32::WHITE), theme::DANGER)
-                .on_hover_text("This scene is longer than 45 minutes.");
+            theme::pill(ui, length.color(egui::Color32::WHITE), theme::DANGER);
+            // Said in words too, so the warning does not rest on colour alone.
+            ui.label(egui::RichText::new("over 45 min").color(theme::DANGER));
         } else {
             ui.label(length);
         }
+        // To the second is enough here, since cuts land on keyframes anyway.
+        // The exact times are one hover away.
         ui.label(theme::muted(format!(
+            "{} to {}",
+            format_clock(layout.span.start),
+            format_clock(layout.span.end)
+        )))
+        .on_hover_text(format!(
             "{} to {}",
             format_timestamp(layout.span.start),
             format_timestamp(layout.span.end)
-        )));
+        ));
         if is_merged(layout) {
-            let note = egui::RichText::new(format!("{} pieces merged", layout.segments.len()))
+            let note = egui::RichText::new(format!("{} parts merged", layout.segments.len()))
                 .color(theme::PRIMARY);
             theme::pill(ui, note, theme::PRIMARY_TINT);
         }
     });
 }
 
-/// Shown beside each strip of a merged scene. Returns true when clicked.
+/// Shown beside each part of a merged scene. Returns true when clicked.
 fn show_move_out_button(ui: &mut egui::Ui) -> bool {
-    ui.small_button("Move out to its own scene")
+    ui.button("Move out to its own scene")
         .on_hover_text(
-            "Takes this strip out and makes it a scene of its own. \
-             The strips before and after it stay as they are.",
+            "Takes this part out and makes it a scene of its own. \
+             The parts before and after it stay as they are.",
         )
         .clicked()
 }
@@ -1142,8 +1447,7 @@ mod tests {
     struct Screen {
         ctx: egui::Context,
         review: Review,
-        export_options: ExportOptions,
-        hard_cut_settings: HardCutSettings,
+        settings: Settings,
         time: f64,
         last_request: Option<ReviewRequest>,
     }
@@ -1171,8 +1475,7 @@ mod tests {
             let mut screen = Self {
                 ctx,
                 review: Review::new(video, detection, cuts, ""),
-                export_options: ExportOptions::default(),
-                hard_cut_settings: HardCutSettings::default(),
+                settings: Settings::default(),
                 time: 0.0,
                 last_request: None,
             };
@@ -1194,13 +1497,12 @@ mod tests {
             let Self {
                 ctx,
                 review,
-                export_options,
-                hard_cut_settings,
+                settings,
                 last_request,
                 ..
             } = self;
             let _ = ctx.run(input, |ctx| {
-                if let Some(request) = review.show(ctx, export_options, hard_cut_settings, None) {
+                if let Some(request) = review.show(ctx, settings, None) {
                     *last_request = Some(request);
                 }
             });
@@ -1216,9 +1518,11 @@ mod tests {
         /// The middle of the first preview of a scene that is not merged.
         fn first_preview_of_scene(&self, scene: usize) -> egui::Pos2 {
             let card = self.review.scene_cards[scene];
+            // Previews are at least this big, so the spot is inside the
+            // first one whatever size the card gives them.
             egui::pos2(
-                card.left() + CARD_MARGIN.left + THUMBNAIL_WIDTH as f32 / 2.0,
-                card.bottom() - CARD_MARGIN.bottom - THUMBNAIL_HEIGHT as f32 / 2.0,
+                card.left() + CARD_MARGIN.left + MIN_PREVIEW_WIDTH / 2.0,
+                card.bottom() - CARD_MARGIN.bottom - MIN_PREVIEW_WIDTH * PREVIEW_ASPECT / 2.0,
             )
         }
 
@@ -1428,6 +1732,58 @@ mod tests {
         };
         assert!(!is_long_scene(scene_of(45.0 * 60.0)));
         assert!(is_long_scene(scene_of(45.0 * 60.0 + 1.0)));
+    }
+
+    #[test]
+    fn the_tips_can_be_hidden_and_merging_still_works() {
+        let mut screen = Screen::with_five_scenes();
+        screen.settings.show_tips = false;
+        // The screen is laid out afresh without the tips before it is used.
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+
+        screen.drag_scene_onto(0, 1);
+        assert_eq!(screen.scene_ends(), vec![40.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn the_join_button_between_two_cards_merges_them() {
+        let mut screen = Screen::with_five_scenes();
+        let first = screen.review.scene_cards[0];
+        let second = screen.review.scene_cards[1];
+        let between = egui::pos2(first.center().x, (first.bottom() + second.top()) / 2.0);
+        screen.click_at(between, egui::Modifiers::NONE);
+
+        assert_eq!(screen.scene_ends(), vec![40.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn previews_fill_the_card_within_their_limits() {
+        const GAP: f32 = 10.0;
+        // Four previews and three gaps fit exactly.
+        assert_eq!(
+            preview_size_for(4.0 * 200.0 + 3.0 * GAP, GAP),
+            egui::vec2(200.0, 113.0)
+        );
+        assert_eq!(preview_size_for(5000.0, GAP).x, MAX_PREVIEW_WIDTH);
+        assert_eq!(preview_size_for(100.0, GAP).x, MIN_PREVIEW_WIDTH);
+    }
+
+    #[test]
+    fn a_fresh_review_has_no_edits_and_a_merge_is_one() {
+        let mut screen = Screen::with_five_scenes();
+        assert!(!screen.review.is_edited());
+
+        screen.drag_scene_onto(0, 1);
+        assert!(screen.review.is_edited());
+    }
+
+    #[test]
+    fn every_tip_says_something() {
+        for (topic, tip) in TIPS {
+            assert!(!topic.is_empty());
+            assert!(tip.ends_with('.'), "{tip}");
+        }
     }
 
     #[test]

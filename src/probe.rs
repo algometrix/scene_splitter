@@ -174,4 +174,81 @@ mod tests {
             .collect();
         assert_eq!(estimate_video_end(&packets), 1.5);
     }
+
+    const NO_CONTAINER_START: f64 = 0.0;
+
+    fn packets_at(times: &[f64]) -> Vec<VideoPacket> {
+        times
+            .iter()
+            .map(|&time| VideoPacket {
+                time,
+                size_bytes: 100,
+                is_keyframe: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejects_a_packet_with_neither_timestamp() {
+        assert!(parse_packet_line("N/A,N/A,24,__", NO_CONTAINER_START).is_err());
+    }
+
+    #[test]
+    fn rejects_a_timestamp_that_is_not_a_number() {
+        assert!(parse_packet_line("soon,1.000000,24,K_", NO_CONTAINER_START).is_err());
+    }
+
+    #[test]
+    fn rejects_a_size_that_is_not_a_number() {
+        assert!(parse_packet_line("1.000000,1.000000,large,K_", NO_CONTAINER_START).is_err());
+    }
+
+    #[test]
+    fn rejects_an_empty_line() {
+        assert!(parse_packet_line("", NO_CONTAINER_START).is_err());
+    }
+
+    #[test]
+    fn ignores_extra_fields_after_the_flags() {
+        // ffprobe appends side data columns to some packets.
+        let packet = parse_packet_line("1.500000,1.500000,24,K_,extra,", NO_CONTAINER_START);
+        assert_eq!(
+            packet.unwrap(),
+            VideoPacket {
+                time: 1.5,
+                size_bytes: 24,
+                is_keyframe: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_discardable_packet_is_not_a_keyframe() {
+        let packet = parse_packet_line("1.500000,1.500000,24,_D_", NO_CONTAINER_START).unwrap();
+        assert!(!packet.is_keyframe);
+    }
+
+    #[test]
+    fn a_packet_before_the_container_start_gets_a_negative_time() {
+        const CONTAINER_START: f64 = 1.0;
+        let packet = parse_packet_line("0.500000,0.500000,24,__", CONTAINER_START).unwrap();
+        assert_eq!(packet.time, -0.5);
+    }
+
+    #[test]
+    fn a_video_of_one_packet_ends_at_that_packet() {
+        // With a single frame there is no typical frame duration to add.
+        assert_eq!(estimate_video_end(&packets_at(&[2.5])), 2.5);
+    }
+
+    #[test]
+    fn a_late_first_packet_does_not_lengthen_the_last_frame() {
+        assert_eq!(estimate_video_end(&packets_at(&[10.0, 10.5, 11.0])), 11.5);
+    }
+
+    #[test]
+    fn an_uneven_frame_rate_uses_the_average_frame_duration() {
+        // One second over two intervals is half a second per frame.
+        assert_eq!(estimate_video_end(&packets_at(&[0.0, 0.25, 1.0])), 1.5);
+    }
 }

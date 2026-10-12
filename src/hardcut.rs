@@ -40,11 +40,13 @@ pub enum Sensitivity {
 impl Sensitivity {
     pub const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
 
+    /// Named by what gets detected, since "sensitivity" alone does not say
+    /// whether more of it means more scenes or fewer.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Low => "Low",
-            Self::Medium => "Medium",
-            Self::High => "High",
+            Self::Low => "Only obvious changes",
+            Self::Medium => "Most changes",
+            Self::High => "Even subtle changes",
         }
     }
 
@@ -59,6 +61,7 @@ impl Sensitivity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HardCutSettings {
     pub sensitivity: Sensitivity,
     /// Hard cuts closer together than this are thinned out, strongest first.
@@ -401,5 +404,234 @@ mod tests {
         assert!(with(Sensitivity::Low).is_empty());
         assert!(with(Sensitivity::Medium).is_empty());
         assert_eq!(with(Sensitivity::High), vec![500.0]);
+    }
+
+    /// A frame far enough from both ends of 40 frames to have a full set of
+    /// neighbours.
+    const MIDDLE_FRAME: usize = 20;
+    const FRAME_COUNT: usize = 40;
+
+    #[test]
+    fn empty_thumbnails_do_not_differ() {
+        assert_eq!(mean_difference(&[], &[]), 0);
+        assert_eq!(mean_difference(&[], &[10, 20]), 0);
+    }
+
+    #[test]
+    fn the_average_difference_is_rounded_down() {
+        // A total of 7 over 4 pixels is 1.75.
+        assert_eq!(mean_difference(&[0, 0, 0, 0], &[7, 0, 0, 0]), 1);
+    }
+
+    #[test]
+    fn black_against_white_is_the_largest_difference_in_either_order() {
+        let black = [u8::MIN; 4];
+        let white = [u8::MAX; 4];
+        assert_eq!(mean_difference(&black, &white), u8::MAX);
+        assert_eq!(mean_difference(&white, &black), u8::MAX);
+    }
+
+    #[test]
+    fn a_video_with_no_frames_has_no_candidates() {
+        assert!(abrupt_changes(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn the_typical_change_leaves_out_the_frame_itself() {
+        const CALM_CHANGE: u8 = 4;
+        let mut changes = vec![CALM_CHANGE; FRAME_COUNT];
+        changes[MIDDLE_FRAME] = 200;
+        assert_eq!(
+            typical_change_around(&changes, MIDDLE_FRAME),
+            f32::from(CALM_CHANGE)
+        );
+    }
+
+    #[test]
+    fn the_typical_change_ignores_frames_beyond_the_neighbourhood() {
+        let mut changes = vec![0u8; FRAME_COUNT];
+        changes[MIDDLE_FRAME - NEIGHBOURS_EACH_SIDE - 1] = 240;
+        changes[MIDDLE_FRAME + NEIGHBOURS_EACH_SIDE + 1] = 240;
+        assert_eq!(typical_change_around(&changes, MIDDLE_FRAME), 0.0);
+    }
+
+    #[test]
+    fn the_typical_change_at_the_first_frame_uses_only_the_frames_after_it() {
+        const CALM_CHANGE: u8 = 3;
+        let mut changes = vec![CALM_CHANGE; FRAME_COUNT];
+        changes[0] = 90;
+        assert_eq!(typical_change_around(&changes, 0), f32::from(CALM_CHANGE));
+    }
+
+    #[test]
+    fn a_lone_frame_has_no_typical_change() {
+        assert_eq!(typical_change_around(&[50], 0), 0.0);
+    }
+
+    #[test]
+    fn a_sharp_change_is_found_in_a_video_shorter_than_the_neighbourhood() {
+        let changes = [1, 50, 1];
+        assert_eq!(
+            abrupt_changes(&changes, &times(changes.len())),
+            vec![candidate(1.0, 50)]
+        );
+    }
+
+    #[test]
+    fn a_change_exactly_at_the_spike_ratio_is_a_candidate_and_one_below_is_not() {
+        const BUSY_CHANGE: u8 = 5;
+        const SPIKE: u8 = SPIKE_RATIO as u8 * BUSY_CHANGE;
+        let mut changes = vec![BUSY_CHANGE; FRAME_COUNT];
+
+        changes[MIDDLE_FRAME] = SPIKE;
+        assert_eq!(
+            abrupt_changes(&changes, &times(FRAME_COUNT)),
+            vec![candidate(MIDDLE_FRAME as f64, SPIKE)]
+        );
+
+        changes[MIDDLE_FRAME] = SPIKE - 1;
+        assert!(abrupt_changes(&changes, &times(FRAME_COUNT)).is_empty());
+    }
+
+    #[test]
+    fn the_weakest_change_worth_remembering_is_a_candidate_in_still_footage() {
+        let mut changes = vec![0u8; FRAME_COUNT];
+        changes[MIDDLE_FRAME] = WEAKEST_CANDIDATE;
+        assert_eq!(
+            abrupt_changes(&changes, &times(FRAME_COUNT)),
+            vec![candidate(MIDDLE_FRAME as f64, WEAKEST_CANDIDATE)]
+        );
+    }
+
+    #[test]
+    fn a_flash_is_a_candidate_on_the_way_in_and_on_the_way_out() {
+        const FLASH_CHANGE: u8 = 60;
+        let mut changes = vec![2u8; FRAME_COUNT];
+        // One bright frame differs from the frame before it, and the frame
+        // after it differs just as much.
+        changes[MIDDLE_FRAME] = FLASH_CHANGE;
+        changes[MIDDLE_FRAME + 1] = FLASH_CHANGE;
+
+        assert_eq!(
+            abrupt_changes(&changes, &times(FRAME_COUNT)),
+            vec![
+                candidate(MIDDLE_FRAME as f64, FLASH_CHANGE),
+                candidate((MIDDLE_FRAME + 1) as f64, FLASH_CHANGE)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_sensitivities_are_listed_from_the_strictest_to_the_most_accepting() {
+        let thresholds = Sensitivity::ALL.map(Sensitivity::weakest_change);
+        assert!(thresholds.windows(2).all(|pair| pair[0] > pair[1]));
+    }
+
+    #[test]
+    fn the_most_sensitive_setting_accepts_every_remembered_candidate() {
+        assert_eq!(Sensitivity::High.weakest_change(), WEAKEST_CANDIDATE);
+    }
+
+    #[test]
+    fn a_change_exactly_at_the_threshold_is_accepted_and_one_below_is_not() {
+        let threshold = Sensitivity::Medium.weakest_change();
+        let keyframes = keyframes_every_ten_seconds();
+        let with_strength = |strength| {
+            cuts_with_hard_cuts(
+                &[],
+                &[candidate(500.0, strength)],
+                &keyframes,
+                VIDEO,
+                &settings(Sensitivity::Medium, 60.0),
+            )
+        };
+        assert_eq!(with_strength(threshold), vec![500.0]);
+        assert!(with_strength(threshold - 1).is_empty());
+    }
+
+    #[test]
+    fn a_video_with_no_keyframes_keeps_only_its_black_screen_cuts() {
+        let cuts = cuts_with_hard_cuts(
+            &[400.0],
+            &[candidate(700.0, 200)],
+            &[],
+            VIDEO,
+            &settings(Sensitivity::Medium, 120.0),
+        );
+        assert_eq!(cuts, vec![400.0]);
+    }
+
+    #[test]
+    fn of_two_equally_strong_close_hard_cuts_the_earlier_one_is_kept() {
+        let cuts = cuts_with_hard_cuts(
+            &[],
+            &[candidate(300.0, 90), candidate(330.0, 90)],
+            &keyframes_every_ten_seconds(),
+            VIDEO,
+            &settings(Sensitivity::Medium, 120.0),
+        );
+        assert_eq!(cuts, vec![300.0]);
+    }
+
+    #[test]
+    fn a_strong_hard_cut_beats_a_weaker_one_on_each_side() {
+        let cuts = cuts_with_hard_cuts(
+            &[],
+            &[
+                candidate(300.0, 50),
+                candidate(400.0, 90),
+                candidate(500.0, 50),
+            ],
+            &keyframes_every_ten_seconds(),
+            VIDEO,
+            &settings(Sensitivity::Medium, 120.0),
+        );
+        // Taken in order of time, 300 and 500 would both fit. The strongest
+        // is placed first, and each of them is within two minutes of it.
+        assert_eq!(cuts, vec![400.0]);
+    }
+
+    #[test]
+    fn hard_cuts_exactly_the_shortest_scene_apart_are_both_kept() {
+        const MIN_SCENE_SECONDS: f64 = 120.0;
+        let cuts = cuts_with_hard_cuts(
+            &[],
+            &[
+                candidate(300.0, 90),
+                candidate(300.0 + MIN_SCENE_SECONDS, 80),
+            ],
+            &keyframes_every_ten_seconds(),
+            VIDEO,
+            &settings(Sensitivity::Medium, MIN_SCENE_SECONDS),
+        );
+        assert_eq!(cuts, vec![300.0, 420.0]);
+    }
+
+    #[test]
+    fn a_hard_cut_exactly_the_shortest_scene_from_an_end_of_the_video_is_kept() {
+        const MIN_SCENE_SECONDS: f64 = 120.0;
+        let cuts = cuts_with_hard_cuts(
+            &[],
+            &[
+                candidate(VIDEO.start + MIN_SCENE_SECONDS, 90),
+                candidate(VIDEO.end - MIN_SCENE_SECONDS, 90),
+            ],
+            &keyframes_every_ten_seconds(),
+            VIDEO,
+            &settings(Sensitivity::Medium, MIN_SCENE_SECONDS),
+        );
+        assert_eq!(cuts, vec![120.0, 880.0]);
+    }
+
+    #[test]
+    fn a_hard_cut_before_a_black_screen_cut_comes_first_in_the_result() {
+        let cuts = cuts_with_hard_cuts(
+            &[800.0],
+            &[candidate(300.0, 90)],
+            &keyframes_every_ten_seconds(),
+            VIDEO,
+            &settings(Sensitivity::Medium, 120.0),
+        );
+        assert_eq!(cuts, vec![300.0, 800.0]);
     }
 }

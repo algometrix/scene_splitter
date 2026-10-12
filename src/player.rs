@@ -19,6 +19,7 @@ use eframe::egui;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 
+use crate::theme;
 use crate::timecode::format_timestamp;
 use crate::tools;
 
@@ -39,6 +40,15 @@ const MAX_QUEUED_AUDIO_CHUNKS: usize = 3;
 const AUDIO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 
 pub const SKIP_SECONDS: f64 = 10.0;
+/// The picture is drawn as large as the window allows, between these widths.
+const MIN_PICTURE_WIDTH: f32 = 320.0;
+const MAX_PICTURE_WIDTH: f32 = FRAME_WIDTH as f32;
+const PICTURE_ASPECT: f32 = FRAME_HEIGHT as f32 / FRAME_WIDTH as f32;
+/// Room the player's title, slider and controls need around the picture.
+const PLAYER_CHROME_WIDTH: f32 = 48.0;
+const PLAYER_CHROME_HEIGHT: f32 = 340.0;
+/// How far from the corner of the window the player first appears.
+const PLAYER_CORNER_GAP: f32 = 16.0;
 /// On a touchpad, which scrolls smoothly, this much scrolling steps one frame.
 const SCROLL_POINTS_PER_FRAME: f32 = 50.0;
 /// A split lands "exactly here" when the keyframe is closer than this.
@@ -330,19 +340,18 @@ fn frames_for_wheel_turn(unit: egui::MouseWheelUnit, turn: f32, points_left_over
 
 /// Says where a split at `position` would really be cut. Splits without
 /// re-encoding can only cut on a keyframe, so the person should see how far
-/// that is from the frame they picked.
-fn landing_description(position: f64, keyframe: f64) -> String {
-    let gap = keyframe - position;
-    let distance = if gap.abs() < SAME_MOMENT_SECONDS {
-        "exactly here".to_owned()
-    } else if gap > 0.0 {
-        format!("{gap:.2} s later")
-    } else {
-        format!("{:.2} s earlier", -gap)
-    };
+/// that is from the picture they picked. The word "keyframe" stays out of
+/// it, since nobody needs to know it to use the answer.
+fn landing_description(position: f64, split_point: f64) -> String {
+    let gap = split_point - position;
+    if gap.abs() < SAME_MOMENT_SECONDS {
+        return "A split would be exactly at this picture.".to_owned();
+    }
+    let direction = if gap > 0.0 { "after" } else { "before" };
     format!(
-        "A split lands on the keyframe at {}, {distance}.",
-        format_timestamp(keyframe)
+        "A split would be {:.2} s {direction} this picture, at {}. A video can only be split at certain points.",
+        gap.abs(),
+        format_timestamp(split_point)
     )
 }
 
@@ -394,6 +403,8 @@ pub struct Player {
     still_wanted_next: Option<f64>,
     /// Smooth scrolling that has not yet added up to a whole frame.
     scroll_points_left_over: f32,
+    /// How large the picture is drawn in this window.
+    picture_size: egui::Vec2,
 }
 
 /// One paused picture, grabbed after stepping to a frame.
@@ -431,6 +442,7 @@ impl Player {
             still_being_grabbed: false,
             still_wanted_next: None,
             scroll_points_left_over: 0.0,
+            picture_size: picture_size_for(ctx.screen_rect().size()),
         };
         player.play_at(position, ctx);
         player
@@ -575,11 +587,21 @@ impl Player {
         self.pause_at_the_end();
         self.handle_keys(ctx);
 
+        // The window can be resized under the player, and the player must
+        // still fit inside it with its controls in reach.
+        let screen = ctx.screen_rect();
+        self.picture_size = picture_size_for(screen.size());
+
         let mut open = true;
         egui::Window::new("Player")
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
+            // Starts in the bottom right corner, where it covers the end of
+            // the scene list and leaves the timeline and first scenes clear.
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .default_pos(screen.right_bottom() - egui::vec2(PLAYER_CORNER_GAP, PLAYER_CORNER_GAP))
+            .constrain_to(screen)
             .show(ctx, |ui| {
                 let pointer_over_picture = self.show_picture(ui);
                 if pointer_over_picture {
@@ -685,13 +707,14 @@ impl Player {
             return;
         }
         let (back, forward, pause, split, escape) = ctx.input(|input| {
-            // With Ctrl held, A belongs to "select all" on the review screen.
+            // With Ctrl held a letter is a shortcut of the review screen,
+            // such as "select all", and not the player's.
             let plain_key = |key| input.key_pressed(key) && !input.modifiers.command;
             (
                 input.key_pressed(egui::Key::ArrowLeft) || plain_key(egui::Key::A),
                 input.key_pressed(egui::Key::ArrowRight) || plain_key(egui::Key::D),
                 input.key_pressed(egui::Key::Space),
-                input.key_pressed(egui::Key::S),
+                plain_key(egui::Key::S),
                 input.key_pressed(egui::Key::Escape),
             )
         });
@@ -719,7 +742,7 @@ impl Player {
 
     /// Draws the picture and returns whether the pointer is over it.
     fn show_picture(&self, ui: &mut egui::Ui) -> bool {
-        let size = egui::vec2(FRAME_WIDTH as f32, FRAME_HEIGHT as f32);
+        let size = self.picture_size;
         let response = match (&self.state, &self.picture) {
             (PlayState::Failed(reason), _) => {
                 let (area, response) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -744,7 +767,7 @@ impl Player {
 
     fn show_position_slider(&mut self, ui: &mut egui::Ui) {
         let mut position = self.scrubbing_to.unwrap_or_else(|| self.position());
-        ui.spacing_mut().slider_width = FRAME_WIDTH as f32;
+        ui.spacing_mut().slider_width = self.picture_size.x;
         let slider =
             ui.add(egui::Slider::new(&mut position, 0.0..=self.video_length).show_value(false));
         if slider.dragged() {
@@ -758,19 +781,46 @@ impl Player {
     }
 
     fn show_controls(&mut self, ui: &mut egui::Ui, split_would_land_at: Option<f64>) {
-        ui.horizontal(|ui| {
-            if ui.button(format!("-{SKIP_SECONDS} s")).clicked() {
+        ui.set_max_width(self.picture_size.x);
+        let paused = !matches!(self.state, PlayState::Playing(_));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(format!("-{SKIP_SECONDS} s"))
+                .on_hover_text("Left arrow or A")
+                .clicked()
+            {
                 self.skip(-SKIP_SECONDS, ui.ctx());
             }
-            let pause_label = match self.state {
-                PlayState::Playing(_) => "Pause",
-                PlayState::Paused { .. } | PlayState::Failed(_) => "Play",
-            };
-            if ui.button(pause_label).clicked() {
+            let pause_label = if paused { "Play" } else { "Pause" };
+            if ui.button(pause_label).on_hover_text("Space").clicked() {
                 self.toggle_pause(ui.ctx());
             }
-            if ui.button(format!("+{SKIP_SECONDS} s")).clicked() {
+            if ui
+                .button(format!("+{SKIP_SECONDS} s"))
+                .on_hover_text("Right arrow or D")
+                .clicked()
+            {
                 self.skip(SKIP_SECONDS, ui.ctx());
+            }
+
+            ui.separator();
+            // The same step the mouse wheel makes, for those who do not
+            // think to turn it.
+            if ui
+                .button("-1 frame")
+                .on_hover_text("One picture back. The mouse wheel over the picture does the same.")
+                .clicked()
+            {
+                self.step_frames(-1, ui.ctx());
+            }
+            if ui
+                .button("+1 frame")
+                .on_hover_text(
+                    "One picture forward. The mouse wheel over the picture does the same.",
+                )
+                .clicked()
+            {
+                self.step_frames(1, ui.ctx());
             }
 
             ui.separator();
@@ -794,29 +844,57 @@ impl Player {
                     self.asking_to_turn_sound_on = true;
                 }
             }
+        });
 
-            ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            let split_button = ui
+                .add(theme::primary_button("Split near here (S)"))
+                .on_hover_text(
+                    "Cuts the scene playing now in two, at the closest point where the video can be split.",
+                );
+            if split_button.clicked() {
+                self.split_requested = true;
+            }
             ui.label(format!(
                 "{} / {}",
                 format_timestamp(self.position()),
                 format_timestamp(self.video_length)
             ));
         });
-        ui.horizontal(|ui| {
-            let split_button = ui.button("Split scene here (S)").on_hover_text(
-                "Cuts the scene playing now in two, on the keyframe nearest to this moment.",
-            );
-            if split_button.clicked() {
-                self.split_requested = true;
-            }
-            ui.label(&self.split_feedback);
-        });
-        if let Some(keyframe) = split_would_land_at {
-            ui.label(landing_description(self.position(), keyframe));
+        if !self.split_feedback.is_empty() {
+            ui.add(egui::Label::new(&self.split_feedback).wrap());
         }
-        ui.weak("Left or A goes back 10 seconds, Right or D goes forward, Space pauses, S splits, Esc closes.");
-        ui.weak("Turn the mouse wheel over the picture to move one frame at a time.");
+        // While playing the answer would change many times a second, so it
+        // is shown once the person has stopped on a picture.
+        if let (true, Some(split_point)) = (paused, split_would_land_at) {
+            ui.add(
+                egui::Label::new(theme::caption(landing_description(
+                    self.position(),
+                    split_point,
+                )))
+                .wrap(),
+            );
+        }
+        ui.add(
+            egui::Label::new(theme::caption(
+                "Esc closes the player. Pause, then step by frames to find the exact picture.",
+            ))
+            .wrap(),
+        );
     }
+}
+
+/// How large to draw the picture so that the whole player fits a window of
+/// `screen` size.
+fn picture_size_for(screen: egui::Vec2) -> egui::Vec2 {
+    let widest_that_fits_across = screen.x - PLAYER_CHROME_WIDTH;
+    let widest_that_fits_down = (screen.y - PLAYER_CHROME_HEIGHT) / PICTURE_ASPECT;
+    let width = MAX_PICTURE_WIDTH
+        .min(widest_that_fits_across)
+        .min(widest_that_fits_down)
+        .max(MIN_PICTURE_WIDTH)
+        .floor();
+    egui::vec2(width, (width * PICTURE_ASPECT).round())
 }
 
 #[cfg(test)]
@@ -845,12 +923,16 @@ mod tests {
         );
     }
 
-    /// Plays a generated video for two seconds with the sound off.
+    /// Plays a generated video with the sound off. The clock starts at the
+    /// first picture, so a machine that is slow to start ffmpeg does not
+    /// fail the test.
     #[test]
     #[ignore = "needs ffmpeg on the PATH"]
     fn a_real_video_plays_at_double_speed() {
         const START: f64 = 1.0;
-        const WATCHED: Duration = Duration::from_secs(2);
+        const WATCHED: Duration = Duration::from_secs(1);
+        const FIRST_PICTURE_DEADLINE: Duration = Duration::from_secs(30);
+        const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
         let video = TestVideo::two_scenes_with_a_black_screen("playback");
         let playback = Playback::start(
@@ -861,16 +943,46 @@ mod tests {
             &egui::Context::default(),
         )
         .unwrap();
+
+        let waiting_since = Instant::now();
+        while playback.state.frames_shown.load(Ordering::Relaxed) == 0 {
+            assert!(
+                waiting_since.elapsed() < FIRST_PICTURE_DEADLINE,
+                "no picture arrived"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let position_at_first_picture = playback.position();
         std::thread::sleep(WATCHED);
 
-        // Two seconds of watching at double speed covers four seconds of
-        // video, less the moment ffmpeg takes to start, which is long on a
-        // busy machine.
-        let covered = playback.position() - START;
-        assert!((1.0..=4.1).contains(&covered), "covered {covered} seconds");
+        // One second of watching at double speed covers two seconds of
+        // video. The bounds are wide because sleeping is not exact.
+        let covered = playback.position() - position_at_first_picture;
+        assert!((1.0..=3.0).contains(&covered), "covered {covered} seconds");
 
         let newest_frame = playback.state.newest_frame.lock().unwrap().take();
         assert_eq!(newest_frame.map(|frame| frame.len()), Some(FRAME_BYTES));
+    }
+
+    #[test]
+    fn the_picture_is_full_size_in_a_large_window() {
+        let size = picture_size_for(egui::vec2(1320.0, 900.0));
+        assert_eq!(size, egui::vec2(640.0, 360.0));
+    }
+
+    #[test]
+    fn the_picture_shrinks_so_the_player_fits_a_small_window() {
+        let window = egui::vec2(800.0, 560.0);
+        let size = picture_size_for(window);
+        assert!(size.x < MAX_PICTURE_WIDTH);
+        assert!(size.y + PLAYER_CHROME_HEIGHT <= window.y + 1.0, "{size:?}");
+        assert!(size.x + PLAYER_CHROME_WIDTH <= window.x);
+    }
+
+    #[test]
+    fn the_picture_never_gets_too_small_to_see() {
+        let size = picture_size_for(egui::vec2(200.0, 200.0));
+        assert_eq!(size.x, MIN_PICTURE_WIDTH);
     }
 
     #[test]
@@ -894,17 +1006,16 @@ mod tests {
 
     #[test]
     fn the_landing_note_says_how_far_the_keyframe_is() {
-        assert_eq!(
-            landing_description(601.63, 602.0),
-            "A split lands on the keyframe at 00:10:02.000, 0.37 s later."
-        );
-        assert_eq!(
-            landing_description(602.5, 602.0),
-            "A split lands on the keyframe at 00:10:02.000, 0.50 s earlier."
-        );
+        let later = landing_description(601.63, 602.0);
+        assert!(later.contains("0.37 s after this picture"), "{later}");
+        assert!(later.contains("00:10:02.000"), "{later}");
+
+        let earlier = landing_description(602.5, 602.0);
+        assert!(earlier.contains("0.50 s before this picture"), "{earlier}");
+
         assert_eq!(
             landing_description(602.0, 602.0),
-            "A split lands on the keyframe at 00:10:02.000, exactly here."
+            "A split would be exactly at this picture."
         );
     }
 

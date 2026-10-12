@@ -5,7 +5,9 @@ edition = "2021"
 rust-version = "1.88"
 repository = "https://github.com/algometrix/scene_splitter"
 readme = "README.md"
-description = "Splits a video into scenes at stretches of black screen"
+description = "Desktop app and command line tool that splits a video into scenes at black screens, without re-encoding"
+keywords = ["video", "ffmpeg", "scene-detection", "video-splitter", "egui"]
+categories = ["multimedia::video", "command-line-utilities", "gui"]
 
 [dependencies]
 anyhow = "1"
@@ -17,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+rfd = "0.15"
 rodio = { version = "0.20", default-features = false }
 trash = "5"
 

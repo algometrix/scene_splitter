@@ -26,6 +26,11 @@ pub struct ScanAheadSummary {
 }
 
 impl ScanAheadSummary {
+    /// True when there was nothing to scan.
+    pub fn is_empty(&self) -> bool {
+        self.freshly_scanned == 0 && self.already_stored == 0 && self.failed.is_empty()
+    }
+
     pub fn describe(&self) -> String {
         format!(
             "{} scanned, {} already scanned, {} failed.",

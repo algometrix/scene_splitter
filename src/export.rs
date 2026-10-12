@@ -27,6 +27,7 @@ pub enum OriginalPolicy {
 
 /// The choices a person makes about how scenes are written.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExportOptions {
     pub scene_location: SceneLocation,
     pub original_policy: OriginalPolicy,
@@ -75,32 +76,42 @@ impl ExportReport {
             )
     }
 
+    /// What happened, in words a person who knows nothing of video can act on.
     pub fn summary(&self) -> String {
         let written = format!(
-            "Wrote {} scene files to\n{}",
-            self.scene_files.len(),
+            "{} are in\n{}",
+            counted_scene_files(self.scene_files.len()),
             self.out_dir.display()
         );
-        let verification = match &self.verification {
+        let checked = match &self.verification {
             Verification::Passed => {
-                "Verified: the scenes hold every video and audio packet of the original, unchanged."
+                "Checked: together they contain the whole original, with nothing missing or changed."
                     .to_owned()
             }
-            Verification::Failed(reason) => format!("Verification failed: {reason}"),
+            Verification::Failed(reason) => format!(
+                "The check did not pass, so the original was kept. Play the scene files before you delete anything.\n\nDetails: {reason}"
+            ),
         };
         let original = match &self.original {
-            OriginalOutcome::Kept => "The original was kept.".to_owned(),
+            OriginalOutcome::Kept | OriginalOutcome::KeptBecauseUnverified => {
+                "The original is still in its place.".to_owned()
+            }
             OriginalOutcome::MovedToRecycleBin => {
-                format!("The original was moved to the {TRASH_NAME}.")
+                format!("The original is in the {TRASH_NAME}. You can restore it from there.")
             }
-            OriginalOutcome::KeptBecauseUnverified => {
-                "The original was kept, because the scenes could not be verified.".to_owned()
-            }
-            OriginalOutcome::KeptBecauseRecyclingFailed(reason) => {
-                format!("The original could not be moved to the {TRASH_NAME}: {reason}")
-            }
+            OriginalOutcome::KeptBecauseRecyclingFailed(reason) => format!(
+                "The scene files are fine. The original could not be moved to the {TRASH_NAME} and is still in its place.\n\nDetails: {reason}"
+            ),
         };
-        format!("{written}\n\n{verification}\n\n{original}")
+        format!("{written}\n\n{checked}\n\n{original}")
+    }
+}
+
+fn counted_scene_files(count: usize) -> String {
+    if count == 1 {
+        "1 scene file".to_owned()
+    } else {
+        format!("{count} scene files")
     }
 }
 

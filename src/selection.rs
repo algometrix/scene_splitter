@@ -133,4 +133,128 @@ mod tests {
         selection.select_all(3);
         assert_eq!(selected(&selection), vec![0, 1, 2]);
     }
+
+    #[test]
+    fn a_new_selection_holds_nothing() {
+        let selection = SceneSelection::default();
+        assert!(selected(&selection).is_empty());
+        assert!(!selection.contains(0));
+    }
+
+    #[test]
+    fn selected_scenes_are_listed_in_scene_order_whatever_the_click_order() {
+        let mut selection = SceneSelection::only(5);
+        selection.click(1, ClickKind::Toggle);
+        selection.click(3, ClickKind::Toggle);
+        assert_eq!(selected(&selection), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn a_shift_click_extends_from_the_scene_ctrl_clicked_last() {
+        let mut selection = SceneSelection::only(1);
+        selection.click(8, ClickKind::Toggle);
+
+        // The range replaces the selection, so scene 1 is dropped.
+        selection.click(6, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![6, 7, 8]);
+    }
+
+    #[test]
+    fn a_shift_click_extends_from_a_scene_that_a_ctrl_click_took_out() {
+        let mut selection = SceneSelection::only(1);
+        selection.click(4, ClickKind::Toggle);
+        selection.click(4, ClickKind::Toggle);
+        assert_eq!(selected(&selection), vec![1]);
+
+        selection.click(6, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn a_shift_click_on_the_scene_clicked_first_selects_it_alone() {
+        let mut selection = SceneSelection::only(3);
+        selection.click(6, ClickKind::ExtendRange);
+
+        selection.click(3, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![3]);
+    }
+
+    #[test]
+    fn a_plain_click_moves_where_a_shift_click_extends_from() {
+        let mut selection = SceneSelection::only(2);
+        selection.click(5, ClickKind::ExtendRange);
+
+        selection.click(7, ClickKind::Single);
+        selection.click(9, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn a_shift_click_after_select_all_extends_from_the_first_scene() {
+        let mut selection = SceneSelection::default();
+        selection.select_all(5);
+
+        selection.click(2, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_all_with_no_scenes_selects_nothing() {
+        let mut selection = SceneSelection::only(2);
+        selection.select_all(0);
+
+        assert!(selected(&selection).is_empty());
+        assert_eq!(selection.span_to_merge(), None);
+    }
+
+    #[test]
+    fn a_shift_click_after_selecting_all_of_no_scenes_acts_as_a_plain_click() {
+        let mut selection = SceneSelection::only(2);
+        selection.select_all(0);
+
+        selection.click(4, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![4]);
+    }
+
+    #[test]
+    fn every_scene_selected_merges_from_the_first_to_the_last() {
+        let mut selection = SceneSelection::default();
+        selection.select_all(4);
+        assert_eq!(selection.span_to_merge(), Some(0..=3));
+    }
+
+    #[test]
+    fn a_selection_toggled_down_to_one_scene_cannot_be_merged() {
+        let mut selection = SceneSelection::only(1);
+        selection.click(4, ClickKind::Toggle);
+        selection.click(1, ClickKind::Toggle);
+        assert_eq!(selection.span_to_merge(), None);
+    }
+
+    #[test]
+    fn a_ctrl_click_on_the_only_selected_scene_leaves_nothing_selected() {
+        let mut selection = SceneSelection::only(3);
+        selection.click(3, ClickKind::Toggle);
+
+        assert!(selected(&selection).is_empty());
+        assert_eq!(selection.span_to_merge(), None);
+    }
+
+    #[test]
+    fn clearing_deselects_every_scene() {
+        let mut selection = SceneSelection::default();
+        selection.select_all(3);
+
+        selection.clear();
+        assert!(selected(&selection).is_empty());
+    }
+
+    #[test]
+    fn clearing_forgets_where_a_shift_click_extends_from() {
+        let mut selection = SceneSelection::only(1);
+        selection.clear();
+
+        selection.click(4, ClickKind::ExtendRange);
+        assert_eq!(selected(&selection), vec![4]);
+    }
 }

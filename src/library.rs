@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use crate::split;
 
 /// Files in a folder with one of these extensions count as videos.
-const VIDEO_EXTENSIONS: [&str; 12] = [
+pub const VIDEO_EXTENSIONS: [&str; 12] = [
     "mp4", "mkv", "mov", "m4v", "avi", "webm", "wmv", "flv", "ts", "m2ts", "mpg", "mpeg",
 ];
 
