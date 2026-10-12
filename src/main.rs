@@ -12,6 +12,7 @@ mod detect;
 mod e2e_tests;
 mod export;
 mod ffmpeg;
+mod focus;
 mod folders;
 mod hardcut;
 mod keyboard;

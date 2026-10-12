@@ -12,14 +12,16 @@ use std::sync::Arc;
 
 use crate::cache::{DetectionSource, SourcedDetection};
 use crate::detect::ScanKind;
+use crate::focus::{self, PictureStep, ReviewFocus, SceneStep};
 use crate::plan::{
-    AddCutError, CutChoice, CutIndex, PlanSnapshot, SceneIndex, SceneLayout, SegmentIndex,
-    SplitPlan,
+    AddCutError, CutChoice, CutIndex, MovedCut, NudgeCutError, NudgeDirection, PlanSnapshot,
+    SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
 };
 use crate::scan::UndecodedFrames;
 use crate::scenes::CutTimes;
 use crate::selection::{ClickKind, SceneSelection};
 use crate::settings::SettingsChange;
+use crate::thumbnails;
 use crate::timecode::{format_timestamp, parse_timestamp, TimeSpan};
 
 /// What looking for the scene files of an earlier split found.
@@ -41,7 +43,8 @@ pub enum ExportObstacle {
     CouldNotCheck(String),
 }
 
-/// How asking for a new split went, for the screens to say.
+/// How asking for a new split, or for a split to be moved, went, for the
+/// screens to say.
 #[derive(Debug, PartialEq)]
 pub enum SplitFeedback {
     /// A split was added at this time of the video.
@@ -49,6 +52,9 @@ pub enum SplitFeedback {
     Refused(AddCutError),
     /// What was typed is not a time.
     NotATime,
+    /// A split was moved to the next point where the video can be cut.
+    Moved(MovedCut),
+    MoveRefused(NudgeCutError),
 }
 
 impl SplitFeedback {
@@ -56,8 +62,8 @@ impl SplitFeedback {
     /// confirmation.
     pub fn is_refusal(&self) -> bool {
         match self {
-            Self::Added(_) => false,
-            Self::Refused(_) | Self::NotATime => true,
+            Self::Added(_) | Self::Moved(_) => false,
+            Self::Refused(_) | Self::NotATime | Self::MoveRefused(_) => true,
         }
     }
 
@@ -69,6 +75,12 @@ impl SplitFeedback {
             ),
             Self::Refused(why) => why.to_string(),
             Self::NotATime => "Type a time like 1:03:12.".to_owned(),
+            Self::Moved(moved) => format!(
+                "Moved the split from {} to {}.",
+                format_timestamp(moved.from),
+                format_timestamp(moved.to)
+            ),
+            Self::MoveRefused(why) => why.to_string(),
         }
     }
 }
@@ -95,6 +107,24 @@ pub enum ReviewRequest {
     TypeNewSplitTime(String),
     /// Add a split at the time that stands in the box.
     AddTypedSplit,
+    /// Move the split at which this scene starts to the next point, earlier
+    /// or later, where the video can be cut.
+    NudgeSplit {
+        scene: SceneIndex,
+        direction: NudgeDirection,
+    },
+    /// Move the focus to another scene. The selection follows by the rules
+    /// of a click of this kind on that scene.
+    StepFocus {
+        step: SceneStep,
+        kind: ClickKind,
+    },
+    /// Choose another picture of the focused scene to play from.
+    StepPicture(PictureStep),
+    /// Play the focused scene, from the picture chosen in it or from its
+    /// start.
+    PlayFocused,
+    JoinFocusedWithNext,
     Undo,
     ResetScenes,
     Split,
@@ -140,6 +170,9 @@ pub struct ReviewSession {
     /// The plan as it was before each change, newest last, for undo.
     undo_history: Vec<PlanSnapshot>,
     selection: SceneSelection,
+    /// The scene the keys act on, once the person has stepped onto or
+    /// clicked one.
+    focus: Option<ReviewFocus>,
     scan_summary: String,
     /// How the scan read the video, for the curious.
     scan_details: String,
@@ -150,7 +183,8 @@ pub struct ReviewSession {
     frame_seconds: f64,
     /// What stands in the box for the time of a new split.
     new_split_time: String,
-    /// How the last split typed into the box went, once one was tried.
+    /// How the last split added or moved on the review screen went, once
+    /// one was tried.
     new_split_feedback: Option<SplitFeedback>,
     export_obstacle: Option<ExportObstacle>,
     /// A scan the person asked for that would throw away their edits, until
@@ -194,6 +228,7 @@ impl ReviewSession {
             plan,
             undo_history: Vec::new(),
             selection: SceneSelection::default(),
+            focus: None,
             scan_summary,
             scan_details,
             undecoded,
@@ -215,6 +250,10 @@ impl ReviewSession {
 
     pub fn selection(&self) -> &SceneSelection {
         &self.selection
+    }
+
+    pub fn focus(&self) -> Option<ReviewFocus> {
+        self.focus
     }
 
     pub fn scan_summary(&self) -> &str {
@@ -294,8 +333,25 @@ impl ReviewSession {
         self.can_undo() || !self.plan.is_as_detected()
     }
 
+    /// Whether "Undo merge" has a merged scene to take apart.
     pub fn has_merged_scene_selected(&self) -> bool {
-        self.selected_layouts().iter().any(SceneLayout::is_merged)
+        self.layouts_to_take_apart()
+            .iter()
+            .any(SceneLayout::is_merged)
+    }
+
+    /// The moment the focused scene plays from: the picture chosen in it,
+    /// or its start when none was.
+    pub fn focused_play_time(&self) -> Option<f64> {
+        let focus = self.focus?;
+        let layout = self.focused_layout()?;
+        let Some(picture) = focus.picture() else {
+            return Some(layout.span.start);
+        };
+        let part = *layout.segments.get(focus::part_of(picture))?;
+        thumbnails::preview_times(part)
+            .get(focus::place_in_part(picture))
+            .copied()
     }
 
     /// Applies everything the person asked for during one frame, in order,
@@ -333,7 +389,10 @@ impl ReviewSession {
         look_for_earlier_scene_files: LookForEarlierSceneFiles,
     ) -> Option<FollowUp> {
         match request {
-            ReviewRequest::ClickScene { scene, kind } => self.selection.click(scene, kind),
+            ReviewRequest::ClickScene { scene, kind } => {
+                self.selection.click(scene, kind);
+                self.focus = Some(ReviewFocus::on(scene));
+            }
             ReviewRequest::SelectAllScenes => self.selection.select_all(self.scene_count()),
             ReviewRequest::ClearSelection => self.selection.clear(),
             ReviewRequest::MergeSelected => {
@@ -351,6 +410,13 @@ impl ReviewSession {
             }
             ReviewRequest::TypeNewSplitTime(typed) => self.new_split_time = typed,
             ReviewRequest::AddTypedSplit => self.add_typed_split(),
+            ReviewRequest::NudgeSplit { scene, direction } => self.nudge_split(scene, direction),
+            ReviewRequest::StepFocus { step, kind } => self.step_focus(step, kind),
+            ReviewRequest::StepPicture(step) => self.step_picture(step),
+            ReviewRequest::PlayFocused => {
+                return self.focused_play_time().map(FollowUp::PlayFrom);
+            }
+            ReviewRequest::JoinFocusedWithNext => self.join_focused_with_next(),
             ReviewRequest::Undo => self.undo(),
             ReviewRequest::ResetScenes => self.edit_plan(SplitPlan::reset_to_detected),
             ReviewRequest::Split => return self.ask_to_split(look_for_earlier_scene_files()),
@@ -426,10 +492,12 @@ impl ReviewSession {
     /// and none leaves stale state behind.
     fn edit_plan<Outcome>(&mut self, edit: impl FnOnce(&mut SplitPlan) -> Outcome) -> Outcome {
         let plan_before = self.plan.snapshot();
+        let focused_moment = self.focused_moment();
         let outcome = edit(&mut self.plan);
         if !self.plan.is_at(&plan_before) {
             self.undo_history.push(plan_before);
             self.forget_what_depended_on_the_old_plan();
+            self.focus_the_scene_showing(focused_moment);
         }
         outcome
     }
@@ -438,8 +506,78 @@ impl ReviewSession {
         let Some(earlier_plan) = self.undo_history.pop() else {
             return;
         };
+        let focused_moment = self.focused_moment();
         self.plan.restore(earlier_plan);
         self.forget_what_depended_on_the_old_plan();
+        self.focus_the_scene_showing(focused_moment);
+    }
+
+    /// Where the focused scene starts, to find the focus again by once the
+    /// scenes are renumbered.
+    fn focused_moment(&self) -> Option<f64> {
+        self.focused_layout().map(|layout| layout.span.start)
+    }
+
+    /// Keeps the focus on the footage it was on, so a person working down
+    /// the list with the keys does not lose their place at every change.
+    /// The pictures of that scene may be others now, so none stays chosen.
+    fn focus_the_scene_showing(&mut self, moment: Option<f64>) {
+        self.focus = moment
+            .and_then(|moment| focus::scene_showing(&self.plan.scenes(), moment))
+            .map(ReviewFocus::on);
+    }
+
+    fn focused_layout(&self) -> Option<SceneLayout> {
+        let focused = self.focus?.scene().position();
+        self.plan.scene_layouts().into_iter().nth(focused)
+    }
+
+    fn step_focus(&mut self, step: SceneStep, kind: ClickKind) {
+        let focused = self.focus.map(ReviewFocus::scene);
+        let Some(scene) = step.from(focused, self.scene_count()) else {
+            return;
+        };
+        // An edit clears the selection and leaves the focus. A range that
+        // is extended from there starts at the scene the keys were on.
+        let nothing_selected = self.selection.scenes().next().is_none();
+        if let (ClickKind::ExtendRange, true, Some(focused)) = (kind, nothing_selected, focused) {
+            self.selection = SceneSelection::only(focused);
+        }
+        self.selection.click(scene, kind);
+        self.focus = Some(ReviewFocus::on(scene));
+    }
+
+    fn step_picture(&mut self, step: PictureStep) {
+        let (Some(focus), Some(layout)) = (self.focus, self.focused_layout()) else {
+            return;
+        };
+        let picture_count = focus::picture_count(layout.segments.len());
+        let picture = step.from(focus.picture(), picture_count);
+        self.focus = Some(focus.with_picture(picture));
+    }
+
+    fn join_focused_with_next(&mut self) {
+        let Some(focus) = self.focus else {
+            return;
+        };
+        let next = focus.scene().next();
+        if next.position() >= self.scene_count() {
+            return;
+        }
+        self.merge_scenes(focus.scene()..=next);
+    }
+
+    fn nudge_split(&mut self, scene: SceneIndex, direction: NudgeDirection) {
+        let nudged = self.edit_plan(|plan| plan.nudge_cut_before(scene, direction));
+        self.new_split_feedback = Some(match nudged {
+            Ok(moved) => {
+                // The scene keeps its number but not its start, which is
+                // what the focus is found again by.
+                self.focus = Some(ReviewFocus::on(scene));
+                SplitFeedback::Moved(moved)
+            }
+            Err(why) => SplitFeedback::MoveRefused(why),
+        });
     }
 
     /// Scene numbers shift when the plan changes, so a selection made
@@ -454,11 +592,12 @@ impl ReviewSession {
         let merged_scene = *scenes.start();
         self.edit_plan(|plan| plan.merge_scenes(scenes));
         self.selection = SceneSelection::only(merged_scene);
+        self.focus = Some(ReviewFocus::on(merged_scene));
     }
 
     fn take_selected_apart(&mut self) {
         let selected_spans: Vec<TimeSpan> = self
-            .selected_layouts()
+            .layouts_to_take_apart()
             .iter()
             .map(|layout| layout.span)
             .collect();
@@ -485,12 +624,20 @@ impl ReviewSession {
         self.edit_plan(|plan| plan.add_cut_near(time))
     }
 
-    fn selected_layouts(&self) -> Vec<SceneLayout> {
+    /// The selected scenes or, with nothing selected, the focused one. An
+    /// edit clears the selection, and the key that takes a merged scene
+    /// apart should still work on the scene the keys are on.
+    fn layouts_to_take_apart(&self) -> Vec<SceneLayout> {
         let layouts = self.plan.scene_layouts();
-        self.selection
+        let selected: Vec<SceneLayout> = self
+            .selection
             .scenes()
             .filter_map(|scene| layouts.get(scene.position()).cloned())
-            .collect()
+            .collect();
+        if !selected.is_empty() {
+            return selected;
+        }
+        self.focused_layout().into_iter().collect()
     }
 }
 
@@ -979,6 +1126,323 @@ mod tests {
     #[test]
     fn nothing_is_said_about_a_new_split_before_one_was_tried() {
         assert_eq!(test_sessions::five_scenes().new_split_feedback(), None);
+    }
+
+    fn nudge(position: usize, direction: NudgeDirection) -> ReviewRequest {
+        ReviewRequest::NudgeSplit {
+            scene: scene(position),
+            direction,
+        }
+    }
+
+    fn step(step: SceneStep) -> ReviewRequest {
+        ReviewRequest::StepFocus {
+            step,
+            kind: ClickKind::Single,
+        }
+    }
+
+    fn step_extending(step: SceneStep) -> ReviewRequest {
+        ReviewRequest::StepFocus {
+            step,
+            kind: ClickKind::ExtendRange,
+        }
+    }
+
+    impl Session {
+        fn focused(&self) -> Option<usize> {
+            self.0.focus().map(|focus| focus.scene().position())
+        }
+
+        fn chosen_picture(&self) -> Option<usize> {
+            self.0.focus().and_then(ReviewFocus::picture)
+        }
+    }
+
+    #[test]
+    fn a_split_is_moved_to_the_next_cut_point_and_the_new_time_is_said() {
+        let mut session = Session::five_scenes();
+        session.ask(nudge(2, NudgeDirection::Later));
+
+        assert_eq!(session.scene_ends(), vec![20.0, 50.0, 60.0, 80.0, 100.0]);
+        let feedback = session.0.new_split_feedback().unwrap();
+        assert_eq!(
+            feedback,
+            &SplitFeedback::Moved(MovedCut {
+                from: 40.0,
+                to: 50.0
+            })
+        );
+        assert!(!feedback.is_refusal());
+        assert_eq!(
+            feedback.in_words(),
+            "Moved the split from 00:00:40.000 to 00:00:50.000."
+        );
+    }
+
+    #[test]
+    fn a_moved_split_can_be_undone() {
+        let mut session = Session::five_scenes();
+        session.ask(nudge(2, NudgeDirection::Earlier));
+        assert_eq!(session.scene_ends(), vec![20.0, 30.0, 60.0, 80.0, 100.0]);
+        assert!(session.0.is_edited());
+
+        session.ask(ReviewRequest::Undo);
+        assert_eq!(session.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+        assert!(!session.0.is_edited());
+    }
+
+    #[test]
+    fn a_split_that_cannot_move_stays_and_the_reason_is_said() {
+        let mut session = Session::five_scenes();
+        session.ask(nudge(2, NudgeDirection::Later));
+        // The split is at 50 now, and the next cut point is the split at 60.
+        session.ask(nudge(2, NudgeDirection::Later));
+
+        assert_eq!(session.scene_ends(), vec![20.0, 50.0, 60.0, 80.0, 100.0]);
+        let feedback = session.0.new_split_feedback().unwrap();
+        assert!(feedback.is_refusal());
+        assert_eq!(
+            feedback.in_words(),
+            "The split cannot move further. The split at 00:01:00.000 is in the way."
+        );
+        // The refused move left nothing more to undo than the first one.
+        session.ask(ReviewRequest::Undo);
+        assert!(!session.0.can_undo());
+    }
+
+    #[test]
+    fn the_first_scene_has_no_split_to_move() {
+        let mut session = Session::five_scenes();
+        session.ask(nudge(0, NudgeDirection::Later));
+
+        assert!(!session.0.can_undo());
+        assert_eq!(
+            session.0.new_split_feedback(),
+            Some(&SplitFeedback::MoveRefused(
+                NudgeCutError::NoSplitBeforeScene
+            ))
+        );
+    }
+
+    #[test]
+    fn moving_a_split_keeps_the_keys_on_the_scene_it_starts() {
+        let mut session = Session::five_scenes();
+        session.ask(click(2, ClickKind::Single));
+
+        // Moved later, the moment the scene started at is in the scene
+        // before it. The keys stay on the scene whose split it is.
+        session.ask(nudge(2, NudgeDirection::Later));
+        assert_eq!(session.focused(), Some(2));
+        session.ask(nudge(2, NudgeDirection::Earlier));
+        session.ask(nudge(2, NudgeDirection::Earlier));
+        assert_eq!(session.focused(), Some(2));
+        assert_eq!(session.scene_ends(), vec![20.0, 30.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn a_reset_puts_a_moved_split_back() {
+        let mut session = Session::five_scenes();
+        session.ask(nudge(2, NudgeDirection::Later));
+
+        session.ask(ReviewRequest::ResetScenes);
+        assert_eq!(session.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn nothing_is_focused_until_the_person_steps_or_clicks() {
+        let mut session = Session::five_scenes();
+        assert_eq!(session.focused(), None);
+        assert_eq!(session.0.focused_play_time(), None);
+
+        session.ask(step(SceneStep::Next));
+        assert_eq!(session.focused(), Some(0));
+    }
+
+    #[test]
+    fn stepping_moves_the_focus_and_selects_the_scene_it_lands_on() {
+        let mut session = Session::five_scenes();
+        session.ask(step(SceneStep::Next));
+        session.ask(step(SceneStep::Next));
+        assert_eq!(session.focused(), Some(1));
+        assert_eq!(session.selected(), vec![1]);
+
+        session.ask(step(SceneStep::Last));
+        assert_eq!(session.focused(), Some(4));
+        session.ask(step(SceneStep::Next));
+        assert_eq!(session.focused(), Some(4));
+
+        session.ask(step(SceneStep::First));
+        session.ask(step(SceneStep::Previous));
+        assert_eq!(session.focused(), Some(0));
+        assert_eq!(session.selected(), vec![0]);
+    }
+
+    #[test]
+    fn stepping_with_shift_extends_the_selection_from_where_it_began() {
+        let mut session = Session::five_scenes();
+        session.ask(click(1, ClickKind::Single));
+        session.ask(step_extending(SceneStep::Next));
+        session.ask(step_extending(SceneStep::Next));
+        assert_eq!(session.selected(), vec![1, 2, 3]);
+        assert_eq!(session.focused(), Some(3));
+
+        session.ask(step_extending(SceneStep::Previous));
+        assert_eq!(session.selected(), vec![1, 2]);
+
+        session.ask(ReviewRequest::MergeSelected);
+        assert_eq!(session.scene_ends(), vec![20.0, 60.0, 80.0, 100.0]);
+        assert_eq!(session.focused(), Some(1));
+    }
+
+    #[test]
+    fn a_range_extended_after_an_edit_starts_at_the_focused_scene() {
+        let mut session = Session::five_scenes();
+        session.ask(click(1, ClickKind::Single));
+        // The edit clears the selection and leaves the focus where it was.
+        session.ask(nudge(1, NudgeDirection::Later));
+        assert!(session.selected().is_empty());
+
+        session.ask(step_extending(SceneStep::Next));
+        assert_eq!(session.selected(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_click_moves_the_focus_to_the_clicked_scene() {
+        let mut session = Session::five_scenes();
+        session.ask(click(3, ClickKind::Single));
+        assert_eq!(session.focused(), Some(3));
+
+        session.ask(ReviewRequest::ClearSelection);
+        // Escape clears the selection. The person keeps their place.
+        assert_eq!(session.focused(), Some(3));
+    }
+
+    #[test]
+    fn the_focused_scene_plays_from_its_start() {
+        let mut session = Session::five_scenes();
+        session.ask(click(2, ClickKind::Single));
+        assert_eq!(
+            session.ask(ReviewRequest::PlayFocused),
+            Some(FollowUp::PlayFrom(40.0))
+        );
+    }
+
+    #[test]
+    fn with_nothing_focused_there_is_nothing_to_play() {
+        let mut session = Session::five_scenes();
+        assert_eq!(session.ask(ReviewRequest::PlayFocused), None);
+    }
+
+    #[test]
+    fn a_chosen_picture_is_where_the_focused_scene_plays_from() {
+        let mut session = Session::five_scenes();
+        session.ask(click(2, ClickKind::Single));
+        session.ask(ReviewRequest::StepPicture(PictureStep::Next));
+        session.ask(ReviewRequest::StepPicture(PictureStep::Next));
+        assert_eq!(session.chosen_picture(), Some(1));
+
+        // The scene runs from 40 to 60 seconds, with a picture every five
+        // seconds from 42.5 on.
+        assert_eq!(
+            session.ask(ReviewRequest::PlayFocused),
+            Some(FollowUp::PlayFrom(47.5))
+        );
+
+        session.ask(ReviewRequest::StepPicture(PictureStep::Previous));
+        session.ask(ReviewRequest::StepPicture(PictureStep::Previous));
+        assert_eq!(session.chosen_picture(), None);
+    }
+
+    #[test]
+    fn the_pictures_of_a_merged_scene_run_through_all_its_parts() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
+        for _ in 0..20 {
+            session.ask(ReviewRequest::StepPicture(PictureStep::Next));
+        }
+
+        // Two parts of four pictures each, the last one 2.5 seconds before
+        // the end of the second part.
+        assert_eq!(session.chosen_picture(), Some(7));
+        assert_eq!(
+            session.ask(ReviewRequest::PlayFocused),
+            Some(FollowUp::PlayFrom(37.5))
+        );
+    }
+
+    #[test]
+    fn stepping_to_another_scene_forgets_the_chosen_picture() {
+        let mut session = Session::five_scenes();
+        session.ask(click(2, ClickKind::Single));
+        session.ask(ReviewRequest::StepPicture(PictureStep::Next));
+
+        session.ask(step(SceneStep::Next));
+        assert_eq!(session.chosen_picture(), None);
+    }
+
+    #[test]
+    fn with_nothing_focused_there_is_no_picture_to_choose() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::StepPicture(PictureStep::Next));
+        assert_eq!(session.0.focus(), None);
+    }
+
+    #[test]
+    fn the_focused_scene_is_joined_with_the_next_and_stays_focused() {
+        let mut session = Session::five_scenes();
+        session.ask(click(1, ClickKind::Single));
+        session.ask(ReviewRequest::JoinFocusedWithNext);
+
+        assert_eq!(session.scene_ends(), vec![20.0, 60.0, 80.0, 100.0]);
+        assert_eq!(session.focused(), Some(1));
+        assert_eq!(session.selected(), vec![1]);
+    }
+
+    #[test]
+    fn the_last_scene_has_no_next_scene_to_join() {
+        let mut session = Session::five_scenes();
+        session.ask(click(4, ClickKind::Single));
+        session.ask(ReviewRequest::JoinFocusedWithNext);
+        assert_eq!(session.0.scene_count(), 5);
+        assert!(!session.0.can_undo());
+
+        let mut nothing_focused = Session::five_scenes();
+        nothing_focused.ask(ReviewRequest::JoinFocusedWithNext);
+        assert_eq!(nothing_focused.0.scene_count(), 5);
+    }
+
+    #[test]
+    fn the_focus_stays_on_its_footage_when_the_scenes_are_renumbered() {
+        let mut session = Session::five_scenes();
+        session.ask(click(3, ClickKind::Single));
+
+        // Splitting the first scene in two renumbers every scene after it.
+        session.0.split_near(10.0);
+        assert_eq!(session.focused(), Some(4));
+
+        session.ask(ReviewRequest::Undo);
+        assert_eq!(session.focused(), Some(3));
+    }
+
+    #[test]
+    fn a_merge_done_with_the_mouse_puts_the_focus_on_the_merged_scene() {
+        let mut session = Session::five_scenes();
+        session.ask(click(4, ClickKind::Single));
+        session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
+        assert_eq!(session.focused(), Some(0));
+    }
+
+    #[test]
+    fn with_nothing_selected_the_focused_merged_scene_is_taken_apart() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::MergeScenes(scenes(1, 2)));
+        session.ask(ReviewRequest::ClearSelection);
+        assert!(session.0.has_merged_scene_selected());
+
+        session.ask(ReviewRequest::TakeSelectedApart);
+        assert_eq!(session.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+        assert_eq!(session.focused(), Some(1));
     }
 
     #[test]

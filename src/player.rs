@@ -722,6 +722,12 @@ impl Player {
     }
 
     /// Shows the outcome of a split in the player window.
+    /// Whether the question about sound is open in front of the player.
+    /// Until it is answered, the keys are not the review screen's either.
+    pub fn is_asking_about_sound(&self) -> bool {
+        self.asking_to_turn_sound_on
+    }
+
     pub fn show_split_feedback(&mut self, feedback: SplitFeedback) {
         self.split_feedback = Some(feedback);
     }
@@ -840,17 +846,25 @@ impl Player {
         if keyboard::take_escape(ctx) {
             self.close_requested = true;
         }
-        let (back, forward, pause, split) = ctx.input(|input| {
+        // The review screen behind the player reads the arrow keys and
+        // Space too, as "another picture" and "play this scene". They are
+        // taken here, so one press does one thing. With Alt held an arrow
+        // key moves a split in the review, and is left for it.
+        let back_arrow = keyboard::take_plain_key(ctx, egui::Key::ArrowLeft);
+        let forward_arrow = keyboard::take_plain_key(ctx, egui::Key::ArrowRight);
+        let pause = keyboard::take_plain_key(ctx, egui::Key::Space);
+        let (back_letter, forward_letter, split) = ctx.input(|input| {
             // With Ctrl held a letter is a shortcut of the review screen,
             // such as "select all", and not the player's.
             let plain_key = |key| input.key_pressed(key) && !input.modifiers.command;
             (
-                input.key_pressed(egui::Key::ArrowLeft) || plain_key(egui::Key::A),
-                input.key_pressed(egui::Key::ArrowRight) || plain_key(egui::Key::D),
-                input.key_pressed(egui::Key::Space),
+                plain_key(egui::Key::A),
+                plain_key(egui::Key::D),
                 plain_key(egui::Key::S),
             )
         });
+        let back = back_arrow || back_letter;
+        let forward = forward_arrow || forward_letter;
         if split {
             self.split_requested = true;
         }
@@ -1328,6 +1342,52 @@ mod tests {
             paused.press(egui::Key::S),
             PlayerEvent::SplitRequested(10.0)
         );
+    }
+
+    #[test]
+    fn the_keys_the_player_acts_on_are_not_left_for_the_review_behind_it() {
+        let mut paused = PausedPlayer::new();
+        let mut left_for_the_review_screen = true;
+        let _ = paused.ctx.run(
+            key_press(egui::Key::ArrowRight, egui::Modifiers::NONE),
+            |ctx| {
+                paused.player.take_keys(ctx, KeyboardOwner::Screens);
+                left_for_the_review_screen =
+                    ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+            },
+        );
+        assert!(!left_for_the_review_screen);
+        assert_eq!(paused.player.position(), 10.0 + SKIP_SECONDS);
+    }
+
+    #[test]
+    fn an_arrow_key_with_alt_held_is_the_reviews_and_does_not_skip() {
+        let mut paused = PausedPlayer::new();
+        let mut left_for_the_review_screen = false;
+        let _ = paused.ctx.run(
+            key_press(egui::Key::ArrowRight, egui::Modifiers::ALT),
+            |ctx| {
+                paused.player.take_keys(ctx, KeyboardOwner::Screens);
+                left_for_the_review_screen =
+                    ctx.input(|input| input.key_pressed(egui::Key::ArrowRight));
+            },
+        );
+        assert!(left_for_the_review_screen);
+        assert_eq!(paused.player.position(), 10.0);
+    }
+
+    fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            modifiers,
+            ..Default::default()
+        }
     }
 
     #[test]

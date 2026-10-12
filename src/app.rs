@@ -928,8 +928,20 @@ impl SceneSplitterApp {
                     .as_ref()
                     .filter(|active| active.job == id)
                     .map(|active| active.player.position());
+                // The question about sound is asked in front of the player,
+                // which is in front of the review. Only the player hears
+                // Escape as its answer. To the review it is a dialog.
+                let asking_about_sound = self
+                    .player
+                    .as_ref()
+                    .is_some_and(|active| active.player.is_asking_about_sound());
+                let review_keyboard = if asking_about_sound {
+                    KeyboardOwner::Dialog
+                } else {
+                    keyboard
+                };
                 let screen = self.review_screens.entry(id).or_default();
-                let requests = screen.show(ctx, session, &self.settings, playhead, keyboard);
+                let requests = screen.show(ctx, session, &self.settings, playhead, review_keyboard);
                 // While the question about recycling is open, the review
                 // behind it is not to be changed, not even with its keys.
                 let may_change_the_review = self.recycling_question_for.is_none();
@@ -1972,8 +1984,13 @@ mod tests {
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) {
+            self.frame_with(events, egui::Modifiers::NONE);
+        }
+
+        fn frame_with(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW)),
+                modifiers,
                 events,
                 ..Default::default()
             };
@@ -1981,14 +1998,28 @@ mod tests {
         }
 
         fn press(&mut self, key: egui::Key) {
-            self.frame(vec![egui::Event::Key {
+            self.press_with(key, egui::Modifiers::NONE);
+        }
+
+        fn press_with(&mut self, key: egui::Key, modifiers: egui::Modifiers) {
+            let press = egui::Event::Key {
                 key,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }]);
+                modifiers,
+            };
+            self.frame_with(vec![press], modifiers);
             self.frame(Vec::new());
+        }
+
+        fn player_position(&self) -> f64 {
+            self.app.player.as_ref().unwrap().player.position()
+        }
+
+        fn scene_ends(&self) -> Vec<f64> {
+            let review = self.app.queue.review(self.job).unwrap();
+            review.scenes().iter().map(|scene| scene.end).collect()
         }
 
         /// Opens the player on the video under review, paused, without
@@ -2046,6 +2077,41 @@ mod tests {
 
         window.press(egui::Key::Escape);
         assert_eq!(window.selected_scene_count(), 0);
+    }
+
+    #[test]
+    fn with_the_player_open_left_right_and_space_are_only_the_players() {
+        use crate::player::SKIP_SECONDS;
+        let mut window = Window::with_a_video_in_review();
+        window.open_the_player();
+        window.press(egui::Key::ArrowDown);
+        let focus_before = window.app.queue.review(window.job).unwrap().focus();
+        assert!(focus_before.is_some());
+
+        // The player skips. No picture is chosen in the review behind it.
+        window.press(egui::Key::ArrowRight);
+        assert_eq!(window.player_position(), 47.0 + SKIP_SECONDS);
+        window.press(egui::Key::Space);
+        assert_eq!(window.player_position(), 47.0 + SKIP_SECONDS);
+        let review = window.app.queue.review(window.job).unwrap();
+        assert_eq!(review.focus(), focus_before);
+    }
+
+    #[test]
+    fn with_the_player_open_the_review_keys_still_move_through_the_scenes() {
+        let mut window = Window::with_a_video_in_review();
+        window.open_the_player();
+        window.press(egui::Key::ArrowDown);
+        window.press(egui::Key::ArrowDown);
+
+        // Alt with an arrow key moves the split, and the player stays put.
+        window.press_with(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert_eq!(window.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
+        assert_eq!(window.player_position(), 47.0);
+
+        // Enter plays the focused scene, which now starts at 30 seconds.
+        window.press(egui::Key::Enter);
+        assert_eq!(window.player_position(), 30.0);
     }
 
     #[test]
