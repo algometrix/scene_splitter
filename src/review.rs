@@ -18,6 +18,7 @@ use eframe::egui;
 
 use crate::detect::ScanKind;
 use crate::export::{ExportOptions, TRASH_NAME};
+use crate::folder_settings::{self, DetectionInUse, DetectionSettings, SettingsScope};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::{CutIndex, SceneIndex, SceneLayout, SegmentIndex, SplitPlan};
@@ -101,6 +102,31 @@ const LOOK_HARDER_EXPLANATION: &str =
     "Looks at every picture of the video for places where it changes abruptly, even subtly. \
      This is much slower than the first scan.";
 const RESCAN_WARNING: &str = "Scanning again removes the merges and splits you made on this video.";
+const SPLIT_LATER_LABEL: &str = "Split later";
+const SPLIT_LATER_EXPLANATION: &str =
+    "Keeps these scenes and shows the next video. Nothing is written yet. \
+     When you have reviewed the others, split them all with one button in the list on the left.";
+const LEAVE_OUT_CHAPTERS_LABEL: &str = "Leave out the chapter marks";
+const LEAVE_OUT_CHAPTERS_EXPLANATION: &str =
+    "Joins the scenes again wherever only a chapter mark of the file separates them. \
+     Undo brings them back.";
+const BLACK_SCREEN_SETTINGS_LABEL: &str = "Black screen settings";
+const HIDE_BLACK_SCREEN_SETTINGS_LABEL: &str = "Hide the black screen settings";
+const BLACK_SCREEN_SETTINGS_EXPLANATION: &str =
+    "What counts as a black screen when this video is scanned.";
+const BLACK_SCREEN_SETTINGS_HEADING: &str = "What counts as a black screen";
+const BLACK_SCREEN_SETTINGS_APPLY_NOTE: &str =
+    "Changes are saved straight away. Press Scan again to scan this video with them.";
+const GENERAL_SETTINGS_IN_USE: &str = "This video is scanned with the general settings.";
+const FOLDER_SETTINGS_IN_USE: &str =
+    "This video is scanned with the settings remembered for its folder.";
+const REMEMBER_FOR_FOLDER_LABEL: &str = "Remember for this folder";
+const USE_GENERAL_SETTINGS_LABEL: &str = "Use the general settings for this folder";
+/// A chapter title longer than this is cut short on the scene card. The
+/// whole title is one hover away.
+const MOST_TITLE_CHARACTERS_SHOWN: usize = 48;
+const TITLE_CUT_SHORT_MARK: &str = "...";
+const CHAPTER_TITLE_FONT_SIZE: f32 = 14.0;
 
 /// Previews are drawn as wide as the card allows, within these limits.
 const PREVIEWS_PER_ROW: f32 = 4.0;
@@ -268,6 +294,18 @@ impl SceneListInput {
     }
 }
 
+/// The card with the black screen settings, which sits above the scenes and
+/// scrolls with them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SettingsCard {
+    Hidden,
+    /// Asked for in this frame or the one before. The list may be scrolled
+    /// far down, so the card is brought into view once, or the click on its
+    /// link would seem to do nothing.
+    JustOpened,
+    Open,
+}
+
 /// The screen of one review: the previews it has loaded, where it drew the
 /// scene cards, and a drag that is under way. What the person decides about
 /// the video is not here but in the `ReviewSession` the screen draws. The
@@ -287,6 +325,8 @@ pub struct ReviewScreen {
     scene_to_scroll_to: Option<SceneIndex>,
     /// Whether the options for finding missed scenes are shown.
     missed_scenes_open: bool,
+    /// Whether the card with the black screen settings is shown.
+    black_screen_settings: SettingsCard,
     /// The size previews are decoded at, which suits the sharpness of the
     /// screen the window is on.
     preview_pixels: PictureSize,
@@ -312,6 +352,7 @@ impl Default for ReviewScreen {
             dragged_scene: None,
             scene_to_scroll_to: None,
             missed_scenes_open: false,
+            black_screen_settings: SettingsCard::Hidden,
             preview_pixels: thumbnails::SMALLEST_THUMBNAIL,
             expanded_scenes: HashSet::new(),
             card_heights: HashMap::new(),
@@ -343,13 +384,20 @@ impl ReviewScreen {
         self.decode_previews_for_the_sharpness_of_the_screen(ctx);
         self.receive_loaded_previews(ctx);
         let mut requests = shortcut_requests(ctx, keyboard);
+        let detection = settings.detection_for(session.video());
 
         let asked_in_header = egui::TopBottomPanel::top("review_header")
             .frame(theme::header_panel())
             .show_separator_line(false)
-            .show(ctx, |ui| self.show_header(ui, session, settings, playhead))
+            .show(ctx, |ui| {
+                self.show_header(ui, session, settings, &detection, playhead)
+            })
             .inner;
         requests.extend(asked_in_header);
+        let settings_card = self.black_screen_settings;
+        if settings_card == SettingsCard::JustOpened {
+            self.black_screen_settings = SettingsCard::Open;
+        }
 
         let (asked_in_overview, input) = egui::CentralPanel::default()
             .frame(theme::panel(theme::BACKGROUND))
@@ -360,7 +408,8 @@ impl ReviewScreen {
                     // Dragging moves scenes, the wheel and scroll bar scroll.
                     .drag_to_scroll(false)
                     .show(ui, |ui| {
-                        let asked_in_overview = show_overview(ui, session, settings);
+                        let asked_in_overview =
+                            show_overview(ui, session, settings, &detection, settings_card);
                         (asked_in_overview, self.show_scenes(ui, session))
                     })
                     .inner
@@ -377,6 +426,7 @@ impl ReviewScreen {
         ui: &mut egui::Ui,
         session: &ReviewSession,
         settings: &Settings,
+        detection: &DetectionInUse,
         playhead: Option<f64>,
     ) -> Vec<ReviewRequest> {
         let mut requests = Vec::new();
@@ -398,7 +448,7 @@ impl ReviewScreen {
                 requests.push(ReviewRequest::ChangeSettings(SettingsChange::ShowTips));
             }
         });
-        requests.extend(self.show_scan_row(ui, session, settings.hard_cuts));
+        requests.extend(self.show_scan_row(ui, session, detection));
         requests.extend(show_rescan_consent(ui, session));
         requests
     }
@@ -408,18 +458,39 @@ impl ReviewScreen {
         &mut self,
         ui: &mut egui::Ui,
         session: &ReviewSession,
-        hard_cuts: HardCutSettings,
+        detection: &DetectionInUse,
     ) -> Vec<ReviewRequest> {
         let mut requests = Vec::new();
         ui.horizontal_wrapped(|ui| {
             // Same text size as the links beside it, so the line reads level.
             ui.label(theme::muted(session.scan_summary()))
                 .on_hover_text(session.scan_details());
+            if session.chapter_split_count() > 0 {
+                let leave_out = ui
+                    .link(LEAVE_OUT_CHAPTERS_LABEL)
+                    .on_hover_text(LEAVE_OUT_CHAPTERS_EXPLANATION);
+                if leave_out.clicked() {
+                    requests.push(ReviewRequest::LeaveOutChapterSplits);
+                }
+            }
             let scan_again = ui
                 .link("Scan again")
                 .on_hover_text("Looks for black screens again, with the current settings.");
             if scan_again.clicked() {
                 requests.push(ReviewRequest::Rescan(ScanKind::BlackScreens));
+            }
+            let settings_label = match self.black_screen_settings {
+                SettingsCard::Hidden => BLACK_SCREEN_SETTINGS_LABEL,
+                SettingsCard::JustOpened | SettingsCard::Open => HIDE_BLACK_SCREEN_SETTINGS_LABEL,
+            };
+            let settings_link = ui
+                .link(settings_label)
+                .on_hover_text(BLACK_SCREEN_SETTINGS_EXPLANATION);
+            if settings_link.clicked() {
+                self.black_screen_settings = match self.black_screen_settings {
+                    SettingsCard::Hidden => SettingsCard::JustOpened,
+                    SettingsCard::JustOpened | SettingsCard::Open => SettingsCard::Hidden,
+                };
             }
             let missed_label = if self.missed_scenes_open {
                 "Hide the options for missed scenes"
@@ -434,7 +505,8 @@ impl ReviewScreen {
             }
         });
         if self.missed_scenes_open {
-            requests.extend(show_hard_cut_scan_controls(ui, hard_cuts));
+            requests.extend(show_hard_cut_scan_controls(ui, detection.detection));
+            requests.extend(show_settings_scope(ui, session.video(), &detection.scope));
         }
         requests
     }
@@ -487,7 +559,11 @@ impl ReviewScreen {
         let clicked = response.clicked();
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text_at_pointer(scene_description(scene, layout));
+            .on_hover_text_at_pointer(scene_description(
+                scene,
+                layout,
+                session.chapter_title(layout.span),
+            ));
         if !clicked {
             return None;
         }
@@ -670,7 +746,8 @@ impl ReviewScreen {
             .inner_margin(CARD_MARGIN)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                show_scene_heading(ui, scene, layout, color);
+                let chapter_title = session.chapter_title(layout.span);
+                show_scene_heading(ui, scene, layout, color, chapter_title);
                 let room_for_previews = if layout.is_merged() {
                     ui.available_width() - MERGED_PART_CONTROLS_WIDTH
                 } else {
@@ -1200,6 +1277,13 @@ fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Opt
             if export_button.clicked() {
                 request = Some(ReviewRequest::Split);
             }
+            let later_button = ui
+                .add_enabled(scene_count > 1, egui::Button::new(SPLIT_LATER_LABEL))
+                .on_hover_text(SPLIT_LATER_EXPLANATION)
+                .on_disabled_hover_text("There is only one scene, so there is nothing to split.");
+            if later_button.clicked() {
+                request = Some(ReviewRequest::SplitLater);
+            }
             let skip_button = ui
                 .button("Skip this video")
                 .on_hover_text("Leaves this video as it is. Nothing is written.");
@@ -1401,12 +1485,23 @@ fn show_overview(
     ui: &mut egui::Ui,
     session: &ReviewSession,
     settings: &Settings,
+    detection: &DetectionInUse,
+    settings_card: SettingsCard,
 ) -> Vec<ReviewRequest> {
     let plan = session.plan();
     let mut requests = Vec::new();
+    if settings_card != SettingsCard::Hidden {
+        let (card, asked) = show_black_screen_settings_card(ui, session.video(), detection);
+        requests.extend(asked);
+        if settings_card == SettingsCard::JustOpened {
+            ui.scroll_to_rect(card, Some(egui::Align::TOP));
+        }
+    }
     ui.horizontal_wrapped(|ui| show_key_numbers(ui, plan));
     if session.scene_count() == 1 && show_nothing_found_note(ui) == LookHarder::Asked {
-        requests.push(ReviewRequest::Rescan(look_harder_scan(settings.hard_cuts)));
+        requests.push(ReviewRequest::Rescan(look_harder_scan(
+            detection.detection.hard_cuts,
+        )));
     }
     for stretch in session.undecoded() {
         show_note(ui, &undecoded_warning(stretch), theme::ROSE_TILE);
@@ -1426,6 +1521,76 @@ fn show_overview(
     }
     ui.add_space(SPACE_BETWEEN_SCENES);
     requests
+}
+
+/// The black screen settings this video is scanned with, whose they are,
+/// and the way to give the video's folder settings of its own or take them
+/// away again. Returns where the card was drawn and what was asked for. A
+/// changed setting is asked for with the rest of the detection settings as
+/// they are, for the app to store where they belong.
+fn show_black_screen_settings_card(
+    ui: &mut egui::Ui,
+    video: &Path,
+    in_use: &DetectionInUse,
+) -> (egui::Rect, Vec<ReviewRequest>) {
+    let mut requests = Vec::new();
+    let mut wanted = in_use.detection.scan;
+    let card = theme::card()
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::semibold(BLACK_SCREEN_SETTINGS_HEADING, 14.0));
+            requests.extend(show_settings_scope(ui, video, &in_use.scope));
+            settings_controls::show_black_screen_controls(ui, &mut wanted);
+            ui.label(theme::caption(BLACK_SCREEN_SETTINGS_APPLY_NOTE));
+        })
+        .response
+        .rect;
+    if wanted != in_use.detection.scan {
+        requests.push(ReviewRequest::ChangeDetection(DetectionSettings {
+            scan: wanted,
+            ..in_use.detection
+        }));
+    }
+    (card, requests)
+}
+
+/// Says plainly whose detection settings this video is scanned with, beside
+/// the button that changes that.
+fn show_settings_scope(
+    ui: &mut egui::Ui,
+    video: &Path,
+    scope: &SettingsScope,
+) -> Option<ReviewRequest> {
+    let mut request = None;
+    ui.horizontal_wrapped(|ui| match scope {
+        SettingsScope::General => {
+            ui.label(theme::muted(GENERAL_SETTINGS_IN_USE));
+            let folder = folder_settings::folder_of(video)
+                .map(|folder| folder.display().to_string())
+                .unwrap_or_default();
+            let remember = ui.button(REMEMBER_FOR_FOLDER_LABEL).on_hover_text(format!(
+                "Keeps the detection settings as they are now for the videos in {folder}, \
+                 whatever the general settings become. \
+                 What you change here afterwards applies to that folder alone."
+            ));
+            if remember.clicked() {
+                request = Some(ReviewRequest::RememberForFolder);
+            }
+        }
+        SettingsScope::Folder(folder) => {
+            let folder = folder.display().to_string();
+            ui.label(theme::muted(FOLDER_SETTINGS_IN_USE))
+                .on_hover_text(&folder);
+            let use_general = ui.button(USE_GENERAL_SETTINGS_LABEL).on_hover_text(format!(
+                "Forgets the detection settings remembered for {folder}. \
+                     Its videos are scanned with the general settings again."
+            ));
+            if use_general.clicked() {
+                request = Some(ReviewRequest::UseGeneralSettings);
+            }
+        }
+    });
+    request
 }
 
 /// The scan the "Look harder" button starts. The button promises to find
@@ -1654,10 +1819,12 @@ fn show_fewer_parts_button(ui: &mut egui::Ui) -> bool {
 }
 
 /// The options of the slower scan, for videos that change scene without a
-/// black screen, and the button that starts it. `saved` are the options as
-/// saved. A change to them is returned for the app to save, and so is the
+/// black screen, and the button that starts it. `in_use` are the detection
+/// settings this video is scanned with, as saved. A change to the options is
+/// returned for the app to save where those settings belong, and so is the
 /// wish to scan, with the options as they stand on screen.
-fn show_hard_cut_scan_controls(ui: &mut egui::Ui, saved: HardCutSettings) -> Vec<ReviewRequest> {
+fn show_hard_cut_scan_controls(ui: &mut egui::Ui, in_use: DetectionSettings) -> Vec<ReviewRequest> {
+    let saved = in_use.hard_cuts;
     let mut wanted = saved;
     let mut scan_asked = false;
     ui.horizontal_wrapped(|ui| {
@@ -1674,9 +1841,10 @@ fn show_hard_cut_scan_controls(ui: &mut egui::Ui, saved: HardCutSettings) -> Vec
     // frame, so at most one of these is asked for.
     let mut requests = Vec::new();
     if wanted != saved {
-        requests.push(ReviewRequest::ChangeSettings(SettingsChange::HardCuts(
-            wanted,
-        )));
+        requests.push(ReviewRequest::ChangeDetection(DetectionSettings {
+            hard_cuts: wanted,
+            ..in_use
+        }));
     }
     if scan_asked {
         requests.push(ReviewRequest::Rescan(ScanKind::HardCuts(wanted)));
@@ -1739,14 +1907,34 @@ fn is_long_scene(span: TimeSpan) -> bool {
     span.seconds() > LONG_SCENE_SECONDS
 }
 
-fn scene_description(scene: SceneIndex, layout: &SceneLayout) -> String {
+/// What the timeline says about a scene under the pointer. `chapter_title`
+/// is the title of the chapter that begins with the scene, if the file
+/// names one.
+fn scene_description(
+    scene: SceneIndex,
+    layout: &SceneLayout,
+    chapter_title: Option<&str>,
+) -> String {
+    let name = match chapter_title {
+        Some(title) => format!("Scene {}   {title}", scene.number()),
+        None => format!("Scene {}", scene.number()),
+    };
     format!(
-        "Scene {}   {}   ({} to {})",
-        scene.number(),
+        "{name}   {}   ({} to {})",
         format_length(layout.span.seconds()),
         format_timestamp(layout.span.start),
         format_timestamp(layout.span.end)
     )
+}
+
+/// A chapter title as a scene card shows it: whole when it is short, and
+/// otherwise its beginning with a mark that it goes on.
+fn title_for_card(title: &str) -> String {
+    if title.chars().count() <= MOST_TITLE_CHARACTERS_SHOWN {
+        return title.to_owned();
+    }
+    let beginning: String = title.chars().take(MOST_TITLE_CHARACTERS_SHOWN).collect();
+    format!("{}{TITLE_CUT_SHORT_MARK}", beginning.trim_end())
 }
 
 fn show_scene_heading(
@@ -1754,10 +1942,18 @@ fn show_scene_heading(
     scene: SceneIndex,
     layout: &SceneLayout,
     color: egui::Color32,
+    chapter_title: Option<&str>,
 ) {
     ui.horizontal_wrapped(|ui| {
         let badge = theme::semibold(scene_name(scene), 13.0).color(egui::Color32::WHITE);
         theme::pill_at_least(ui, badge, color, SCENE_BADGE_MIN_WIDTH);
+        if let Some(title) = chapter_title {
+            ui.label(theme::semibold(
+                title_for_card(title),
+                CHAPTER_TITLE_FONT_SIZE,
+            ))
+            .on_hover_text(format!("Chapter: {title}"));
+        }
 
         let length = theme::semibold(format_length(layout.span.seconds()), SCENE_LENGTH_FONT_SIZE);
         if is_long_scene(layout.span) {
@@ -1898,8 +2094,19 @@ mod tests {
             // No scene files of an earlier split are in the way.
             let follow_up = session.apply_frame(requests, &test_sessions::nothing_in_the_way);
             // Settings are the app's to keep, and this stands in for it.
-            if let Some(FollowUp::ChangeSettings(change)) = follow_up {
-                *settings = settings.changed_by(change);
+            let video = Arc::clone(session.video());
+            match follow_up {
+                Some(FollowUp::ChangeSettings(change)) => *settings = settings.changed_by(change),
+                Some(FollowUp::ChangeDetection(detection)) => {
+                    settings.change_detection_for(&video, detection);
+                }
+                Some(FollowUp::RememberForFolder) => {
+                    settings.remember_detection_for_folder_of(&video);
+                }
+                Some(FollowUp::UseGeneralSettings) => {
+                    settings.use_general_detection_for_folder_of(&video);
+                }
+                _ => {}
             }
             if follow_up.is_some() {
                 *last_follow_up = follow_up;
@@ -2195,7 +2402,7 @@ mod tests {
     fn the_screen_draws_the_settings_without_changing_them() {
         let mut screen = Screen::with_five_scenes();
         screen.view.missed_scenes_open = true;
-        let before = screen.settings;
+        let before = screen.settings.clone();
         screen.frame(Vec::new(), egui::Modifiers::NONE);
         screen.click_scene(1, egui::Modifiers::NONE);
         assert_eq!(screen.settings, before);
@@ -2698,6 +2905,99 @@ mod tests {
     fn a_merge_is_described_with_the_scene_numbers_people_see() {
         let first_and_third = span_between(SceneIndex::new(2), SceneIndex::new(0));
         assert_eq!(merge_description(&first_and_third), "Merge scenes 1 to 3");
+    }
+
+    #[test]
+    fn a_short_chapter_title_is_shown_whole_and_a_long_one_is_cut_short() {
+        assert_eq!(title_for_card("The heist"), "The heist");
+
+        let exactly_fits = "x".repeat(MOST_TITLE_CHARACTERS_SHOWN);
+        assert_eq!(title_for_card(&exactly_fits), exactly_fits);
+
+        let long = format!("{exactly_fits} and then some more");
+        let shown = title_for_card(&long);
+        assert_eq!(shown, format!("{exactly_fits}{TITLE_CUT_SHORT_MARK}"));
+    }
+
+    #[test]
+    fn a_title_in_letters_of_several_bytes_is_cut_between_letters() {
+        let long = "é".repeat(MOST_TITLE_CHARACTERS_SHOWN + 5);
+        let shown = title_for_card(&long);
+        assert_eq!(
+            shown.chars().count(),
+            MOST_TITLE_CHARACTERS_SHOWN + TITLE_CUT_SHORT_MARK.len()
+        );
+    }
+
+    #[test]
+    fn the_timeline_names_the_chapter_that_begins_with_the_scene_under_the_pointer() {
+        let session = test_sessions::five_scenes();
+        let layouts = session.plan().scene_layouts();
+        let second = SceneIndex::new(1);
+
+        assert_eq!(
+            scene_description(second, &layouts[1], Some("The heist")),
+            "Scene 2   The heist   20 s   (00:00:20.000 to 00:00:40.000)"
+        );
+        assert_eq!(
+            scene_description(second, &layouts[1], None),
+            "Scene 2   20 s   (00:00:20.000 to 00:00:40.000)"
+        );
+    }
+
+    /// The main panel of the smallest window: 900 points less the sidebar.
+    const SMALLEST_MAIN_PANEL: egui::Vec2 = egui::vec2(630.0, 600.0);
+
+    /// Five scenes from the scan, in a file whose chapters name two of them
+    /// and add a split of their own.
+    fn session_with_chapters() -> ReviewSession {
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
+        detection.chapters = Some(vec![
+            crate::chapters::Chapter {
+                start: 0.0,
+                title: Some("Opening".to_owned()),
+            },
+            crate::chapters::Chapter {
+                start: 31.0,
+                title: Some("A chapter with a title far too long to fit a card".to_owned()),
+            },
+        ]);
+        test_sessions::fresh_scan_of(detection)
+    }
+
+    #[test]
+    fn a_review_with_chapters_and_every_settings_part_open_is_drawn_at_the_smallest_size() {
+        let mut screen = Screen::showing(session_with_chapters(), SMALLEST_MAIN_PANEL);
+        assert_eq!(screen.session.scene_count(), 6);
+        screen.view.missed_scenes_open = true;
+        screen.view.black_screen_settings = SettingsCard::JustOpened;
+        let settings_before = screen.settings.clone();
+
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+
+        // Drawing asked for nothing: no setting changed, no scene changed.
+        assert_eq!(screen.settings, settings_before);
+        assert_eq!(screen.session.scene_count(), 6);
+        assert_eq!(screen.last_follow_up, None);
+        // The card was brought into view once and then left where it is.
+        assert_eq!(screen.view.black_screen_settings, SettingsCard::Open);
+        // Every card got its place, the one with the long title included.
+        assert_eq!(screen.view.scene_cards.len(), 6);
+    }
+
+    #[test]
+    fn a_folders_own_settings_are_drawn_without_changing_them() {
+        let mut screen = Screen::with_five_scenes();
+        let video = Arc::clone(screen.session.video());
+        screen.settings.remember_detection_for_folder_of(&video);
+        screen.view.missed_scenes_open = true;
+        screen.view.black_screen_settings = SettingsCard::Open;
+        let settings_before = screen.settings.clone();
+
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.click_scene(1, egui::Modifiers::NONE);
+        assert_eq!(screen.settings, settings_before);
     }
 
     #[test]

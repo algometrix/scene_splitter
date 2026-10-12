@@ -4,6 +4,7 @@
 
 use eframe::egui;
 
+use crate::detect::{ScanMode, ScanSettings};
 use crate::export::OriginalPolicy;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::split::SceneLocation;
@@ -11,6 +12,10 @@ use crate::timecode::SECONDS_PER_MINUTE;
 
 /// The range offered for the shortest scene a hard-cut scan may produce.
 const SHORTEST_SCENE_MINUTES: std::ops::RangeInclusive<f64> = 0.5..=60.0;
+/// The ranges offered for what counts as a black screen.
+const SHORTEST_BLACK_SECONDS: std::ops::RangeInclusive<f64> = 0.05..=10.0;
+const BLACK_SHARE_PERCENT: std::ops::RangeInclusive<f64> = 50.0..=100.0;
+const PERCENT: f64 = 100.0;
 
 /// How much the slow scan detects and the shortest scene it may leave, in
 /// the row or wrapping row the caller has opened. `id_salt` tells the
@@ -38,6 +43,55 @@ pub fn show_hard_cut_controls(
         .suffix(" min");
     if ui.add(shortest_scene).changed() {
         hard_cuts.min_scene_seconds = minutes * SECONDS_PER_MINUTE;
+    }
+}
+
+/// What counts as a black screen, and how much of the video is looked at to
+/// find them. The sidebar shows these for the general settings and a review
+/// screen for the settings its video is scanned with.
+pub fn show_black_screen_controls(ui: &mut egui::Ui, scan: &mut ScanSettings) {
+    let criteria = &mut scan.criteria;
+    ui.horizontal(|ui| {
+        ui.label("Shortest black screen");
+        ui.add(
+            egui::DragValue::new(&mut criteria.min_seconds)
+                .range(SHORTEST_BLACK_SECONDS)
+                .speed(0.01)
+                .fixed_decimals(2)
+                .suffix(" s"),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("How dark counts as black").on_hover_text(
+            "0 is pure black, 255 is white. Raise this if dark grey screens are missed.",
+        );
+        ui.add(egui::DragValue::new(&mut criteria.max_dark_luma));
+    });
+    ui.horizontal(|ui| {
+        ui.label("How much of the picture must be black")
+            .on_hover_text("A logo in a corner is why this is not 100%.");
+        let mut percent = criteria.min_dark_fraction * PERCENT;
+        let share = egui::DragValue::new(&mut percent)
+            .range(BLACK_SHARE_PERCENT)
+            .speed(0.1)
+            .fixed_decimals(1)
+            .suffix(" %");
+        if ui.add(share).changed() {
+            criteria.min_dark_fraction = percent / PERCENT;
+        }
+    });
+    let mut every_frame = scan.mode == ScanMode::EveryFrame;
+    let every_frame_box = ui
+        .checkbox(&mut every_frame, "Check every picture (much slower)")
+        .on_hover_text(
+            "Use this if black screens are being missed, for example in grainy footage.",
+        );
+    if every_frame_box.changed() {
+        scan.mode = if every_frame {
+            ScanMode::EveryFrame
+        } else {
+            ScanMode::Suspicious
+        };
     }
 }
 

@@ -1,5 +1,6 @@
 //! The videos the person has added and how far each one has come: waiting,
-//! being scanned, in review, being split, done, skipped or failed.
+//! being scanned, in review, ready to be split, being split, done, skipped
+//! or failed.
 //!
 //! Every change of status is a method here, and each one refuses a video
 //! that is not at a stage the change makes sense for. Nothing in this module
@@ -115,6 +116,10 @@ pub enum JobStatus {
     /// to be stored from last time never does.
     Scanning(Option<ScanProgress>),
     Reviewing(Box<ReviewSession>),
+    /// Reviewed, and waiting to be split together with the other videos
+    /// that are ready, when the person says so. Its scenes cannot be edited
+    /// until it is taken back into review.
+    ReadyToSplit(Box<ReviewSession>),
     /// The review is kept while its split runs. If the split fails, nothing
     /// about the review was wrong, and the person gets it back.
     Exporting(Box<ReviewSession>),
@@ -135,6 +140,7 @@ pub enum Stage {
     Waiting,
     Scanning,
     Reviewing,
+    ReadyToSplit,
     Exporting,
     Finished,
     Skipped,
@@ -147,6 +153,7 @@ impl fmt::Display for Stage {
             Self::Waiting => "waiting",
             Self::Scanning => "being scanned",
             Self::Reviewing => "in review",
+            Self::ReadyToSplit => "ready to be split",
             Self::Exporting => "being split",
             Self::Finished => "finished",
             Self::Skipped => "skipped",
@@ -162,6 +169,7 @@ impl JobStatus {
             Self::Waiting => Stage::Waiting,
             Self::Scanning(_) => Stage::Scanning,
             Self::Reviewing(_) => Stage::Reviewing,
+            Self::ReadyToSplit(_) => Stage::ReadyToSplit,
             Self::Exporting(_) => Stage::Exporting,
             Self::Finished(_) => Stage::Finished,
             Self::Skipped(_) => Stage::Skipped,
@@ -170,12 +178,13 @@ impl JobStatus {
     }
 
     /// The review of the video, wherever it is kept: under way, put aside,
-    /// or waiting for the outcome of its split.
+    /// waiting to be split, or waiting for the outcome of its split.
     pub fn kept_review(&self) -> Option<&ReviewSession> {
         match self {
-            Self::Reviewing(review) | Self::Exporting(review) | Self::Skipped(review) => {
-                Some(review)
-            }
+            Self::Reviewing(review)
+            | Self::ReadyToSplit(review)
+            | Self::Exporting(review)
+            | Self::Skipped(review) => Some(review),
             Self::Failed { review, .. } => review.as_deref(),
             Self::Waiting | Self::Scanning(_) | Self::Finished(_) => None,
         }
@@ -183,9 +192,10 @@ impl JobStatus {
 
     fn kept_review_mut(&mut self) -> Option<&mut ReviewSession> {
         match self {
-            Self::Reviewing(review) | Self::Exporting(review) | Self::Skipped(review) => {
-                Some(review)
-            }
+            Self::Reviewing(review)
+            | Self::ReadyToSplit(review)
+            | Self::Exporting(review)
+            | Self::Skipped(review) => Some(review),
             Self::Failed { review, .. } => review.as_deref_mut(),
             Self::Waiting | Self::Scanning(_) | Self::Finished(_) => None,
         }
@@ -195,9 +205,10 @@ impl JobStatus {
     /// the caller sets what it has become.
     fn take_kept_review(&mut self) -> Option<Box<ReviewSession>> {
         match std::mem::replace(self, Self::Waiting) {
-            Self::Reviewing(review) | Self::Exporting(review) | Self::Skipped(review) => {
-                Some(review)
-            }
+            Self::Reviewing(review)
+            | Self::ReadyToSplit(review)
+            | Self::Exporting(review)
+            | Self::Skipped(review) => Some(review),
             Self::Failed { review, .. } => review,
             Self::Waiting | Self::Scanning(_) | Self::Finished(_) => None,
         }
@@ -250,7 +261,10 @@ pub enum Transition {
     Skip,
     ReviewAfterAll,
     Rescan,
+    MarkReady,
+    EditAgain,
     StartExport,
+    StartReadyExport,
     Finished,
     Failed,
     Crashed,
@@ -268,7 +282,10 @@ impl fmt::Display for Transition {
             Self::Skip => "skipping",
             Self::ReviewAfterAll => "reviewing after all",
             Self::Rescan => "scanning again",
+            Self::MarkReady => "marking as ready to split",
+            Self::EditAgain => "editing the scenes again",
             Self::StartExport => "starting the split",
+            Self::StartReadyExport => "starting the split of a ready video",
             Self::Finished => "taking the result of the split",
             Self::Failed => "failing",
             Self::Crashed => "reporting a crash",
@@ -563,29 +580,89 @@ impl Queue {
         Ok(())
     }
 
+    /// Puts a reviewed video with those that are ready to be split, and
+    /// shows the next video that needs attention. Nothing is written yet.
+    pub fn mark_ready(&mut self, id: JobId) -> Result<(), Refused> {
+        let job = self.job_at(id, Transition::MarkReady, &[Stage::Reviewing])?;
+        job.status = match std::mem::replace(&mut job.status, JobStatus::Waiting) {
+            JobStatus::Reviewing(session) => JobStatus::ReadyToSplit(session),
+            other => other,
+        };
+        self.move_on_from(id);
+        Ok(())
+    }
+
+    /// Takes a ready video back into review, with every merge and added
+    /// split as it was. It is no longer ready: a video that is split
+    /// unattended must be exactly the one the person last looked at and
+    /// called ready, so after more edits they say so again. The leave to
+    /// replace earlier scene files is not kept either, as what is on disk
+    /// may have changed since.
+    pub fn edit_again(&mut self, id: JobId) -> Result<(), Refused> {
+        let job = self.job_at(id, Transition::EditAgain, &[Stage::ReadyToSplit])?;
+        job.status = match std::mem::replace(&mut job.status, JobStatus::Waiting) {
+            JobStatus::ReadyToSplit(mut session) => {
+                session.forget_export_obstacle();
+                JobStatus::Reviewing(session)
+            }
+            other => other,
+        };
+        Ok(())
+    }
+
+    /// The videos that are ready to be split, in the order of the list.
+    pub fn ready_jobs(&self) -> Vec<JobId> {
+        self.jobs
+            .iter()
+            .filter(|job| job.status.stage() == Stage::ReadyToSplit)
+            .map(|job| job.id)
+            .collect()
+    }
+
+    /// The review of a video that is ready to be split, which says what it
+    /// would be split into.
+    pub fn ready_review(&self, id: JobId) -> Option<&ReviewSession> {
+        match &self.job(id)?.status {
+            JobStatus::ReadyToSplit(session) => Some(session),
+            _ => None,
+        }
+    }
+
     /// Takes the cuts of the review as final and shows the next video that
     /// needs attention, so the person can keep reviewing while this one is
     /// written. The review stays with the video until the split has worked.
     pub fn start_export(&mut self, id: JobId) -> Result<ExportOrder, Refused> {
-        let job = self.job_mut(id)?;
-        let JobStatus::Reviewing(session) = &job.status else {
-            return Err(Refused::WrongStage {
-                job: id,
-                transition: Transition::StartExport,
-                stage: job.status.stage(),
-            });
-        };
-        let order = ExportOrder {
-            job: id,
-            video: Arc::clone(&job.video),
-            cuts: session.accepted_cuts(),
-        };
-        job.status = match std::mem::replace(&mut job.status, JobStatus::Waiting) {
-            JobStatus::Reviewing(session) => JobStatus::Exporting(session),
-            other => other,
-        };
+        let order = self.begin_export(id, Transition::StartExport, Stage::Reviewing)?;
         self.move_on_from(id);
         Ok(order)
+    }
+
+    /// Starts the split of a video that waited to be split with the others.
+    /// What is shown stays as it is: the person is looking at another video
+    /// by now, and a run of splits must not page through the list.
+    pub fn start_ready_export(&mut self, id: JobId) -> Result<ExportOrder, Refused> {
+        self.begin_export(id, Transition::StartReadyExport, Stage::ReadyToSplit)
+    }
+
+    fn begin_export(
+        &mut self,
+        id: JobId,
+        transition: Transition,
+        from: Stage,
+    ) -> Result<ExportOrder, Refused> {
+        let job = self.job_at(id, transition, &[from])?;
+        let video = Arc::clone(&job.video);
+        // A video at either of the stages a split starts from has its review.
+        let Some(session) = job.status.take_kept_review() else {
+            return Err(Refused::NoReviewKept(id));
+        };
+        let cuts = session.accepted_cuts();
+        job.status = JobStatus::Exporting(session);
+        Ok(ExportOrder {
+            job: id,
+            video,
+            cuts,
+        })
     }
 
     /// The split worked. Only now is the review let go.
@@ -598,7 +675,12 @@ impl Queue {
     /// The scan or the split did not work out, or the split could not even
     /// be started from the review. A video that had a review keeps it.
     pub fn failed(&mut self, id: JobId, failure: Failure) -> Result<(), Refused> {
-        let may_fail = [Stage::Scanning, Stage::Reviewing, Stage::Exporting];
+        let may_fail = [
+            Stage::Scanning,
+            Stage::Reviewing,
+            Stage::ReadyToSplit,
+            Stage::Exporting,
+        ];
         let job = self.job_at(id, Transition::Failed, &may_fail)?;
         let review = job.status.take_kept_review();
         job.status = JobStatus::Failed { failure, review };
@@ -739,6 +821,7 @@ mod tests {
                 decoded_frames: 0,
                 decoded_windows: 0,
                 hard_cut_candidates: None,
+                chapters: None,
             },
             source: DetectionSource::FreshScan,
             undecoded: Vec::new(),
@@ -807,6 +890,10 @@ mod tests {
                 queue.start_scan(id).unwrap();
             }
             Stage::Reviewing => bring_to_review(&mut queue, id),
+            Stage::ReadyToSplit => {
+                bring_to_review(&mut queue, id);
+                queue.mark_ready(id).unwrap();
+            }
             Stage::Exporting => {
                 bring_to_review(&mut queue, id);
                 queue.start_export(id).unwrap();
@@ -829,10 +916,11 @@ mod tests {
         (queue, id)
     }
 
-    const EVERY_STAGE: [Stage; 7] = [
+    const EVERY_STAGE: [Stage; 8] = [
         Stage::Waiting,
         Stage::Scanning,
         Stage::Reviewing,
+        Stage::ReadyToSplit,
         Stage::Exporting,
         Stage::Finished,
         Stage::Skipped,
@@ -1306,6 +1394,7 @@ mod tests {
             (Stage::Waiting, false),
             (Stage::Scanning, false),
             (Stage::Reviewing, true),
+            (Stage::ReadyToSplit, true),
             (Stage::Exporting, true),
             (Stage::Finished, false),
             (Stage::Skipped, true),
@@ -1342,8 +1431,155 @@ mod tests {
     }
 
     #[test]
+    fn a_reviewed_video_can_wait_to_be_split_and_the_next_one_is_shown() {
+        let (mut queue, ids) = queue_with(2);
+        bring_to_review(&mut queue, ids[0]);
+
+        queue.mark_ready(ids[0]).unwrap();
+        assert_eq!(stage(&queue, ids[0]), Stage::ReadyToSplit);
+        assert_eq!(queue.ready_jobs(), vec![ids[0]]);
+        assert_eq!(queue.current(), Some(ids[1]));
+        // Nothing can be asked of the review while it waits.
+        assert!(queue.review(ids[0]).is_none());
+        let ready = queue.ready_review(ids[0]).unwrap();
+        assert_eq!(ready.accepted_cuts().as_slice(), [20.0, 60.0]);
+    }
+
+    #[test]
+    fn only_a_video_in_review_can_be_marked_ready() {
+        assert_refused_elsewhere(
+            Transition::MarkReady,
+            &[Stage::Reviewing],
+            Queue::mark_ready,
+        );
+    }
+
+    #[test]
+    fn the_ready_videos_are_listed_in_the_order_of_the_list() {
+        let (mut queue, ids) = queue_with(3);
+        for &id in &ids {
+            bring_to_review(&mut queue, id);
+        }
+        queue.mark_ready(ids[2]).unwrap();
+        queue.mark_ready(ids[0]).unwrap();
+
+        assert_eq!(queue.ready_jobs(), vec![ids[0], ids[2]]);
+        assert!(queue.ready_review(ids[1]).is_none());
+    }
+
+    #[test]
+    fn a_ready_video_taken_up_again_is_in_review_as_it_was_and_no_longer_ready() {
+        let (mut queue, id) = queue_with_an_edited_review();
+        queue.mark_ready(id).unwrap();
+
+        queue.edit_again(id).unwrap();
+        assert_eq!(stage(&queue, id), Stage::Reviewing);
+        assert!(queue.ready_jobs().is_empty());
+        let review = queue.review(id).unwrap();
+        assert_eq!(review.accepted_cuts().as_slice(), [60.0]);
+        assert!(review.can_undo());
+    }
+
+    #[test]
+    fn only_a_ready_video_can_be_edited_again() {
+        assert_refused_elsewhere(
+            Transition::EditAgain,
+            &[Stage::ReadyToSplit],
+            Queue::edit_again,
+        );
+    }
+
+    #[test]
+    fn leave_to_replace_earlier_files_lasts_while_ready_and_ends_with_more_edits() {
+        let (mut queue, id) = queue_at(Stage::Reviewing);
+        let review = queue.review_mut(id).unwrap();
+        review.apply(ReviewRequest::SplitLater, &earlier_files_in_the_way);
+        let agreed = ReviewRequest::ReplaceEarlierFiles {
+            scene_dir: test_sessions::scene_dir(),
+        };
+        review.apply(agreed, &earlier_files_in_the_way);
+        queue.mark_ready(id).unwrap();
+        assert!(queue
+            .ready_review(id)
+            .unwrap()
+            .may_split_over(&earlier_files_in_the_way()));
+
+        queue.edit_again(id).unwrap();
+        assert!(!queue
+            .review(id)
+            .unwrap()
+            .may_split_over(&earlier_files_in_the_way()));
+    }
+
+    #[test]
+    fn the_split_of_a_ready_video_takes_its_cuts_and_leaves_what_is_shown() {
+        let (mut queue, ids) = queue_with(3);
+        bring_to_review(&mut queue, ids[0]);
+        bring_to_review(&mut queue, ids[1]);
+        queue.mark_ready(ids[0]).unwrap();
+        assert_eq!(queue.current(), Some(ids[1]));
+
+        let order = queue.start_ready_export(ids[0]).unwrap();
+        assert_eq!(order.job, ids[0]);
+        assert_eq!(&*order.video, Path::new("video_0.mp4"));
+        assert_eq!(order.cuts.as_slice(), [20.0, 60.0]);
+        assert_eq!(stage(&queue, ids[0]), Stage::Exporting);
+        // The person is reviewing the second video and stays there.
+        assert_eq!(queue.current(), Some(ids[1]));
+    }
+
+    #[test]
+    fn only_a_ready_video_is_split_with_the_ready_videos() {
+        assert_refused_elsewhere(
+            Transition::StartReadyExport,
+            &[Stage::ReadyToSplit],
+            |queue, id| queue.start_ready_export(id).map(|_order| ()),
+        );
+    }
+
+    #[test]
+    fn a_ready_video_whose_split_fails_keeps_its_review() {
+        let (mut queue, id) = queue_with_an_edited_review();
+        queue.mark_ready(id).unwrap();
+        queue.start_ready_export(id).unwrap();
+        queue.failed(id, failure()).unwrap();
+
+        queue.back_to_review(id).unwrap();
+        assert_eq!(queue.review(id).unwrap().accepted_cuts().as_slice(), [60.0]);
+    }
+
+    #[test]
+    fn a_ready_video_whose_split_could_not_be_started_keeps_its_review() {
+        let (mut queue, id) = queue_with_an_edited_review();
+        queue.mark_ready(id).unwrap();
+        queue.failed(id, failure()).unwrap();
+
+        queue.back_to_review(id).unwrap();
+        assert_eq!(queue.review(id).unwrap().accepted_cuts().as_slice(), [60.0]);
+    }
+
+    #[test]
+    fn a_ready_video_is_not_one_that_still_needs_attention() {
+        let (mut queue, ids) = queue_with(3);
+        for &id in &ids {
+            bring_to_review(&mut queue, id);
+        }
+        queue.mark_ready(ids[1]).unwrap();
+        queue.show(ids[0]).unwrap();
+
+        // Skipping the first moves past the ready one to the third.
+        queue.skip(ids[0]).unwrap();
+        assert_eq!(queue.current(), Some(ids[2]));
+    }
+
+    #[test]
     fn a_scan_a_review_and_a_split_can_fail() {
-        for from in [Stage::Scanning, Stage::Reviewing, Stage::Exporting] {
+        for from in [
+            Stage::Scanning,
+            Stage::Reviewing,
+            Stage::ReadyToSplit,
+            Stage::Exporting,
+        ] {
             let (mut queue, id) = queue_at(from);
             queue.failed(id, failure()).unwrap();
 
@@ -1556,7 +1792,12 @@ mod tests {
     fn a_video_nobody_is_working_on_cannot_fail() {
         assert_refused_elsewhere(
             Transition::Failed,
-            &[Stage::Scanning, Stage::Reviewing, Stage::Exporting],
+            &[
+                Stage::Scanning,
+                Stage::Reviewing,
+                Stage::ReadyToSplit,
+                Stage::Exporting,
+            ],
             |queue, id| queue.failed(id, failure()),
         );
     }
@@ -1637,7 +1878,10 @@ mod tests {
             Transition::Skip,
             Transition::ReviewAfterAll,
             Transition::Rescan,
+            Transition::MarkReady,
+            Transition::EditAgain,
             Transition::StartExport,
+            Transition::StartReadyExport,
             Transition::Finished,
             Transition::Failed,
             Transition::Crashed,

@@ -67,7 +67,20 @@ enum CutSource {
     /// Suggested by the scan, whether for a black screen or for a sudden
     /// change of picture. The plan is not told which.
     Detected,
+    /// A chapter mark of the file, where the scan itself found nothing.
+    Chapter,
     AddedByUser,
+}
+
+impl CutSource {
+    /// Whether the cut was there when the review began, as opposed to one
+    /// the person added.
+    fn is_suggested(self) -> bool {
+        match self {
+            Self::Detected | Self::Chapter => true,
+            Self::AddedByUser => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -172,6 +185,47 @@ impl SplitPlan {
         }
     }
 
+    /// Adds the cuts that come from the file's chapter marks, each set to
+    /// split. Meant for a plan nobody has edited yet. A time outside the
+    /// video, or one that is proposed already, is left out.
+    pub fn propose_chapter_cuts(&mut self, chapter_cut_times: &[f64]) {
+        for &time in chapter_cut_times {
+            if !self.whole_video.has_strictly_inside(time) {
+                continue;
+            }
+            let position = self.cuts.partition_point(|cut| cut.time < time);
+            if self.cuts.get(position).is_some_and(|cut| cut.time == time) {
+                continue;
+            }
+            self.cuts.insert(
+                position,
+                ProposedCut {
+                    time,
+                    source: CutSource::Chapter,
+                    choice: CutChoice::Split,
+                },
+            );
+        }
+    }
+
+    /// How many splits the plan has now only because of a chapter mark.
+    pub fn chapter_split_count(&self) -> usize {
+        self.cuts
+            .iter()
+            .filter(|cut| cut.source == CutSource::Chapter && cut.choice == CutChoice::Split)
+            .count()
+    }
+
+    /// Merges the footage on both sides of every split that comes from a
+    /// chapter mark, for a person who wants only what the scan found.
+    pub fn merge_chapter_cuts(&mut self) {
+        for cut in &mut self.cuts {
+            if cut.source == CutSource::Chapter {
+                cut.choice = CutChoice::Merge;
+            }
+        }
+    }
+
     pub fn whole_video(&self) -> TimeSpan {
         self.whole_video
     }
@@ -245,10 +299,11 @@ impl SplitPlan {
         }
     }
 
-    /// Goes back to the scan's own suggestion: every detected cut splits
-    /// again, and the cuts the person added are gone.
+    /// Goes back to what the review began with: every detected cut and
+    /// every chapter cut splits again, and the cuts the person added are
+    /// gone.
     pub fn reset_to_detected(&mut self) {
-        self.cuts.retain(|cut| cut.source == CutSource::Detected);
+        self.cuts.retain(|cut| cut.source.is_suggested());
         for cut in &mut self.cuts {
             cut.choice = CutChoice::Split;
         }
@@ -271,11 +326,11 @@ impl SplitPlan {
         self.cuts == snapshot.cuts
     }
 
-    /// Whether the plan is still exactly what the scan suggested.
+    /// Whether the plan is still exactly what the review began with.
     pub fn is_as_detected(&self) -> bool {
         self.cuts
             .iter()
-            .all(|cut| cut.source == CutSource::Detected && cut.choice == CutChoice::Split)
+            .all(|cut| cut.source.is_suggested() && cut.choice == CutChoice::Split)
     }
 
     /// Undoes every merge strictly inside `span`.
@@ -899,6 +954,58 @@ mod tests {
             .cuts
             .iter()
             .all(|cut| cut.source == CutSource::Detected));
+    }
+
+    #[test]
+    fn chapter_cuts_split_beside_the_detected_ones_and_are_marked_as_such() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_chapter_cuts(&[2.0, 8.0]);
+
+        assert_eq!(plan.accepted_cuts().as_slice(), [2.0, 4.0, 8.0]);
+        let sources: Vec<CutSource> = plan.cuts.iter().map(|cut| cut.source).collect();
+        assert_eq!(
+            sources,
+            [CutSource::Chapter, CutSource::Detected, CutSource::Chapter]
+        );
+        assert_eq!(plan.chapter_split_count(), 2);
+        // Nothing the person did, so there is nothing to reset.
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn a_chapter_cut_where_a_cut_exists_or_outside_the_video_is_left_out() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_chapter_cuts(&[4.0, 0.0, 10.0, 25.0, f64::NAN]);
+
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0]);
+        assert_eq!(plan.cuts[0].source, CutSource::Detected);
+        assert_eq!(plan.chapter_split_count(), 0);
+    }
+
+    #[test]
+    fn a_reset_brings_chapter_cuts_back_and_keeps_them() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_chapter_cuts(&[8.0]);
+        plan.merge_scenes(scenes(0, 2));
+        plan.add_cut_near(2.25).unwrap();
+
+        plan.reset_to_detected();
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 8.0]);
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn leaving_out_the_chapter_cuts_keeps_the_detected_and_added_splits() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_chapter_cuts(&[2.0, 8.0]);
+        plan.add_cut_near(6.25).unwrap();
+
+        plan.merge_chapter_cuts();
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 6.0]);
+        assert_eq!(plan.chapter_split_count(), 0);
+        // The marks are still there to be separated at again.
+        assert_eq!(plan.segments().len(), 5);
+        assert!(!plan.is_as_detected());
     }
 
     #[test]

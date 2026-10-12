@@ -159,14 +159,16 @@ pub fn scan_ahead(
 }
 
 fn describe_detection(detection: &Detection) -> String {
-    let black_screens = format!("black screens: {}", detection.black_screens.len());
-    match &detection.hard_cut_candidates {
-        Some(candidates) => format!(
-            "{black_screens}, sudden picture changes: {}",
-            candidates.len()
-        ),
-        None => black_screens,
+    let mut found = format!("black screens: {}", detection.black_screens.len());
+    if let Some(candidates) = &detection.hard_cut_candidates {
+        found.push_str(&format!(", sudden picture changes: {}", candidates.len()));
     }
+    // Most videos have no chapters, and then nothing is said about them.
+    let chapter_mark_count = detection.chapter_marks().len();
+    if chapter_mark_count > 0 {
+        found.push_str(&format!(", chapter marks: {chapter_mark_count}"));
+    }
+    found
 }
 
 #[cfg(test)]
@@ -191,6 +193,7 @@ mod tests {
             decoded_frames: 40,
             decoded_windows: 1,
             hard_cut_candidates,
+            chapters: None,
         }
     }
 
@@ -211,6 +214,27 @@ mod tests {
         assert_eq!(
             describe_detection(&detection_with(Some(candidates))),
             "black screens: 1, sudden picture changes: 1"
+        );
+    }
+
+    #[test]
+    fn a_video_with_chapters_reports_how_many_marks_it_has() {
+        let with_chapters = Detection {
+            chapters: Some(vec![
+                crate::chapters::Chapter {
+                    start: 0.0,
+                    title: None,
+                },
+                crate::chapters::Chapter {
+                    start: 50.0,
+                    title: None,
+                },
+            ]),
+            ..detection_with(None)
+        };
+        assert_eq!(
+            describe_detection(&with_chapters),
+            "black screens: 1, chapter marks: 2"
         );
     }
 

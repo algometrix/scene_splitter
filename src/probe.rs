@@ -1,10 +1,13 @@
 //! Reads the video's packet table with ffprobe. This only demuxes, so it costs
 //! about a second even for a multi-hour file.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 
+use crate::chapters::Chapter;
 use crate::ffmpeg::{NotUnderstood, Program, ToolCommand, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT};
 use crate::timecode::TimeSpan;
 use crate::tools;
@@ -96,6 +99,86 @@ fn read_container_start(input: &Path) -> Result<f64> {
         .with_context(|| format!("unexpected container start time {field:?}"))
 }
 
+/// The chapter marks of the file, in the order they begin. Most videos have
+/// none, which is not an error.
+pub fn read_chapters(input: &Path) -> Result<Vec<Chapter>> {
+    let listing = ffprobe_on(
+        input,
+        &[
+            "-show_chapters",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "json",
+        ],
+    )
+    .run_for_text(QUICK_ANSWER_LIMIT)
+    .with_context(|| format!("could not list the chapters of {}", input.display()))?;
+    parse_chapter_listing(&listing)
+        .with_context(|| format!("could not understand the chapters of {}", input.display()))
+}
+
+/// What `ffprobe -show_chapters -show_entries format=start_time -of json`
+/// prints, as far as this program reads it.
+#[derive(Deserialize)]
+struct ChapterListing {
+    #[serde(default)]
+    chapters: Vec<ListedChapter>,
+    #[serde(default)]
+    format: ListedFormat,
+}
+
+#[derive(Deserialize)]
+struct ListedChapter {
+    start_time: String,
+    #[serde(default)]
+    tags: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListedFormat {
+    /// Left out, or "N/A", for a container without a start time.
+    start_time: Option<String>,
+}
+
+const CHAPTER_TITLE_TAG: &str = "title";
+
+/// Chapters are listed on the same absolute clock as packets, so the
+/// container's start time is taken off them as well.
+fn parse_chapter_listing(listing: &str) -> Result<Vec<Chapter>> {
+    let listing: ChapterListing =
+        serde_json::from_str(listing).context("the listing is not what ffprobe prints")?;
+    let container_start = match listing.format.start_time.as_deref() {
+        None | Some("N/A") => 0.0,
+        Some(start) => start
+            .parse()
+            .with_context(|| format!("unexpected container start time {start:?}"))?,
+    };
+
+    let mut chapters = Vec::with_capacity(listing.chapters.len());
+    for listed in listing.chapters {
+        let absolute_start: f64 = listed
+            .start_time
+            .parse()
+            .with_context(|| format!("unexpected chapter start {:?}", listed.start_time))?;
+        // Some containers write the tag in capitals. A chapter track without
+        // names gives every chapter an empty title.
+        let title = listed
+            .tags
+            .iter()
+            .find(|(tag, _)| tag.eq_ignore_ascii_case(CHAPTER_TITLE_TAG))
+            .map(|(_, title)| title.trim())
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned);
+        chapters.push(Chapter {
+            start: absolute_start - container_start,
+            title,
+        });
+    }
+    chapters.sort_by(|a, b| a.start.total_cmp(&b.start));
+    Ok(chapters)
+}
+
 /// ffprobe always prints these fields in the order pts_time, dts_time, size,
 /// flags, whatever order they were requested in.
 fn parse_packet_line(line: &str, container_start: f64) -> Result<VideoPacket> {
@@ -162,6 +245,90 @@ mod tests {
     #[test]
     fn rejects_a_truncated_line() {
         assert!(parse_packet_line("1.0,1.0", 0.0).is_err());
+    }
+
+    fn chapter(start: f64, title: Option<&str>) -> Chapter {
+        Chapter {
+            start,
+            title: title.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn chapters_are_read_with_their_titles() {
+        let listing = r#"{
+            "chapters": [
+                {"id": 0, "time_base": "1/1000", "start": 0, "start_time": "0.000000",
+                 "end": 2300, "end_time": "2.300000", "tags": {"title": "Opening"}},
+                {"id": 1, "time_base": "1/1000", "start": 2300, "start_time": "2.300000",
+                 "end": 4600, "end_time": "4.600000", "tags": {"TITLE": " The heist "}}
+            ],
+            "format": {"start_time": "0.000000"}
+        }"#;
+        assert_eq!(
+            parse_chapter_listing(listing).unwrap(),
+            vec![
+                chapter(0.0, Some("Opening")),
+                chapter(2.3, Some("The heist"))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_chapter_with_an_empty_title_or_none_has_no_title() {
+        let listing = r#"{"chapters": [
+            {"start_time": "1.000000", "tags": {"title": ""}},
+            {"start_time": "2.000000"}
+        ]}"#;
+        assert_eq!(
+            parse_chapter_listing(listing).unwrap(),
+            vec![chapter(1.0, None), chapter(2.0, None)]
+        );
+    }
+
+    #[test]
+    fn a_video_without_chapters_has_an_empty_list() {
+        let listing = r#"{"chapters": [], "format": {"start_time": "0.000000"}}"#;
+        assert!(parse_chapter_listing(listing).unwrap().is_empty());
+        assert!(parse_chapter_listing("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn chapters_are_put_on_the_clock_that_starts_with_the_container() {
+        let listing = r#"{"chapters": [{"start_time": "11.500000"}],
+            "format": {"start_time": "1.500000"}}"#;
+        assert_eq!(
+            parse_chapter_listing(listing).unwrap(),
+            vec![chapter(10.0, None)]
+        );
+    }
+
+    #[test]
+    fn a_container_without_a_start_time_starts_at_zero() {
+        let listing = r#"{"chapters": [{"start_time": "4.000000"}],
+            "format": {"start_time": "N/A"}}"#;
+        assert_eq!(
+            parse_chapter_listing(listing).unwrap(),
+            vec![chapter(4.0, None)]
+        );
+    }
+
+    #[test]
+    fn chapters_listed_out_of_order_come_out_in_order() {
+        let listing = r#"{"chapters": [{"start_time": "9.0"}, {"start_time": "3.0"}]}"#;
+        let starts: Vec<f64> = parse_chapter_listing(listing)
+            .unwrap()
+            .iter()
+            .map(|chapter| chapter.start)
+            .collect();
+        assert_eq!(starts, vec![3.0, 9.0]);
+    }
+
+    #[test]
+    fn a_chapter_listing_that_makes_no_sense_is_refused() {
+        assert!(parse_chapter_listing("not json").is_err());
+        assert!(parse_chapter_listing(r#"{"chapters": [{"start_time": "soon"}]}"#).is_err());
+        assert!(parse_chapter_listing(r#"{"chapters": [{"id": 1}]}"#).is_err());
     }
 
     #[test]

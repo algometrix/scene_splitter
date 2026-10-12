@@ -15,7 +15,10 @@ use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::probe;
 use crate::scenes::CutTimes;
 use crate::split;
-use crate::test_videos::{TestVideo, BLACK_SECONDS, FRAME_RATE, FRAME_SECONDS, SCENE_SECONDS};
+use crate::test_videos::{
+    ChapterContainer, TestChapter, TestVideo, BLACK_SECONDS, FRAME_RATE, FRAME_SECONDS,
+    SCENE_SECONDS,
+};
 use crate::thumbnails::{self, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH};
 use crate::timecode::TimeSpan;
 use crate::verify;
@@ -158,6 +161,129 @@ fn the_hard_cut_scan_finds_the_change_of_scene() {
     let cuts = detection.cuts_with_hard_cuts(&settings);
     assert_eq!(cuts.len(), 1, "{cuts:?}");
     assert_close(cuts[0], SCENE_SECONDS);
+}
+
+const OPENING_TITLE: &str = "Opening";
+const MIDDLE_TITLE: &str = "Middle";
+/// A chapter that begins between two points where the video can be cut,
+/// nearer to the one before it, and far from the black screen.
+const MIDDLE_CHAPTER_START: f64 = 2.3;
+const MIDDLE_CHAPTER_CUT: f64 = 2.0;
+/// A chapter that begins inside the black screen, a little after the point
+/// the scan cuts at.
+const LAST_CHAPTER_START: f64 = BLACK_START + 0.6;
+
+/// Three chapters for the video with a black screen: one that opens it, one
+/// in the middle of the first scene, and an unnamed one at the black screen.
+fn three_chapters() -> [TestChapter; 3] {
+    [
+        TestChapter {
+            start_seconds: 0.0,
+            title: Some(OPENING_TITLE),
+        },
+        TestChapter {
+            start_seconds: MIDDLE_CHAPTER_START,
+            title: Some(MIDDLE_TITLE),
+        },
+        TestChapter {
+            start_seconds: LAST_CHAPTER_START,
+            title: None,
+        },
+    ]
+}
+
+fn assert_the_three_chapters_were_read(detection: &Detection) {
+    let chapters = detection.chapter_marks();
+    assert_eq!(chapters.len(), 3, "{chapters:?}");
+    assert_close(chapters[0].start, 0.0);
+    assert_close(chapters[1].start, MIDDLE_CHAPTER_START);
+    assert_close(chapters[2].start, LAST_CHAPTER_START);
+    let titles: Vec<Option<&str>> = chapters
+        .iter()
+        .map(|chapter| chapter.title.as_deref())
+        .collect();
+    assert_eq!(titles, [Some(OPENING_TITLE), Some(MIDDLE_TITLE), None]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_without_chapters_is_scanned_as_having_none() {
+    let video = TestVideo::two_scenes_with_a_black_screen("no_chapters");
+    let detection = scan(&video, ScanMode::Suspicious, ScanDepth::BlackScreens);
+
+    // Looked for and not found, which is not the same as never looked for.
+    assert_eq!(detection.chapters, Some(Vec::new()));
+    assert!(detection.chapter_splits(&detection.cuts).cuts.is_empty());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn chapter_marks_are_read_and_offered_as_splits_beside_the_black_screen() {
+    let video = TestVideo::two_scenes_with_chapters(
+        "chapters",
+        ChapterContainer::Matroska,
+        &three_chapters(),
+    );
+    let detection = scan(&video, ScanMode::EveryFrame, ScanDepth::BlackScreens);
+    assert_the_three_chapters_were_read(&detection);
+    assert_eq!(detection.cuts.len(), 1, "{:?}", detection.cuts);
+    let black_screen_cut = detection.cuts[0];
+
+    let chapter_splits = detection.chapter_splits(&detection.cuts);
+    // The middle chapter gets a split of its own where the video can be
+    // cut. The last one sits at the black screen and adds none.
+    assert_eq!(chapter_splits.cuts.len(), 1, "{chapter_splits:?}");
+    assert_close(chapter_splits.cuts[0], MIDDLE_CHAPTER_CUT);
+    assert_eq!(
+        chapter_splits.title_of_scene_starting_at(detection.video.start),
+        Some(OPENING_TITLE)
+    );
+    assert_eq!(
+        chapter_splits.title_of_scene_starting_at(chapter_splits.cuts[0]),
+        Some(MIDDLE_TITLE)
+    );
+    assert_eq!(
+        chapter_splits.title_of_scene_starting_at(black_screen_cut),
+        None
+    );
+
+    // Split at the black screen and at the chapter, the scenes hold the
+    // whole video.
+    let every_cut = vec![chapter_splits.cuts[0], black_screen_cut];
+    let cuts = CutTimes::inside(detection.video, every_cut).unwrap();
+    let report =
+        export::export_scenes(&video.path, &cuts, video.folder(), OriginalPolicy::Keep).unwrap();
+    assert_eq!(report.scene_files.len(), 3);
+    assert!(report.is_clean(), "{:?}", report.verification);
+    assert!(video.path.is_file());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn an_mp4_keeps_its_chapters_in_a_stream_the_check_refuses_to_lose() {
+    let video = TestVideo::two_scenes_with_chapters(
+        "mp4_chapters",
+        ChapterContainer::Mp4,
+        &three_chapters(),
+    );
+    let detection = scan(&video, ScanMode::EveryFrame, ScanDepth::BlackScreens);
+    assert_the_three_chapters_were_read(&detection);
+
+    // The scenes are written, but they do not carry the chapter stream, so
+    // the original is not one the check lets go.
+    let report = export::export_scenes(
+        &video.path,
+        &detected_cuts(&detection),
+        video.folder(),
+        OriginalPolicy::Keep,
+    )
+    .unwrap();
+    assert_eq!(report.scene_files.len(), 2);
+    let Verification::Failed(reason) = &report.verification else {
+        panic!("the chapter stream of the original was let go unnoticed");
+    };
+    assert!(reason.contains("data stream"), "{reason}");
+    assert!(video.path.is_file());
 }
 
 /// Scans the video and returns every progress report in the order given.

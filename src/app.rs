@@ -18,13 +18,14 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use eframe::egui;
 
+use crate::batch::{SplitBatch, SplitOutcome};
 use crate::cache::{self, CacheUse, SourcedDetection};
-use crate::detect::{ScanKind, ScanMode, ScanProgress, ScanStage};
+use crate::detect::{ScanKind, ScanProgress, ScanStage};
 use crate::export::{self, ExportReport, OriginalPolicy, TRASH_NAME};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
 use crate::player::{Player, PlayerEvent};
-use crate::queue::{Failure, Job, JobId, JobStatus, Queue, Refused, ScanOrder};
+use crate::queue::{ExportOrder, Failure, Job, JobId, JobStatus, Queue, Refused, ScanOrder};
 use crate::review::{file_name, ReviewScreen};
 use crate::review_session::{counted, EarlierSceneFiles, FollowUp, ReviewRequest, ReviewSession};
 use crate::settings::{LoadedSettings, RecyclingQuestion, Settings, SettingsChange};
@@ -79,9 +80,27 @@ const WELCOME_STEPS: [(&str, &str); 3] = [
 ];
 const PERCENT: f64 = 100.0;
 const BYTES_PER_MEGABYTE: u64 = 1024 * 1024;
-/// The ranges the settings section offers.
-const SHORTEST_BLACK_SECONDS: std::ops::RangeInclusive<f64> = 0.05..=10.0;
-const BLACK_SHARE_PERCENT: std::ops::RangeInclusive<f64> = 50.0..=100.0;
+/// The bar under the count of ready videos that have been split, in the
+/// sidebar.
+const BATCH_BAR_HEIGHT: f32 = 6.0;
+const SPLIT_READY_EXPLANATION: &str =
+    "Splits every video you marked with \"Split later\", one after another, \
+     each into the scenes you reviewed. Each one is checked like any other split.";
+const BATCH_RUNNING_HEADING: &str = "Splitting the ready videos";
+const BATCH_OVER_HEADING: &str = "The ready videos were split";
+const READY_EXPLANATION: &str =
+    "Nothing is written yet. This video is split with the other ready videos \
+     when you press the button for that in the list on the left.";
+const EDIT_AGAIN_LABEL: &str = "Edit the scenes again";
+const EDIT_AGAIN_EXPLANATION: &str =
+    "Takes this video back into review. It is then no longer ready, \
+     until you press \"Split later\" again.";
+const FOLDERS_HEADING: &str = "Folders with their own detection settings";
+const FOLDERS_EXPLANATION: &str =
+    "Videos in these folders are not scanned with the settings above. \
+     Change a folder's settings on the review screen of one of its videos.";
+const FORGET_FOLDER_EXPLANATION: &str =
+    "Videos in this folder are scanned with the general settings again.";
 /// Problems are few and each is a line of text. Should something go wrong
 /// over and over, only the newest are kept, so the sidebar stays usable.
 const MOST_PROBLEMS_KEPT: usize = 5;
@@ -137,6 +156,12 @@ enum AppRequest {
     TryAgain(JobId),
     /// Take up the review of a video whose split failed, as it was.
     BackToReview(JobId),
+    /// Take a video that waits to be split back into review.
+    EditAgain(JobId),
+    /// Split every video that is ready, one after another.
+    SplitReadyVideos,
+    /// The person has read how the run of splits went.
+    DismissBatchSummary,
     /// The person has read the problems listed in the sidebar.
     DismissProblems,
     /// Show this folder in the system's file manager.
@@ -169,10 +194,21 @@ enum RecyclingAnswer {
     Cancel,
 }
 
+/// What waits for the person's answer to the question about recycling
+/// originals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SplitAwaitingAnswer {
+    /// The split of the video under review.
+    OneVideo(JobId),
+    /// The run over every video that is ready. The question is asked once,
+    /// before the first of them is split, and the answer goes for all.
+    ReadyVideos,
+}
+
 /// The settings to split with after `answer`, or `None` when the person
 /// backed out, so nothing is split and nothing is remembered.
 fn settings_after_recycling_answer(
-    settings: Settings,
+    settings: &Settings,
     answer: RecyclingAnswer,
 ) -> Option<Settings> {
     let original_policy = match answer {
@@ -180,7 +216,7 @@ fn settings_after_recycling_answer(
         RecyclingAnswer::KeepOriginal => OriginalPolicy::Keep,
         RecyclingAnswer::Cancel => return None,
     };
-    let mut answered = settings;
+    let mut answered = settings.clone();
     answered.export.original_policy = original_policy;
     answered.recycling_question = RecyclingQuestion::Answered;
     Some(answered)
@@ -217,9 +253,12 @@ struct SceneSplitterApp {
     add_dialog: AddDialog,
     add_feedback: String,
     player: Option<ActivePlayer>,
-    /// The video whose split waits for the person to say, this once, what
-    /// happens to originals.
-    recycling_question_for: Option<JobId>,
+    /// The split that waits for the person to say, this once, what happens
+    /// to originals.
+    recycling_question_for: Option<SplitAwaitingAnswer>,
+    /// The run over the ready videos: under way, or over with its summary
+    /// still to be read.
+    batch: Option<SplitBatch>,
     /// Things that went wrong outside any one video, newest last, shown in
     /// the sidebar until the person dismisses them.
     problems: Vec<String>,
@@ -349,8 +388,8 @@ impl SceneSplitterApp {
     fn new(loaded: LoadedSettings) -> Self {
         let (updates_sender, updates) = mpsc::channel();
         Self {
+            saved_settings: loaded.settings.clone(),
             settings: loaded.settings,
-            saved_settings: loaded.settings,
             settings_problem: loaded.problem.unwrap_or_default(),
             setup: Setup::Ready,
             queue: Queue::default(),
@@ -361,6 +400,7 @@ impl SceneSplitterApp {
             add_feedback: String::new(),
             player: None,
             recycling_question_for: None,
+            batch: None,
             problems: Vec::new(),
             text_box_had_the_keyboard: false,
         }
@@ -371,11 +411,12 @@ impl SceneSplitterApp {
     fn run_frame(&mut self, ctx: &egui::Context) {
         self.follow_setup();
         self.apply_job_updates();
+        self.advance_batch(ctx);
         self.apply(ctx, requests_from_keys_and_drops(ctx));
         self.start_next_scan(ctx);
         self.close_player_unless_its_video_is_in_review();
         self.forget_review_screens_no_longer_shown();
-        self.drop_the_recycling_question_unless_its_video_is_in_review();
+        self.drop_the_recycling_question_unless_its_split_can_still_start();
 
         let scene_location_before = self.settings.export.scene_location;
         let keyboard = self.keyboard_owner();
@@ -400,6 +441,7 @@ impl SceneSplitterApp {
                         requests.extend(show_queue(
                             ui,
                             &self.queue,
+                            self.batch.as_ref(),
                             &self.add_feedback,
                             &self.problems,
                             &mut self.settings,
@@ -520,6 +562,12 @@ impl SceneSplitterApp {
                 let taken_up = self.queue.back_to_review(job);
                 self.note_refusal(taken_up);
             }
+            AppRequest::EditAgain(job) => {
+                let taken_up = self.queue.edit_again(job);
+                self.note_refusal(taken_up);
+            }
+            AppRequest::SplitReadyVideos => self.split_ready_once_recycling_is_settled(ctx),
+            AppRequest::DismissBatchSummary => self.dismiss_batch_summary(),
             AppRequest::DismissProblems => self.problems.clear(),
             AppRequest::OpenFolder(folder) => {
                 if let Err(problem) = open_in_file_manager(&folder) {
@@ -546,35 +594,149 @@ impl SceneSplitterApp {
         // The person is done with the player, and its keys must not go on
         // changing the scenes behind the question.
         self.player = None;
-        self.recycling_question_for = Some(job);
+        self.recycling_question_for = Some(SplitAwaitingAnswer::OneVideo(job));
+    }
+
+    /// Starts the run over every ready video, unless one is under way or
+    /// nothing is ready. The question about recycling originals, if it was
+    /// never answered, is asked once before the first split and not again
+    /// for each video.
+    fn split_ready_once_recycling_is_settled(&mut self, ctx: &egui::Context) {
+        if self.batch_is_running() || self.queue.ready_jobs().is_empty() {
+            return;
+        }
+        if !self.settings.must_ask_before_recycling() {
+            return self.start_batch(ctx);
+        }
+        self.player = None;
+        self.recycling_question_for = Some(SplitAwaitingAnswer::ReadyVideos);
     }
 
     fn answer_recycling_question(&mut self, ctx: &egui::Context, answer: RecyclingAnswer) {
-        let Some(job) = self.recycling_question_for.take() else {
+        let Some(awaiting) = self.recycling_question_for.take() else {
             return;
         };
-        let Some(answered) = settings_after_recycling_answer(self.settings, answer) else {
+        let Some(answered) = settings_after_recycling_answer(&self.settings, answer) else {
             return;
         };
         self.settings = answered;
-        self.start_export(ctx, job);
+        match awaiting {
+            SplitAwaitingAnswer::OneVideo(job) => self.start_export(ctx, job),
+            SplitAwaitingAnswer::ReadyVideos => self.start_batch(ctx),
+        }
     }
 
-    /// The question belongs to one split. If its video is no longer the one
-    /// under review, there is nothing left to ask about.
-    fn drop_the_recycling_question_unless_its_video_is_in_review(&mut self) {
-        let still_in_review = self.recycling_question_for.is_some_and(|job| {
-            self.queue.current() == Some(job) && self.queue.review(job).is_some()
-        });
-        if !still_in_review {
+    /// The question belongs to one split or one run of splits. If its video
+    /// is no longer the one under review, or no video is ready any more,
+    /// there is nothing left to ask about.
+    fn drop_the_recycling_question_unless_its_split_can_still_start(&mut self) {
+        let can_still_start = match self.recycling_question_for {
+            Some(SplitAwaitingAnswer::OneVideo(job)) => {
+                self.queue.current() == Some(job) && self.queue.review(job).is_some()
+            }
+            Some(SplitAwaitingAnswer::ReadyVideos) => !self.queue.ready_jobs().is_empty(),
+            None => false,
+        };
+        if !can_still_start {
             self.recycling_question_for = None;
         }
     }
 
     fn show_recycling_question(&self, ctx: &egui::Context) -> Option<AppRequest> {
-        let job = self.queue.job(self.recycling_question_for?)?;
-        show_recycling_question(ctx, &file_name(job.video()))
-            .map(AppRequest::AnswerRecyclingQuestion)
+        let answer = match self.recycling_question_for? {
+            SplitAwaitingAnswer::OneVideo(job) => {
+                let name = file_name(self.queue.job(job)?.video());
+                show_recycling_question(ctx, RecyclingSubject::OneVideo(&name))
+            }
+            SplitAwaitingAnswer::ReadyVideos => {
+                let ready_count = self.queue.ready_jobs().len();
+                show_recycling_question(ctx, RecyclingSubject::ReadyVideos(ready_count))
+            }
+        };
+        answer.map(AppRequest::AnswerRecyclingQuestion)
+    }
+
+    fn batch_is_running(&self) -> bool {
+        self.batch.as_ref().is_some_and(|batch| !batch.is_over())
+    }
+
+    /// A summary can only be put away once its run is over.
+    fn dismiss_batch_summary(&mut self) {
+        if !self.batch_is_running() {
+            self.batch = None;
+        }
+    }
+
+    fn start_batch(&mut self, ctx: &egui::Context) {
+        self.batch = SplitBatch::of(self.queue.ready_jobs());
+        self.advance_batch(ctx);
+    }
+
+    /// Gives the next ready video its turn once the one before is done. A
+    /// turn that ends without a split, such as a video that was taken back
+    /// into review, makes way for the next at once.
+    fn advance_batch(&mut self, ctx: &egui::Context) {
+        loop {
+            let Some(video) = self.batch.as_mut().and_then(SplitBatch::take_next) else {
+                return;
+            };
+            let Some(ended_at_once) = self.start_ready_split(ctx, video) else {
+                return;
+            };
+            if let Some(batch) = &mut self.batch {
+                batch.turn_ended(video, ended_at_once);
+            }
+        }
+    }
+
+    /// Starts the split of a video that waited for it, with every safeguard
+    /// a single split has. Returns how its turn ended when no split was
+    /// started, and `None` when one is running now.
+    fn start_ready_split(&mut self, ctx: &egui::Context, job: JobId) -> Option<SplitOutcome> {
+        let Some(review) = self.queue.ready_review(job) else {
+            return Some(SplitOutcome::NoLongerReady);
+        };
+        let video = Arc::clone(review.video());
+        let found = look_for_earlier_scene_files(&video, self.settings.export.scene_location);
+        let may_split = review.may_split_over(&found);
+        let earlier_files = match found {
+            Ok(earlier_files) => earlier_files,
+            Err(problem) => {
+                let failed = self.queue.failed(job, Failure::in_plain_words(problem));
+                self.note_refusal(failed);
+                return Some(SplitOutcome::Failed);
+            }
+        };
+        if !may_split {
+            self.hold_back_for_earlier_files(job, earlier_files);
+            return Some(SplitOutcome::EarlierFilesInTheWay);
+        }
+        let order = match self.queue.start_ready_export(job) {
+            Ok(order) => order,
+            Err(refused) => {
+                self.note_refusal(Err(refused));
+                return Some(SplitOutcome::Failed);
+            }
+        };
+        self.export_in_background(ctx, order, earlier_files.scene_dir);
+        None
+    }
+
+    /// Scene files of an earlier split turned up where a ready video's
+    /// scenes would go, and the person never agreed to replace those. Nobody
+    /// is asked in the middle of a run. The video goes back into review with
+    /// the question open on it, for the person to find there.
+    fn hold_back_for_earlier_files(&mut self, job: JobId, earlier_files: EarlierSceneFiles) {
+        let taken_back = self.queue.edit_again(job);
+        self.note_refusal(taken_back);
+        let Some(review) = self.queue.review_mut(job) else {
+            return;
+        };
+        let asked = review.apply(ReviewRequest::Split, &|| Ok(earlier_files.clone()));
+        debug_assert!(
+            asked.is_none(),
+            "a split over files nobody agreed to replace must wait"
+        );
     }
 
     /// The dialog stays open on a mistake, with the reason in it, so a
@@ -604,6 +766,10 @@ impl SceneSplitterApp {
         };
         match follow_up {
             FollowUp::Export => self.split_once_recycling_is_settled(ctx, job),
+            FollowUp::MarkReady => {
+                let marked = self.queue.mark_ready(job);
+                self.note_refusal(marked);
+            }
             FollowUp::Skip => {
                 let skipped = self.queue.skip(job);
                 self.note_refusal(skipped);
@@ -615,6 +781,16 @@ impl SceneSplitterApp {
             }
             FollowUp::PlayFrom(time) => self.play_from(ctx, job, time),
             FollowUp::ChangeSettings(change) => self.change_settings(change),
+            // Which settings a video is scanned with depends on its folder,
+            // so these three are told which video they came from. Like every
+            // other change they are saved once the frame is over.
+            FollowUp::ChangeDetection(detection) => {
+                self.settings.change_detection_for(&video, detection);
+            }
+            FollowUp::RememberForFolder => self.settings.remember_detection_for_folder_of(&video),
+            FollowUp::UseGeneralSettings => {
+                self.settings.use_general_detection_for_folder_of(&video);
+            }
         }
     }
 
@@ -698,7 +874,7 @@ impl SceneSplitterApp {
         }
         // Remembered as saved even on failure, so a folder that cannot be
         // written is reported once and not retried on every frame.
-        self.saved_settings = self.settings;
+        self.saved_settings = self.settings.clone();
         self.settings_problem = match self.settings.save() {
             Ok(()) => String::new(),
             Err(error) => format!("Could not save the settings: {error:#}"),
@@ -740,7 +916,8 @@ impl SceneSplitterApp {
             cache_use,
             depth,
         } = order;
-        let settings = self.settings.scan;
+        // Those remembered for the video's folder, else the general ones.
+        let settings = self.settings.detection_for(&video).detection.scan;
         let updates_sender = self.updates_sender.clone();
         let window = ctx.clone();
         self.run_in_background(ctx, job, move || {
@@ -819,7 +996,6 @@ impl SceneSplitterApp {
         let Some(video) = self.queue.job(job).map(|job| Arc::clone(job.video())) else {
             return self.note_refusal(Err(Refused::NoSuchJob(job)));
         };
-        let policy = self.settings.export.original_policy;
         let out_dir = match split::scene_dir(&video, self.settings.export.scene_location) {
             Ok(out_dir) => out_dir,
             Err(error) => {
@@ -832,7 +1008,14 @@ impl SceneSplitterApp {
             Ok(order) => order,
             Err(refused) => return self.note_refusal(Err(refused)),
         };
-        self.run_in_background(ctx, job, move || {
+        self.export_in_background(ctx, order, out_dir);
+    }
+
+    /// Writes and checks the scenes of one video in the background, and
+    /// deals with its original as the settings say now.
+    fn export_in_background(&self, ctx: &egui::Context, order: ExportOrder, out_dir: PathBuf) {
+        let policy = self.settings.export.original_policy;
+        self.run_in_background(ctx, order.job, move || {
             JobEvent::Exported(export::export_scenes(
                 &order.video,
                 &order.cuts,
@@ -868,6 +1051,11 @@ impl SceneSplitterApp {
     fn apply_job_updates(&mut self) {
         let updates: Vec<JobUpdate> = self.updates.try_iter().collect();
         for JobUpdate { job, event } in updates {
+            // A run over the ready videos waits for this to give the next
+            // video its turn. It ignores a video whose turn it is not.
+            if let (Some(batch), Some(outcome)) = (&mut self.batch, split_outcome_of(&event)) {
+                batch.turn_ended(job, outcome);
+            }
             let told = match event {
                 JobEvent::ScanProgressed(progress) => self.queue.scan_progressed(job, progress),
                 JobEvent::Scanned(Ok(sourced)) => self.queue.scan_finished(job, sourced),
@@ -955,6 +1143,7 @@ impl SceneSplitterApp {
                 }
                 None
             }
+            JobStatus::ReadyToSplit(review) => show_ready(ctx, id, &name, review.scene_count()),
             JobStatus::Exporting(_) => {
                 show_busy(ctx, &format!("Writing and checking the scenes of {name}"));
                 None
@@ -966,6 +1155,19 @@ impl SceneSplitterApp {
             }
         };
         request.into_iter().collect()
+    }
+}
+
+/// How a split ended, as a run over the ready videos counts it, or `None`
+/// for news that does not end a split.
+fn split_outcome_of(event: &JobEvent) -> Option<SplitOutcome> {
+    match event {
+        JobEvent::Exported(Ok(report)) if report.is_clean() => Some(SplitOutcome::Clean),
+        JobEvent::Exported(Ok(_)) => Some(SplitOutcome::NeedsALook),
+        // A crash is counted for the video whose turn it is, which is being
+        // split. A scan that crashed is some other video's.
+        JobEvent::Exported(Err(_)) | JobEvent::Crashed => Some(SplitOutcome::Failed),
+        JobEvent::ScanProgressed(_) | JobEvent::Scanned(_) => None,
     }
 }
 
@@ -1000,6 +1202,9 @@ fn status_label(status: &JobStatus) -> String {
                 counted(review.scene_count(), "scene")
             )
         }
+        JobStatus::ReadyToSplit(review) => {
+            format!("Ready to split, {}", counted(review.scene_count(), "scene"))
+        }
         JobStatus::Exporting(_) => "Writing and checking".to_owned(),
         JobStatus::Finished(report) if report.is_clean() => "Done, checked".to_owned(),
         JobStatus::Finished(_) => "Done, check the result".to_owned(),
@@ -1012,7 +1217,8 @@ fn status_color(status: &JobStatus) -> egui::Color32 {
     match status {
         JobStatus::Waiting | JobStatus::Skipped(_) => theme::MUTED_TEXT,
         JobStatus::Scanning(_) | JobStatus::Exporting(_) => theme::ACCENT,
-        JobStatus::Reviewing(_) => theme::PRIMARY,
+        // Both wait for the person, which is what this colour says.
+        JobStatus::Reviewing(_) | JobStatus::ReadyToSplit(_) => theme::PRIMARY,
         JobStatus::Finished(report) if report.is_clean() => theme::SUCCESS,
         JobStatus::Finished(_) | JobStatus::Failed { .. } => theme::DANGER,
     }
@@ -1023,6 +1229,7 @@ fn status_color(status: &JobStatus) -> egui::Color32 {
 fn show_queue(
     ui: &mut egui::Ui,
     queue: &Queue,
+    batch: Option<&SplitBatch>,
     add_feedback: &str,
     problems: &[String],
     settings: &mut Settings,
@@ -1048,6 +1255,8 @@ fn show_queue(
             "Videos you add are listed here with their progress. Click one to open it.",
         ));
     }
+    // Above the list, so it stays in sight however many videos are listed.
+    requests.extend(show_ready_videos(ui, queue.ready_jobs().len(), batch));
     for job in queue.jobs() {
         let is_current = queue.current() == Some(job.id());
         requests.extend(show_job_card(ui, job, is_current));
@@ -1057,6 +1266,50 @@ fn show_queue(
     ui.add_space(8.0);
     egui::CollapsingHeader::new(theme::semibold("Settings", 14.0))
         .show(ui, |ui| show_settings(ui, settings, settings_problem));
+    requests
+}
+
+/// "Split 1 ready video", "Split 3 ready videos": the button that starts the
+/// run over the videos that wait to be split.
+fn split_ready_label(ready_count: usize) -> String {
+    format!("Split {}", counted(ready_count, "ready video"))
+}
+
+/// The run over the ready videos: the button that starts it, how far it has
+/// come while it runs, and how it went once it is over. Draws nothing when
+/// no video is ready and no run has anything to say.
+fn show_ready_videos(
+    ui: &mut egui::Ui,
+    ready_count: usize,
+    batch: Option<&SplitBatch>,
+) -> Vec<AppRequest> {
+    let mut requests = Vec::new();
+    let running = batch.filter(|batch| !batch.is_over());
+    if let Some(batch) = running {
+        let progress = batch.progress();
+        ui.label(theme::semibold(BATCH_RUNNING_HEADING, 13.0));
+        theme::progress_bar(ui, progress.fraction(), BATCH_BAR_HEIGHT);
+        ui.label(theme::caption(format!(
+            "{} of {} done",
+            progress.done, progress.video_count
+        )));
+    }
+    if let Some(batch) = batch.filter(|batch| batch.is_over()) {
+        ui.label(theme::semibold(BATCH_OVER_HEADING, 13.0));
+        ui.add(theme::selectable(theme::caption(batch.summary())).wrap());
+        if ui.button("Dismiss").clicked() {
+            requests.push(AppRequest::DismissBatchSummary);
+        }
+    }
+    // Videos marked ready while a run is under way wait for the next one.
+    if ready_count > 0 && running.is_none() {
+        let split_ready = ui
+            .button(split_ready_label(ready_count))
+            .on_hover_text(SPLIT_READY_EXPLANATION);
+        if split_ready.clicked() {
+            requests.push(AppRequest::SplitReadyVideos);
+        }
+    }
     requests
 }
 
@@ -1127,64 +1380,47 @@ fn show_settings(ui: &mut egui::Ui, settings: &mut Settings, problem: &str) {
     // and the defaults suit most films, so it stays folded away.
     ui.add_space(4.0);
     egui::CollapsingHeader::new("Advanced: what counts as a black screen").show(ui, |ui| {
-        show_black_screen_settings(ui, settings);
+        settings_controls::show_black_screen_controls(ui, &mut settings.scan);
     });
+    show_folders_with_their_own_settings(ui, settings);
 
     ui.add_space(4.0);
     ui.label(theme::caption(
         "Changes are saved straight away. Detection settings apply the next time a video is scanned.",
     ));
     let restore = ui.button("Restore default settings").on_hover_text(
-        "Puts every setting here back to how it was at first, except what happens to originals.",
+        "Puts every setting here back to how it was at first, except what happens to originals. \
+         Settings remembered for folders are forgotten too.",
     );
     if restore.clicked() {
         *settings = settings.restored_to_defaults();
     }
 }
 
-fn show_black_screen_settings(ui: &mut egui::Ui, settings: &mut Settings) {
-    let criteria = &mut settings.scan.criteria;
-    ui.horizontal(|ui| {
-        ui.label("Shortest black screen");
-        ui.add(
-            egui::DragValue::new(&mut criteria.min_seconds)
-                .range(SHORTEST_BLACK_SECONDS)
-                .speed(0.01)
-                .fixed_decimals(2)
-                .suffix(" s"),
-        );
-    });
-    ui.horizontal(|ui| {
-        ui.label("How dark counts as black").on_hover_text(
-            "0 is pure black, 255 is white. Raise this if dark grey screens are missed.",
-        );
-        ui.add(egui::DragValue::new(&mut criteria.max_dark_luma));
-    });
-    ui.horizontal(|ui| {
-        ui.label("How much of the picture must be black")
-            .on_hover_text("A logo in a corner is why this is not 100%.");
-        let mut percent = criteria.min_dark_fraction * PERCENT;
-        let share = egui::DragValue::new(&mut percent)
-            .range(BLACK_SHARE_PERCENT)
-            .speed(0.1)
-            .fixed_decimals(1)
-            .suffix(" %");
-        if ui.add(share).changed() {
-            criteria.min_dark_fraction = percent / PERCENT;
-        }
-    });
-    let mut every_frame = settings.scan.mode == ScanMode::EveryFrame;
-    let every_frame_box = ui
-        .checkbox(&mut every_frame, "Check every picture (much slower)")
-        .on_hover_text(
-            "Use this if black screens are being missed, for example in grainy footage.",
-        );
-    if every_frame_box.changed() {
-        settings.scan.mode = if every_frame {
-            ScanMode::EveryFrame
-        } else {
-            ScanMode::Suspicious
-        };
+/// The folders whose videos are not scanned with the general settings shown
+/// above, each with the way to make it an ordinary folder again. Draws
+/// nothing while no folder has settings of its own.
+fn show_folders_with_their_own_settings(ui: &mut egui::Ui, settings: &mut Settings) {
+    if settings.folders.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(theme::semibold(FOLDERS_HEADING, 13.0));
+    ui.label(theme::caption(FOLDERS_EXPLANATION));
+    let mut folder_to_forget = None;
+    for (folder, _) in settings.folders.iter() {
+        let shown = folder.display().to_string();
+        ui.horizontal(|ui| {
+            let forget = ui.link("Forget").on_hover_text(FORGET_FOLDER_EXPLANATION);
+            if forget.clicked() {
+                folder_to_forget = Some(folder.to_path_buf());
+            }
+            ui.add(egui::Label::new(theme::caption(&shown)).truncate())
+                .on_hover_text(&shown);
+        });
+    }
+    if let Some(folder) = folder_to_forget {
+        settings.folders.forget(&folder);
     }
 }
 
@@ -1364,10 +1600,58 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
     paths_to_add.map(AppRequest::AddFromDialog)
 }
 
+/// Whose originals the question about recycling is asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RecyclingSubject<'a> {
+    /// The video of this name, which is about to be split.
+    OneVideo(&'a str),
+    /// This many videos that are ready, about to be split one by one.
+    ReadyVideos(usize),
+}
+
+impl RecyclingSubject<'_> {
+    fn what_happens(self) -> String {
+        match self {
+            Self::OneVideo(_) => {
+                format!("After the split, the original video is moved to the {TRASH_NAME}:")
+            }
+            Self::ReadyVideos(_) => format!(
+                "After each split, the original of that video is moved to the {TRASH_NAME}. \
+                 That goes for:"
+            ),
+        }
+    }
+
+    fn named(self) -> String {
+        match self {
+            Self::OneVideo(name) => name.to_owned(),
+            Self::ReadyVideos(1) => "the 1 video that is ready to split".to_owned(),
+            Self::ReadyVideos(ready_count) => {
+                format!("all {ready_count} videos that are ready to split")
+            }
+        }
+    }
+
+    fn what_keeping_does(self) -> &'static str {
+        match self {
+            Self::OneVideo(_) | Self::ReadyVideos(1) => {
+                "Splits the video and leaves the original where it is, this time and from now on."
+            }
+            Self::ReadyVideos(_) => {
+                "Splits the videos and leaves the originals where they are, this time and from now on."
+            }
+        }
+    }
+}
+
 /// Asked once, before the first split that would move an original to the
 /// Recycle Bin or Trash: what will happen, and on what condition. Returns
 /// the person's answer, if they gave one in this frame.
-fn show_recycling_question(ctx: &egui::Context, video_name: &str) -> Option<RecyclingAnswer> {
+fn show_recycling_question(
+    ctx: &egui::Context,
+    subject: RecyclingSubject,
+) -> Option<RecyclingAnswer> {
+    let named = subject.named();
     let clicked_outside =
         theme::show_backdrop(ctx, "recycling_question_backdrop", egui::Order::Middle);
     let mut answer = None;
@@ -1380,14 +1664,9 @@ fn show_recycling_question(ctx: &egui::Context, video_name: &str) -> Option<Recy
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.set_width(RECYCLING_DIALOG_WIDTH.min(ctx.screen_rect().width() - CARD_SIDE_ROOM));
-            ui.add(
-                egui::Label::new(format!(
-                    "After the split, the original video is moved to the {TRASH_NAME}:"
-                ))
-                .wrap(),
-            );
-            ui.add(egui::Label::new(theme::semibold(video_name, 14.0)).truncate())
-                .on_hover_text(video_name);
+            ui.add(egui::Label::new(subject.what_happens()).wrap());
+            ui.add(egui::Label::new(theme::semibold(&named, 14.0)).truncate())
+                .on_hover_text(&named);
             ui.add(
                 egui::Label::new(
                     "That only happens if the new files pass the check: together they must \
@@ -1412,15 +1691,17 @@ fn show_recycling_question(ctx: &egui::Context, video_name: &str) -> Option<Recy
                 }
                 let keep_it = egui::Button::new("Keep the original")
                     .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
-                let keep_it = ui.add(keep_it).on_hover_text(
-                    "Splits the video and leaves the original where it is, this time and from now on.",
-                );
+                let keep_it = ui.add(keep_it).on_hover_text(subject.what_keeping_does());
                 if keep_it.clicked() {
                     answer = Some(RecyclingAnswer::KeepOriginal);
                 }
                 let cancel = egui::Button::new("Cancel")
                     .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
-                if ui.add(cancel).on_hover_text("Does not split yet.").clicked() {
+                if ui
+                    .add(cancel)
+                    .on_hover_text("Does not split yet.")
+                    .clicked()
+                {
                     answer = Some(RecyclingAnswer::Cancel);
                 }
             });
@@ -1491,6 +1772,32 @@ fn show_skipped(ctx: &egui::Context, job: JobId, name: &str) -> Option<AppReques
         ));
         if ui.button("Review it after all").clicked() {
             request = Some(AppRequest::ReviewAfterAll(job));
+        }
+    });
+    request
+}
+
+/// A video that waits to be split with the other ready videos, with the way
+/// back into its review.
+fn show_ready(
+    ctx: &egui::Context,
+    job: JobId,
+    name: &str,
+    scene_count: usize,
+) -> Option<AppRequest> {
+    let mut request = None;
+    show_centered_card(ctx, |ui| {
+        ui.add(egui::Label::new(theme::semibold(name, 16.0)).truncate());
+        ui.label(format!(
+            "Ready to split into {}.",
+            counted(scene_count, "file")
+        ));
+        ui.label(theme::muted(READY_EXPLANATION));
+        let edit_again = ui
+            .button(EDIT_AGAIN_LABEL)
+            .on_hover_text(EDIT_AGAIN_EXPLANATION);
+        if edit_again.clicked() {
+            request = Some(AppRequest::EditAgain(job));
         }
     });
     request
@@ -1717,7 +2024,7 @@ mod tests {
     #[test]
     fn saying_yes_to_recycling_is_remembered_and_keeps_the_choice() {
         let answered =
-            settings_after_recycling_answer(Settings::default(), RecyclingAnswer::MoveOriginal)
+            settings_after_recycling_answer(&Settings::default(), RecyclingAnswer::MoveOriginal)
                 .unwrap();
         assert_eq!(
             answered.export.original_policy,
@@ -1730,7 +2037,7 @@ mod tests {
     #[test]
     fn keeping_the_original_is_remembered_and_unticks_recycling() {
         let answered =
-            settings_after_recycling_answer(Settings::default(), RecyclingAnswer::KeepOriginal)
+            settings_after_recycling_answer(&Settings::default(), RecyclingAnswer::KeepOriginal)
                 .unwrap();
         assert_eq!(answered.export.original_policy, OriginalPolicy::Keep);
         assert_eq!(answered.recycling_question, RecyclingQuestion::Answered);
@@ -1739,7 +2046,7 @@ mod tests {
     #[test]
     fn cancelling_the_recycling_question_changes_nothing() {
         assert_eq!(
-            settings_after_recycling_answer(Settings::default(), RecyclingAnswer::Cancel),
+            settings_after_recycling_answer(&Settings::default(), RecyclingAnswer::Cancel),
             None
         );
     }
@@ -1766,7 +2073,10 @@ mod tests {
         let (mut app, job) = app_with_a_video_in_review();
 
         app.split_once_recycling_is_settled(&ctx, job);
-        assert_eq!(app.recycling_question_for, Some(job));
+        assert_eq!(
+            app.recycling_question_for,
+            Some(SplitAwaitingAnswer::OneVideo(job))
+        );
         // Nothing was started: the video is still in review.
         assert!(app.queue.review(job).is_some());
     }
@@ -1790,8 +2100,279 @@ mod tests {
         app.split_once_recycling_is_settled(&ctx, job);
 
         app.queue.skip(job).unwrap();
-        app.drop_the_recycling_question_unless_its_video_is_in_review();
+        app.drop_the_recycling_question_unless_its_split_can_still_start();
         assert_eq!(app.recycling_question_for, None);
+    }
+
+    #[test]
+    fn split_later_puts_the_video_with_the_ready_ones_and_writes_nothing() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        assert_eq!(app.queue.ready_jobs(), vec![job]);
+        // No split was started, and nobody was asked about originals yet.
+        assert!(app.batch.is_none());
+        assert_eq!(app.recycling_question_for, None);
+        assert_eq!(
+            status_label(app.queue.job(job).unwrap().status()),
+            "Ready to split, 5 scenes"
+        );
+    }
+
+    #[test]
+    fn a_ready_video_can_be_edited_again() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+
+        app.apply_request(&ctx, AppRequest::EditAgain(job));
+        assert!(app.queue.ready_jobs().is_empty());
+        assert_eq!(app.queue.review(job).unwrap().scene_count(), 5);
+        assert!(app.problems.is_empty());
+    }
+
+    #[test]
+    fn the_run_over_ready_videos_asks_about_originals_once_before_it_starts() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        assert!(app.settings.must_ask_before_recycling());
+
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        assert_eq!(
+            app.recycling_question_for,
+            Some(SplitAwaitingAnswer::ReadyVideos)
+        );
+        // Nothing starts before the answer.
+        assert!(app.batch.is_none());
+        assert_eq!(app.queue.ready_jobs(), vec![job]);
+
+        // "Not now" leaves the video ready and the question for next time.
+        app.answer_recycling_question(&ctx, RecyclingAnswer::Cancel);
+        assert!(app.batch.is_none());
+        assert_eq!(app.queue.ready_jobs(), vec![job]);
+        assert!(app.settings.must_ask_before_recycling());
+    }
+
+    #[test]
+    fn the_question_for_the_ready_videos_goes_away_when_none_is_ready_any_more() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+
+        app.drop_the_recycling_question_unless_its_split_can_still_start();
+        assert!(app.recycling_question_for.is_some());
+
+        app.queue.edit_again(job).unwrap();
+        app.drop_the_recycling_question_unless_its_split_can_still_start();
+        assert_eq!(app.recycling_question_for, None);
+    }
+
+    #[test]
+    fn with_no_video_ready_the_run_does_not_start_or_ask_anything() {
+        let ctx = egui::Context::default();
+        let (mut app, _) = app_with_a_video_in_review();
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        assert!(app.batch.is_none());
+        assert_eq!(app.recycling_question_for, None);
+    }
+
+    /// An app whose person has answered the question about originals with
+    /// "keep", and one ready video named `film.mp4` in `folder`. The video
+    /// itself does not exist, so nothing here may get as far as splitting.
+    fn app_with_a_ready_video_in(folder: &Path) -> (SceneSplitterApp, JobId) {
+        let mut settings = Settings::default();
+        settings.export.original_policy = OriginalPolicy::Keep;
+        let mut app = SceneSplitterApp::new(LoadedSettings {
+            settings,
+            problem: None,
+        });
+        let video = folder.join("film.mp4");
+        let crate::queue::Added::New(job) = app.queue.add(&video) else {
+            panic!("the queue was empty");
+        };
+        app.queue.start_scan(job).unwrap();
+        let scan = SourcedDetection {
+            detection: crate::review_session::test_sessions::scenes_of_twenty_seconds_detected(5),
+            source: cache::DetectionSource::FreshScan,
+            undecoded: Vec::new(),
+        };
+        app.queue.scan_finished(job, scan).unwrap();
+        app.queue.mark_ready(job).unwrap();
+        (app, job)
+    }
+
+    #[test]
+    fn a_ready_video_with_earlier_scene_files_in_the_way_is_held_back_not_split() {
+        let folder = std::env::temp_dir().join(format!(
+            "scene_splitter_test_{}_ready_but_in_the_way",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        // Turned up after the video was marked ready.
+        std::fs::write(folder.join("film_scene_001.mp4"), b"").unwrap();
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_ready_video_in(&folder);
+
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        let _ = std::fs::remove_dir_all(&folder);
+
+        // Back in review, with the question about those files open on it.
+        let review = app.queue.review(job).unwrap();
+        assert!(matches!(
+            review.export_obstacle(),
+            Some(crate::review_session::ExportObstacle::EarlierSceneFiles(found))
+                if found.file_count == 1
+        ));
+        // The run is over, and says what happened.
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.is_over());
+        assert!(
+            batch.summary().contains("are in the way"),
+            "{}",
+            batch.summary()
+        );
+        assert!(app.problems.is_empty());
+    }
+
+    #[test]
+    fn a_video_taken_back_into_review_before_its_turn_is_left_out_of_the_run() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_ready_video_in(Path::new("no_such_folder"));
+        app.batch = SplitBatch::of(app.queue.ready_jobs());
+        app.queue.edit_again(job).unwrap();
+
+        app.advance_batch(&ctx);
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.is_over());
+        assert!(
+            batch.summary().contains("taken back into review"),
+            "{}",
+            batch.summary()
+        );
+        // Still in review, untouched.
+        assert_eq!(app.queue.review(job).unwrap().scene_count(), 5);
+    }
+
+    #[test]
+    fn the_summary_of_a_run_stays_until_it_is_dismissed() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_ready_video_in(Path::new("no_such_folder"));
+        app.batch = SplitBatch::of(app.queue.ready_jobs());
+
+        // While the run is under way there is nothing to dismiss.
+        app.apply_request(&ctx, AppRequest::DismissBatchSummary);
+        assert!(app.batch.is_some());
+
+        app.queue.edit_again(job).unwrap();
+        app.advance_batch(&ctx);
+        app.apply_request(&ctx, AppRequest::DismissBatchSummary);
+        assert!(app.batch.is_none());
+    }
+
+    #[test]
+    fn the_end_of_a_split_is_counted_for_a_run_as_how_it_went() {
+        let clean = ExportReport {
+            scene_files: Vec::new(),
+            out_dir: PathBuf::from("scenes"),
+            verification: export::Verification::Passed,
+            original: export::OriginalOutcome::Kept,
+        };
+        let unverified = ExportReport {
+            verification: export::Verification::Failed("a packet differs".to_owned()),
+            original: export::OriginalOutcome::KeptBecauseUnverified,
+            scene_files: Vec::new(),
+            out_dir: PathBuf::from("scenes"),
+        };
+        assert_eq!(
+            split_outcome_of(&JobEvent::Exported(Ok(clean))),
+            Some(SplitOutcome::Clean)
+        );
+        assert_eq!(
+            split_outcome_of(&JobEvent::Exported(Ok(unverified))),
+            Some(SplitOutcome::NeedsALook)
+        );
+        assert_eq!(
+            split_outcome_of(&JobEvent::Exported(Err(anyhow!("the disk is full")))),
+            Some(SplitOutcome::Failed)
+        );
+        assert_eq!(
+            split_outcome_of(&JobEvent::Crashed),
+            Some(SplitOutcome::Failed)
+        );
+        let scanning = JobEvent::ScanProgressed(ScanProgress {
+            stage: ScanStage::BlackScreens,
+            fraction: 0.5,
+        });
+        assert_eq!(split_outcome_of(&scanning), None);
+    }
+
+    #[test]
+    fn the_button_for_the_ready_videos_counts_them() {
+        assert_eq!(split_ready_label(1), "Split 1 ready video");
+        assert_eq!(split_ready_label(4), "Split 4 ready videos");
+    }
+
+    #[test]
+    fn the_recycling_question_names_one_video_or_counts_the_ready_ones() {
+        assert_eq!(RecyclingSubject::OneVideo("film.mp4").named(), "film.mp4");
+        assert_eq!(
+            RecyclingSubject::ReadyVideos(1).named(),
+            "the 1 video that is ready to split"
+        );
+        assert_eq!(
+            RecyclingSubject::ReadyVideos(3).named(),
+            "all 3 videos that are ready to split"
+        );
+        assert!(RecyclingSubject::ReadyVideos(3)
+            .what_happens()
+            .starts_with("After each split"));
+    }
+
+    #[test]
+    fn detection_settings_changed_on_a_review_go_to_the_settings_its_video_uses() {
+        use crate::folder_settings::{DetectionSettings, SettingsScope};
+
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        let video = Arc::clone(app.queue.review(job).unwrap().video());
+        let mut wanted = DetectionSettings::default();
+        wanted.scan.criteria.min_seconds = 0.5;
+
+        // No folder has settings of its own yet, so the general ones change.
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::ChangeDetection(wanted)]);
+        assert_eq!(app.settings.general_detection(), wanted);
+        assert!(app.settings.folders.is_empty());
+
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::RememberForFolder]);
+        assert!(matches!(
+            app.settings.detection_for(&video).scope,
+            SettingsScope::Folder(_)
+        ));
+        assert_eq!(app.settings.detection_for(&video).detection, wanted);
+
+        // From now on a change stays with the folder.
+        let mut for_this_folder = wanted;
+        for_this_folder.scan.criteria.max_dark_luma = 60;
+        app.apply_to_review(
+            &ctx,
+            job,
+            vec![ReviewRequest::ChangeDetection(for_this_folder)],
+        );
+        assert_eq!(app.settings.general_detection(), wanted);
+        assert_eq!(
+            app.settings.detection_for(&video).detection,
+            for_this_folder
+        );
+
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::UseGeneralSettings]);
+        assert_eq!(
+            app.settings.detection_for(&video).scope,
+            SettingsScope::General
+        );
+        assert!(app.settings.folders.is_empty());
     }
 
     /// Draws the details of an error for one frame and returns what the
@@ -2075,7 +2656,7 @@ mod tests {
     fn keys_do_not_reach_the_review_behind_the_recycling_question() {
         let mut window = Window::with_a_video_in_review();
         window.select_the_first_two_scenes();
-        window.app.recycling_question_for = Some(window.job);
+        window.app.recycling_question_for = Some(SplitAwaitingAnswer::OneVideo(window.job));
 
         window.press(egui::Key::M);
         assert_eq!(window.scene_count(), 5);
