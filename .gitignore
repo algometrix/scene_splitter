@@ -28,8 +28,12 @@
 *~
 *.rs.bk
 
-# Local tool settings
+# Local tool settings and notes for coding assistants
 .claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.worktrees/
 .env
 .env.*
 

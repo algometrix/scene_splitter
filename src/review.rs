@@ -59,6 +59,8 @@ const TIMELINE_MIN_LABELLED_WIDTH: f32 = 22.0;
 /// Room kept between a block's label and each of its ends.
 const TIMELINE_LABEL_PADDING: f32 = 6.0;
 const TIMELINE_LABEL_FONT_SIZE: f32 = 13.0;
+/// Between a scene's name and its length on the timeline.
+const TIMELINE_LABEL_GAP: f32 = 10.0;
 const TIMELINE_ROUNDING: f32 = 6.0;
 const PLAYHEAD_WIDTH: f32 = 2.0;
 
@@ -1051,23 +1053,95 @@ fn paint_timeline_block(
     if block.width() < TIMELINE_MIN_LABELLED_WIDTH {
         return;
     }
-    // The scene's number with its length when both fit, else the number
-    // alone, else nothing: a label that hangs over its block names the
-    // wrong scene.
-    let number = scene.number().to_string();
-    let number_and_length = format!("{number}   {}", format_length(layout.span.seconds()));
-    for label in [number_and_length, number] {
-        let text = painter.layout_no_wrap(
-            label,
-            egui::FontId::proportional(TIMELINE_LABEL_FONT_SIZE),
-            egui::Color32::WHITE,
-        );
-        if label_fits(text.size().x, block.width()) {
-            let top_left = block.center() - text.size() / 2.0;
-            painter.galley(top_left, text, egui::Color32::WHITE);
-            return;
-        }
+    let white = egui::Color32::WHITE;
+    let heavier = theme::semibold_font(TIMELINE_LABEL_FONT_SIZE);
+    let name = painter.layout_no_wrap(scene_name(scene), heavier.clone(), white);
+    let number = painter.layout_no_wrap(scene.number().to_string(), heavier, white);
+    // Lighter than the name, so the two read as a name and a figure and not
+    // as one run of numbers.
+    let lighter = egui::FontId::proportional(TIMELINE_LABEL_FONT_SIZE);
+    let seconds = layout.span.seconds();
+    let length = painter.layout_no_wrap(format_length(seconds), lighter.clone(), white);
+    let short_length = painter.layout_no_wrap(format_clock(seconds), lighter, white);
+    let widths = TimelineLabelWidths {
+        name: name.size().x,
+        length: length.size().x,
+        short_length: short_length.size().x,
+        number: number.size().x,
+    };
+    let paint_centred = |text: std::sync::Arc<egui::Galley>| {
+        painter.galley(block.center() - text.size() / 2.0, text, white);
+    };
+    let paint_name_with = |length: std::sync::Arc<egui::Galley>| {
+        let both = widths.name + TIMELINE_LABEL_GAP + length.size().x;
+        let left = block.center().x - both / 2.0;
+        let length_left = left + widths.name + TIMELINE_LABEL_GAP;
+        let middle = block.center().y;
+        let name_top = middle - name.size().y / 2.0;
+        painter.galley(egui::pos2(left, name_top), name.clone(), white);
+        let length_top = middle - length.size().y / 2.0;
+        painter.galley(egui::pos2(length_left, length_top), length, white);
+    };
+    match timeline_label(widths, block.width()) {
+        TimelineLabel::NameAndLength => paint_name_with(length),
+        TimelineLabel::NameAndShortLength => paint_name_with(short_length),
+        TimelineLabel::Name => paint_centred(name.clone()),
+        TimelineLabel::Number => paint_centred(number),
+        TimelineLabel::Nothing => {}
     }
+}
+
+fn scene_name(scene: SceneIndex) -> String {
+    format!("Scene {}", scene.number())
+}
+
+/// How much a timeline block says about its scene. A bare number is the
+/// last resort: beside a length it reads as part of the length.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TimelineLabel {
+    NameAndLength,
+    /// The length as a player shows it, "2:40", which takes half the room.
+    NameAndShortLength,
+    Name,
+    Number,
+    Nothing,
+}
+
+/// How wide each piece of a timeline label is once drawn.
+#[derive(Debug, Clone, Copy)]
+struct TimelineLabelWidths {
+    name: f32,
+    length: f32,
+    short_length: f32,
+    number: f32,
+}
+
+impl TimelineLabelWidths {
+    fn name_and_length(self) -> f32 {
+        self.name + TIMELINE_LABEL_GAP + self.length
+    }
+
+    fn name_and_short_length(self) -> f32 {
+        self.name + TIMELINE_LABEL_GAP + self.short_length
+    }
+}
+
+/// The most a block of `block_width` can say without its label hanging over
+/// the edge, where it would name the wrong scene.
+fn timeline_label(widths: TimelineLabelWidths, block_width: f32) -> TimelineLabel {
+    if label_fits(widths.name_and_length(), block_width) {
+        return TimelineLabel::NameAndLength;
+    }
+    if label_fits(widths.name_and_short_length(), block_width) {
+        return TimelineLabel::NameAndShortLength;
+    }
+    if label_fits(widths.name, block_width) {
+        return TimelineLabel::Name;
+    }
+    if label_fits(widths.number, block_width) {
+        return TimelineLabel::Number;
+    }
+    TimelineLabel::Nothing
 }
 
 /// What a preview says when the pointer rests on it: what a click does and,
@@ -1682,8 +1756,7 @@ fn show_scene_heading(
     color: egui::Color32,
 ) {
     ui.horizontal_wrapped(|ui| {
-        let badge =
-            theme::semibold(format!("Scene {}", scene.number()), 13.0).color(egui::Color32::WHITE);
+        let badge = theme::semibold(scene_name(scene), 13.0).color(egui::Color32::WHITE);
         theme::pill_at_least(ui, badge, color, SCENE_BADGE_MIN_WIDTH);
 
         let length = theme::semibold(format_length(layout.span.seconds()), SCENE_LENGTH_FONT_SIZE);
@@ -2363,6 +2436,35 @@ mod tests {
 
     #[test]
     fn a_label_is_only_written_in_a_block_it_fits_in() {
+        let widths = TimelineLabelWidths {
+            name: 50.0,
+            length: 70.0,
+            short_length: 30.0,
+            number: 8.0,
+        };
+        let room_for = |text_width: f32| text_width + 2.0 * TIMELINE_LABEL_PADDING;
+        let both = room_for(widths.name_and_length());
+        assert_eq!(timeline_label(widths, both), TimelineLabel::NameAndLength);
+        let short = room_for(widths.name_and_short_length());
+        assert_eq!(
+            timeline_label(widths, both - 1.0),
+            TimelineLabel::NameAndShortLength
+        );
+        assert_eq!(
+            timeline_label(widths, short),
+            TimelineLabel::NameAndShortLength
+        );
+        assert_eq!(timeline_label(widths, short - 1.0), TimelineLabel::Name);
+        assert_eq!(timeline_label(widths, room_for(50.0)), TimelineLabel::Name);
+        assert_eq!(
+            timeline_label(widths, room_for(49.0)),
+            TimelineLabel::Number
+        );
+        assert_eq!(timeline_label(widths, room_for(8.0)), TimelineLabel::Number);
+        assert_eq!(
+            timeline_label(widths, room_for(7.0)),
+            TimelineLabel::Nothing
+        );
         assert!(label_fits(20.0, 20.0 + 2.0 * TIMELINE_LABEL_PADDING));
         assert!(!label_fits(20.0, 19.0 + 2.0 * TIMELINE_LABEL_PADDING));
         assert!(!label_fits(80.0, 40.0));

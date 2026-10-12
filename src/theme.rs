@@ -244,7 +244,8 @@ fn load_first_font(
     Some(name.to_owned())
 }
 
-fn semibold_font(size: f32) -> FontId {
+/// The heavier font, for text painted directly and not laid out as a label.
+pub fn semibold_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(SEMIBOLD_FAMILY.into()))
 }
 
