@@ -95,6 +95,56 @@ impl TimeLimit {
     }
 }
 
+/// The option that makes ffmpeg pass every picture on with the time its file
+/// gives it, without dropping or repeating pictures to even the times out.
+///
+/// ffmpeg 5.1 renamed the option and ffmpeg 8 removed the old name, while
+/// ffmpeg 4, which many systems still have, only knows the old one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PictureTimesOption {
+    Vsync,
+    FpsMode,
+}
+
+/// The first ffmpeg that is asked by the new name. Versions from 5.1 to 7
+/// take both names.
+const FIRST_VERSION_ASKED_BY_THE_NEW_NAME: u32 = 6;
+const VERSION_BANNER_START: &str = "ffmpeg version ";
+
+impl PictureTimesOption {
+    /// Chosen from what `ffmpeg -version` prints first, such as
+    /// "ffmpeg version 4.4.1-full_build" or "ffmpeg version n8.0". A build
+    /// without a version number is a recent development build, so it gets
+    /// the new name.
+    pub fn for_version(banner: &str) -> Self {
+        let Some(major) = major_version(banner) else {
+            return Self::FpsMode;
+        };
+        if major < FIRST_VERSION_ASKED_BY_THE_NEW_NAME {
+            Self::Vsync
+        } else {
+            Self::FpsMode
+        }
+    }
+
+    pub fn arguments(self) -> [&'static str; 2] {
+        match self {
+            Self::Vsync => ["-vsync", "passthrough"],
+            Self::FpsMode => ["-fps_mode", "passthrough"],
+        }
+    }
+}
+
+fn major_version(banner: &str) -> Option<u32> {
+    let version = banner.strip_prefix(VERSION_BANNER_START)?;
+    // Some builds write the version as a git tag, "n7.1".
+    let version = version.strip_prefix('n').unwrap_or(version);
+    let digits_end = version
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(version.len());
+    version[..digits_end].parse().ok()
+}
+
 /// Why a line or a whole output could not be used, in a few plain words.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotUnderstood(pub String);
@@ -975,6 +1025,25 @@ mod tests {
         };
         assert!(stderr_tail.contains("no_such_video.mp4"), "{stderr_tail}");
         assert!(error.is_worth_one_more_try());
+    }
+
+    #[test]
+    fn old_ffmpeg_is_asked_by_the_old_name_and_new_ffmpeg_by_the_new_one() {
+        let option = PictureTimesOption::for_version;
+        let old = PictureTimesOption::Vsync;
+        let new = PictureTimesOption::FpsMode;
+        assert_eq!(option("ffmpeg version 4.4.1-full_build Copyright"), old);
+        assert_eq!(option("ffmpeg version 5.1.2 Copyright"), old);
+        assert_eq!(option("ffmpeg version n5.1.2"), old);
+        assert_eq!(option("ffmpeg version 6.0 Copyright"), new);
+        assert_eq!(option("ffmpeg version 8.0 Copyright"), new);
+        assert_eq!(option("ffmpeg version n7.1-10-g0123abc"), new);
+        // Development builds carry no number.
+        assert_eq!(option("ffmpeg version N-118193-g5f38c82536"), new);
+        assert_eq!(option("ffmpeg version git-2026-01-01"), new);
+        assert_eq!(option("something else"), new);
+        assert_eq!(old.arguments(), ["-vsync", "passthrough"]);
+        assert_eq!(new.arguments(), ["-fps_mode", "passthrough"]);
     }
 
     #[test]

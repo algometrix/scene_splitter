@@ -147,6 +147,21 @@ pub fn command(program: Program) -> ToolCommand {
     ToolCommand::at(program, located(program))
 }
 
+/// How the ffmpeg in use is asked to keep every picture's own time. Asked of
+/// the program once, since the answer cannot change while the app runs.
+pub fn picture_times_option() -> ffmpeg::PictureTimesOption {
+    static OPTION: OnceLock<ffmpeg::PictureTimesOption> = OnceLock::new();
+    *OPTION.get_or_init(|| {
+        let banner = command(Program::Ffmpeg)
+            .arg("-version")
+            .run_for_text(ffmpeg::QUICK_ANSWER_LIMIT)
+            // An ffmpeg that cannot even say its version fails the run that
+            // follows with its own, better error.
+            .unwrap_or_default();
+        ffmpeg::PictureTimesOption::for_version(&banner)
+    })
+}
+
 /// A bare command that runs ffmpeg, for the player. Its decoders run for as
 /// long as a video plays, so it starts and stops them itself.
 pub fn ffmpeg_command() -> Command {

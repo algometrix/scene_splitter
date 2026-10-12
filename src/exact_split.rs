@@ -30,7 +30,8 @@ use crate::exact_cut::{
 use crate::exact_verify::{self, ExactCutProof, VerifyError};
 use crate::fates::ScenesToWrite;
 use crate::ffmpeg::{
-    FfmpegError, NotUnderstood, Program, TimeLimit, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT,
+    FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit, QUICK_ANSWER_LIMIT,
+    STEADY_OUTPUT_LIMIT,
 };
 use crate::probe;
 use crate::scene_name::SceneNamePattern;
@@ -595,7 +596,15 @@ fn write_scene(
                 reorder_ticks,
             } => (
                 Step::EncodePart,
-                encode_arguments(input, part, seek, reorder_ticks, source, &part_file),
+                encode_arguments(
+                    input,
+                    part,
+                    seek,
+                    reorder_ticks,
+                    tools::picture_times_option(),
+                    source,
+                    &part_file,
+                ),
             ),
         };
         run_ffmpeg(step, arguments)?;
@@ -672,6 +681,7 @@ fn encode_arguments(
     part: &ScenePart,
     seek: Option<FfmpegTime>,
     reorder_ticks: i64,
+    picture_times: PictureTimesOption,
     source: &SourceVideo,
     part_file: &Path,
 ) -> Vec<OsString> {
@@ -702,7 +712,8 @@ fn encode_arguments(
     }
     arguments = arguments
         // Every picture keeps the exact time the original gives it.
-        .with(&["-vsync", "passthrough", "-enc_time_base", "-1"]);
+        .with(&picture_times.arguments())
+        .with(&["-enc_time_base", "-1"]);
     if reorder_ticks != 0 {
         arguments = arguments.option("-bsf:v", format!("setts=dts=PTS-{reorder_ticks}"));
     }
@@ -1045,6 +1056,7 @@ mod tests {
             part,
             seek,
             reorder_ticks,
+            PictureTimesOption::Vsync,
             &source(),
             Path::new("part_1.mp4"),
         ));
