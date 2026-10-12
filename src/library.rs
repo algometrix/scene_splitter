@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::scene_name;
+use crate::scene_name::SceneNames;
 
 /// Files in a folder with one of these extensions count as videos.
 pub const VIDEO_EXTENSIONS: [&str; 12] = [
@@ -14,10 +14,11 @@ pub const VIDEO_EXTENSIONS: [&str; 12] = [
 /// The videos a path stands for: the file itself, or the videos directly
 /// inside a folder, in name order.
 ///
-/// Subfolders are not searched. Scene files written by earlier splits are
-/// left out, so naming a folder again does not split its scenes a second
-/// time. A file named directly is always taken, whatever it is called.
-pub fn videos_at(path: &Path) -> Result<Vec<PathBuf>> {
+/// Subfolders are not searched. Files that `scene_names` take for scenes
+/// written by earlier splits are left out, so naming a folder again does
+/// not split its scenes a second time. A file named directly is always
+/// taken, whatever it is called.
+pub fn videos_at(path: &Path, scene_names: SceneNames) -> Result<Vec<PathBuf>> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
@@ -33,7 +34,7 @@ pub fn videos_at(path: &Path) -> Result<Vec<PathBuf>> {
             .path();
         if entry_path.is_file()
             && has_video_extension(&entry_path)
-            && !scene_name::is_default_scene_file(&entry_path)
+            && !scene_names.is_scene_file_of_some_video(&entry_path)
         {
             videos.push(entry_path);
         }
@@ -55,6 +56,7 @@ fn has_video_extension(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene_name::{PatternsUsed, SceneNamePattern};
 
     /// A folder of its own for one test, removed when the test ends.
     struct Folder(PathBuf);
@@ -99,9 +101,14 @@ mod tests {
         assert!(!has_video_extension(Path::new("no_extension")));
     }
 
+    /// The names of someone who never chose a name for scene files.
+    fn default_names() -> SceneNames {
+        SceneNames::from(SceneNamePattern::default())
+    }
+
     #[test]
     fn a_path_that_does_not_exist_is_an_error() {
-        assert!(videos_at(Path::new("no/such/place.mp4")).is_err());
+        assert!(videos_at(Path::new("no/such/place.mp4"), default_names()).is_err());
     }
 
     #[test]
@@ -112,18 +119,50 @@ mod tests {
                 "b.mkv",
                 "a.mp4",
                 "notes.txt",
+                // Scenes named by the default, and by the default before it.
+                "a_scene_1_of_2.mp4",
+                "a_scene_2_of_2.mp4",
                 "a_scene_001.mp4",
                 "a_scene_002.mp4",
+                // Videos of their own, which only look a little like scenes.
+                "a_scene_3_of_2.mp4",
+                "a_scene_2.mp4",
+                "c 1 of 2.mp4",
             ],
         );
-        let videos = videos_at(&folder.0).unwrap();
-        assert_eq!(file_names(&videos), vec!["a.mp4", "b.mkv"]);
+        let videos = videos_at(&folder.0, default_names()).unwrap();
+        assert_eq!(
+            file_names(&videos),
+            vec![
+                "a.mp4",
+                "a_scene_2.mp4",
+                "a_scene_3_of_2.mp4",
+                "b.mkv",
+                "c 1 of 2.mp4"
+            ]
+        );
+    }
+
+    #[test]
+    fn scenes_named_by_a_pattern_used_before_are_left_out_when_it_says_the_count() {
+        let folder = Folder::with_files(
+            "folder_with_chosen_names",
+            &["a.mp4", "a 1 of 2.mp4", "a 2 of 2.mp4", "a part 001.mp4"],
+        );
+        let mut used_before = PatternsUsed::default();
+        used_before.remember(SceneNamePattern::new("{name} {number} of {count}").unwrap());
+        used_before.remember(SceneNamePattern::new("{name} part {number}").unwrap());
+        let names = SceneNames::new(SceneNamePattern::default(), used_before);
+
+        let videos = videos_at(&folder.0, names).unwrap();
+        // "a part 001" could be anyone's video, so it is not left out.
+        assert_eq!(file_names(&videos), vec!["a part 001.mp4", "a.mp4"]);
     }
 
     #[test]
     fn a_file_named_directly_is_taken_as_it_is() {
-        let folder = Folder::with_files("direct", &["a_scene_001.mp4"]);
-        let scene = folder.0.join("a_scene_001.mp4");
-        assert_eq!(videos_at(&scene).unwrap(), vec![scene]);
+        let folder = Folder::with_files("direct", &["a_scene_1_of_2.mp4"]);
+        let scene = folder.0.join("a_scene_1_of_2.mp4");
+        assert_eq!(videos_at(&scene, default_names()).unwrap(), vec![scene]);
     }
 }

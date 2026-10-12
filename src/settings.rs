@@ -14,10 +14,23 @@ use crate::folder_settings::{
     self, DetectionInUse, DetectionSettings, FolderSettings, SettingsScope,
 };
 use crate::folders;
+use crate::scene_name::{PatternsUsed, SceneNamePattern, SceneNames};
 use crate::theme::ThemeChoice;
 
 const APP_FOLDER: &str = "scene_splitter";
 const SETTINGS_FILE: &str = "settings.json";
+/// The entry of the settings file that holds `Settings::scene_names_used`.
+/// A file without it was written before the default name said the count.
+const SCENE_NAMES_USED_ENTRY: &str = "scene_names_used";
+
+/// Which version of the app wrote a settings file, as far as it matters
+/// for the name of scene files.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WrittenBy {
+    /// The default name was "{name}_scene_{number}" then.
+    AVersionBeforeTheCount,
+    AVersionThatSaysTheCount,
+}
 
 /// A missing part of the file falls back to its default, so a file written
 /// by an older version keeps working.
@@ -45,6 +58,11 @@ pub struct Settings {
     /// Whether the window is light, dark, or as the system is. A file from
     /// before there was a choice follows the system.
     pub theme: ThemeChoice,
+    /// The names splits were written with, the newest first. Not a choice
+    /// the person makes: it is how the scene files of an earlier split are
+    /// still found after the name for scene files was changed. Empty in a
+    /// file from before names were remembered.
+    pub scene_names_used: PatternsUsed,
 }
 
 /// The first split that would move an original to the Recycle Bin or Trash
@@ -67,6 +85,7 @@ impl Default for Settings {
             show_tips: true,
             recycling_question: RecyclingQuestion::NotAskedYet,
             theme: ThemeChoice::FollowSystem,
+            scene_names_used: PatternsUsed::default(),
         }
     }
 }
@@ -139,16 +158,38 @@ impl Settings {
             && self.recycling_question == RecyclingQuestion::NotAskedYet
     }
 
-    /// Every setting as it was at first, except what happens to originals.
-    /// What was remembered for folders is forgotten with the rest.
+    /// The name scene files get now, with the names earlier splits gave
+    /// theirs.
+    pub fn scene_names(&self) -> SceneNames {
+        SceneNames::new(self.export.scene_name, self.scene_names_used)
+    }
+
+    /// Notes that a split is being written with the name in use, so its
+    /// scene files are still known as scenes after the name is changed.
     ///
-    /// That is the person's answer to a question, not a preference with a
-    /// default: someone who said "keep the original" and later resets the
-    /// detection settings must not find their originals in the Recycle Bin.
-    /// So their choice is kept, and with it the fact that they were asked.
+    /// Remembered when a split is written and not when the name is typed:
+    /// every stop on the way from one name to another is a usable name too,
+    /// and remembering those would push out the names files really have.
+    pub fn remember_scene_name_in_use(&mut self) {
+        self.scene_names_used.remember(self.export.scene_name);
+    }
+
+    /// Every setting as it was at first, except what happens to originals
+    /// and the names earlier splits were written with. What was remembered
+    /// for folders is forgotten with the rest.
+    ///
+    /// The names are kept because they are no preference: the files written
+    /// under them are still in the person's folders.
+    ///
+    /// What happens to originals is the person's answer to a question, not
+    /// a preference with a default: someone who said "keep the original" and
+    /// later resets the detection settings must not find their originals in
+    /// the Recycle Bin. So their choice is kept, and with it the fact that
+    /// they were asked.
     pub fn restored_to_defaults(&self) -> Self {
         let mut restored = Self {
             recycling_question: self.recycling_question,
+            scene_names_used: self.scene_names_used,
             ..Self::default()
         };
         restored.export.original_policy = self.export.original_policy;
@@ -252,9 +293,33 @@ impl Settings {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error).context("the file could not be read"),
         };
-        let settings: Self = serde_json::from_str(&json).context("the file is not valid")?;
+        let saved: serde_json::Value =
+            serde_json::from_str(&json).context("the file is not valid")?;
+        let written_by = if saved.get(SCENE_NAMES_USED_ENTRY).is_some() {
+            WrittenBy::AVersionThatSaysTheCount
+        } else {
+            WrittenBy::AVersionBeforeTheCount
+        };
+        let settings: Self = serde_json::from_value(saved).context("the file is not valid")?;
         settings.validate()?;
-        Ok(Some(settings))
+        Ok(Some(settings.with_the_default_name_of_today(written_by)))
+    }
+
+    /// The settings, with the default name of today where the file only
+    /// holds the default name of its day.
+    ///
+    /// Settings are saved whole, so a file from before the default name
+    /// said the count holds the old default name whether or not the person
+    /// ever looked at it. Left as it is, they would never get the new
+    /// names. A file this version wrote is taken at its word: someone who
+    /// types the old default name now keeps it.
+    fn with_the_default_name_of_today(mut self, written_by: WrittenBy) -> Self {
+        let holds_the_old_default =
+            self.export.scene_name == SceneNamePattern::default_before_the_count();
+        if written_by == WrittenBy::AVersionBeforeTheCount && holds_the_old_default {
+            self.export.scene_name = SceneNamePattern::default();
+        }
+        self
     }
 
     fn save_to(&self, path: &Path) -> Result<()> {
@@ -274,6 +339,27 @@ impl Settings {
     }
 }
 
+/// Notes in the saved settings that a split was written with `pattern`,
+/// for a run that does not keep the settings open, as the command line is.
+/// Only this one entry of the file changes, whatever the run was told to do
+/// differently from the file.
+///
+/// A settings file that cannot be read is left as it is, and that is the
+/// error: writing a new one over it would lose what it says about originals.
+pub fn remember_scene_name_used_for_a_split(pattern: SceneNamePattern) -> Result<()> {
+    let path = settings_path().context("this system has no folder for settings")?;
+    remember_scene_name_in(&path, pattern)
+}
+
+fn remember_scene_name_in(path: &Path, pattern: SceneNamePattern) -> Result<()> {
+    let mut saved = Settings::load_from(path)?.unwrap_or_default();
+    if saved.scene_names_used.newest() == Some(pattern) {
+        return Ok(());
+    }
+    saved.scene_names_used.remember(pattern);
+    saved.save_to(path)
+}
+
 /// Where the settings are kept, in the system's own folder for settings.
 /// `None` on a system that has no such folder.
 pub fn settings_path() -> Option<PathBuf> {
@@ -286,7 +372,6 @@ mod tests {
     use crate::detect::{ScanMode, ScanSettings};
     use crate::exact_cut::CutPrecision;
     use crate::hardcut::{HardCutSettings, Sensitivity};
-    use crate::scene_name::SceneNamePattern;
     use crate::split::SceneLocation;
 
     /// A settings file of its own for one test, removed when the test ends.
@@ -324,6 +409,135 @@ mod tests {
         settings.recycling_question = RecyclingQuestion::Answered;
         settings.theme = ThemeChoice::Dark;
         settings
+            .scene_names_used
+            .remember(SceneNamePattern::new("{number} {name}").unwrap());
+        settings.remember_scene_name_in_use();
+        settings
+    }
+
+    fn write_settings_file(file: &SettingsFile, json: &str) {
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(&file.0, json).unwrap();
+    }
+
+    #[test]
+    fn the_names_splits_were_written_with_are_remembered_newest_first() {
+        let used: Vec<String> = changed_settings()
+            .scene_names_used
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect();
+        assert_eq!(used, ["{name} part {number}", "{number} {name}"]);
+        assert_eq!(
+            changed_settings().scene_names(),
+            SceneNames::new(
+                SceneNamePattern::new("{name} part {number}").unwrap(),
+                changed_settings().scene_names_used
+            )
+        );
+    }
+
+    #[test]
+    fn restoring_the_defaults_keeps_the_names_earlier_splits_were_written_with() {
+        let restored = changed_settings().restored_to_defaults();
+        assert_eq!(
+            restored.scene_names_used,
+            changed_settings().scene_names_used
+        );
+    }
+
+    #[test]
+    fn a_file_from_before_names_were_remembered_loads_with_none() {
+        let file = SettingsFile::for_test("before_names_used");
+        write_settings_file(&file, SETTINGS_OF_AN_EARLIER_VERSION);
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.scene_names_used, PatternsUsed::default());
+    }
+
+    #[test]
+    fn the_old_default_name_in_a_file_from_before_becomes_the_default_of_today() {
+        let file = SettingsFile::for_test("old_default_name");
+        // Settings are saved whole, so the old default stands in every file
+        // an earlier version saved.
+        write_settings_file(
+            &file,
+            r#"{ "export": { "scene_name": "{name}_scene_{number}", "original_policy": "Keep" } }"#,
+        );
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.export.scene_name, SceneNamePattern::default());
+        assert_eq!(
+            loaded.export.scene_name.as_str(),
+            "{name}_scene_{number}_of_{count}"
+        );
+        assert_eq!(loaded.export.original_policy, OriginalPolicy::Keep);
+    }
+
+    #[test]
+    fn a_name_the_person_chose_before_is_kept() {
+        let file = SettingsFile::for_test("chosen_name_before");
+        write_settings_file(
+            &file,
+            r#"{ "export": { "scene_name": "{name} part {number}" } }"#,
+        );
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.export.scene_name.as_str(), "{name} part {number}");
+    }
+
+    #[test]
+    fn the_old_default_name_typed_into_this_version_is_kept() {
+        let file = SettingsFile::for_test("old_default_chosen_now");
+        let mut settings = Settings::default();
+        settings.export.scene_name = SceneNamePattern::default_before_the_count();
+        settings.save_to(&file.0).unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded, settings);
+        assert_eq!(loaded.export.scene_name.as_str(), "{name}_scene_{number}");
+    }
+
+    #[test]
+    fn a_remembered_name_that_would_leave_the_folder_is_an_error() {
+        let file = SettingsFile::for_test("remembered_name_with_folder");
+        write_settings_file(&file, r#"{ "scene_names_used": ["../{name}_{number}"] }"#);
+        assert!(Settings::load_from(&file.0).is_err());
+    }
+
+    #[test]
+    fn a_run_without_the_window_adds_its_name_to_the_saved_settings_and_nothing_else() {
+        let file = SettingsFile::for_test("remember_from_command_line");
+        changed_settings().save_to(&file.0).unwrap();
+        let for_this_run = SceneNamePattern::new("{name} take {number}").unwrap();
+
+        remember_scene_name_in(&file.0, for_this_run).unwrap();
+        let mut expected = changed_settings();
+        expected.scene_names_used.remember(for_this_run);
+        assert_eq!(
+            Settings::load_from(&file.0).unwrap(),
+            Some(expected.clone())
+        );
+        // The name in use is the saved one still, not that of the run.
+        assert_eq!(expected.export.scene_name.as_str(), "{name} part {number}");
+
+        // Said again, nothing changes.
+        remember_scene_name_in(&file.0, for_this_run).unwrap();
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn a_name_is_remembered_even_when_no_settings_were_ever_saved() {
+        let file = SettingsFile::for_test("remember_without_a_file");
+        remember_scene_name_in(&file.0, SceneNamePattern::default()).unwrap();
+        let mut expected = Settings::default();
+        expected.remember_scene_name_in_use();
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn a_damaged_settings_file_is_not_written_over_to_remember_a_name() {
+        let file = SettingsFile::for_test("remember_in_damaged_file");
+        write_settings_file(&file, "{ not json");
+        assert!(remember_scene_name_in(&file.0, SceneNamePattern::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "{ not json");
     }
 
     #[test]
@@ -414,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_from_before_scene_names_could_be_chosen_keeps_the_names_it_had() {
+    fn a_file_from_before_scene_names_could_be_chosen_gets_the_default_name() {
         let file = SettingsFile::for_test("before_scene_names");
         std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
         std::fs::write(
@@ -425,7 +639,10 @@ mod tests {
 
         let loaded = Settings::load_from(&file.0).unwrap().unwrap();
         assert_eq!(loaded.export.scene_name, SceneNamePattern::default());
-        assert_eq!(loaded.export.scene_name.as_str(), "{name}_scene_{number}");
+        assert_eq!(
+            loaded.export.scene_name.as_str(),
+            "{name}_scene_{number}_of_{count}"
+        );
     }
 
     #[test]
@@ -525,6 +742,7 @@ mod tests {
         let mut expected = Settings::default();
         expected.export.original_policy = OriginalPolicy::Keep;
         expected.recycling_question = RecyclingQuestion::Answered;
+        expected.scene_names_used = chosen.scene_names_used;
         assert_eq!(restored, expected);
     }
 
@@ -771,8 +989,8 @@ mod tests {
         assert_eq!(loaded.export.original_policy, OriginalPolicy::Keep);
         assert!(!loaded.show_tips);
         assert_eq!(loaded.recycling_question, RecyclingQuestion::Answered);
-        // What it could not say yet is as the app always did it: the names
-        // scenes always had, cuts on keyframes, and no folder of its own.
+        // What it could not say yet is as the app does it by default: the
+        // default names, cuts on keyframes, and no folder of its own.
         assert_eq!(loaded.export.scene_name, SceneNamePattern::default());
         assert_eq!(loaded.export.cut_precision, CutPrecision::NearestKeyframe);
         assert!(loaded.folders.is_empty());

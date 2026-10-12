@@ -23,8 +23,8 @@ use crate::cache::{self, CacheUse, SourcedDetection};
 use crate::detect::{ScanKind, ScanProgress, ScanStage};
 use crate::exact_cut::CutPrecision;
 use crate::export::{
-    self, ExistingListFile, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalPolicy,
-    SplitMethod, SplitOrder, TRASH_NAME,
+    self, ExistingListFile, ExportReport, OriginalAlwaysKept, OriginalPolicy, SplitMethod,
+    SplitOrder, TRASH_NAME,
 };
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
@@ -36,10 +36,10 @@ use crate::review_session::{
     SceneListNote,
 };
 use crate::scene_list::{FrameRate, SceneList, SceneListFormat};
-use crate::scene_name::SceneNamePattern;
+use crate::scene_name::{SceneNamePattern, SceneNames};
 use crate::settings::{LoadedSettings, RecyclingQuestion, Settings, SettingsChange};
 use crate::settings_controls::{self, SceneNameDraft};
-use crate::split;
+use crate::split::{self, SceneLocation};
 use crate::theme;
 use crate::tools::{self, Availability, DownloadProgress};
 
@@ -557,9 +557,13 @@ impl SceneSplitterApp {
     /// the scenes would be, and a warning about splits on exact pictures
     /// holds only while cuts are not exact. When one of those three changes,
     /// no such warning stays on any review.
-    fn use_settings(&mut self, settings: Settings) {
+    fn use_settings(&mut self, mut settings: Settings) {
         let before = self.settings.export;
         let now = settings.export;
+        // No screen changes the names splits were written with. Settings
+        // that were drawn before a split began hold the list as it was
+        // then, and must not take the name of that split out of it.
+        settings.scene_names_used = self.settings.scene_names_used;
         self.settings = settings;
         let obstacles_are_outdated = now.scene_location != before.scene_location
             || now.scene_name != before.scene_name
@@ -810,7 +814,11 @@ impl SceneSplitterApp {
             return Some(SplitOutcome::SplitsOnExactPictures);
         }
         let video = Arc::clone(review.video());
-        let found = look_for_earlier_scene_files(&video, self.settings.export);
+        let found = look_for_earlier_scene_files(
+            &video,
+            self.settings.export.scene_location,
+            self.settings.scene_names(),
+        );
         let may_split = review.may_split_over(&found);
         let earlier_files = match found {
             Ok(earlier_files) => earlier_files,
@@ -868,8 +876,9 @@ impl SceneSplitterApp {
             return;
         };
         let video = Arc::clone(session.video());
-        let export_options = self.settings.export;
-        let look_for_files = || look_for_earlier_scene_files(&video, export_options);
+        let scene_location = self.settings.export.scene_location;
+        let scene_names = self.settings.scene_names();
+        let look_for_files = || look_for_earlier_scene_files(&video, scene_location, scene_names);
         let Some(follow_up) = session.apply_frame(requests, &look_for_files) else {
             return;
         };
@@ -1009,7 +1018,8 @@ impl SceneSplitterApp {
     /// what happened in the sidebar. Fails with a sentence for the person
     /// when the path leads to nothing that can be added.
     fn add_path(&mut self, path: PathBuf) -> Result<(), String> {
-        let videos = library::videos_at(&path).map_err(|error| format!("{error:#}"))?;
+        let videos = library::videos_at(&path, self.settings.scene_names())
+            .map_err(|error| format!("{error:#}"))?;
         if videos.is_empty() {
             return Err(format!("No videos were found in {}.", path.display()));
         }
@@ -1141,19 +1151,24 @@ impl SceneSplitterApp {
 
     /// Writes and checks the scenes of one video in the background, and
     /// deals with its original as the settings say now.
-    fn export_in_background(&self, ctx: &egui::Context, order: ExportOrder, out_dir: PathBuf) {
+    fn export_in_background(&mut self, ctx: &egui::Context, order: ExportOrder, out_dir: PathBuf) {
         let export_options = self.settings.export;
         // Made here and not from the settings alone: an order that drops
         // scenes or cuts on exact pictures keeps the original whatever the
         // person chose for it.
         let split_order = SplitOrder::new(order.scenes, export_options.split_method());
-        let scene_name = export_options.scene_name;
+        // As they are before this split: what it finds of earlier splits is
+        // what the person was asked about.
+        let scene_names = self.settings.scene_names();
+        // Saved with every other change once the frame is over, so the
+        // scenes of this split are still known after the name is changed.
+        self.settings.remember_scene_name_in_use();
         self.run_in_background(ctx, order.job, move || {
             JobEvent::Exported(export::export_scenes(
                 &order.video,
                 &split_order,
                 &out_dir,
-                scene_name,
+                scene_names,
             ))
         });
     }
@@ -1347,21 +1362,19 @@ fn split_outcome_of(event: &JobEvent) -> Option<SplitOutcome> {
     }
 }
 
-/// Looks where the scenes of this video would go now, and names the scene
-/// files an earlier split of it left there under the name scenes get now.
+/// Looks where the scenes of this video would go now, and finds the scene
+/// files earlier splits of it left there: under the name scenes get now,
+/// and under the names they got before.
 fn look_for_earlier_scene_files(
     video: &Path,
-    export_options: ExportOptions,
+    scene_location: SceneLocation,
+    scene_names: SceneNames,
 ) -> Result<EarlierSceneFiles, String> {
-    let scene_dir = split::scene_dir(video, export_options.scene_location)
+    let scene_dir =
+        split::scene_dir(video, scene_location).map_err(|error| format!("{error:#}"))?;
+    let splits = split::earlier_splits_in(video, &scene_dir, scene_names)
         .map_err(|error| format!("{error:#}"))?;
-    let earlier_files =
-        split::scene_files_from_earlier_splits(video, &scene_dir, export_options.scene_name)
-            .map_err(|error| format!("{error:#}"))?;
-    Ok(EarlierSceneFiles {
-        scene_dir,
-        file_names: split::file_names_of(&earlier_files),
-    })
+    Ok(EarlierSceneFiles { scene_dir, splits })
 }
 
 /// How far along a video is, as the sidebar says it.
@@ -2322,7 +2335,7 @@ fn show_scan_progress(ctx: &egui::Context, text: &str, progress: ScanProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::split::SceneLocation;
+    use crate::scene_name::EarlierNaming;
 
     #[test]
     fn a_pasted_path_loses_its_surrounding_quotes() {
@@ -3100,11 +3113,22 @@ mod tests {
         assert_eq!(copied, details);
     }
 
-    fn scenes_go(scene_location: SceneLocation) -> ExportOptions {
-        ExportOptions {
-            scene_location,
-            ..ExportOptions::default()
-        }
+    /// The names of someone who never chose a name for scene files.
+    fn default_names() -> SceneNames {
+        Settings::default().scene_names()
+    }
+
+    /// The scene files of earlier splits of `video` in `scene_dir`, as the
+    /// default names find them among files with these names.
+    fn found_in(scene_dir: PathBuf, video: &str, file_names: &[&str]) -> EarlierSceneFiles {
+        let files: Vec<PathBuf> = file_names
+            .iter()
+            .map(|file_name| scene_dir.join(file_name))
+            .collect();
+        let splits =
+            crate::scene_name::earlier_splits_among(&scene_dir.join(video), default_names(), files)
+                .unwrap();
+        EarlierSceneFiles { scene_dir, splits }
     }
 
     #[test]
@@ -3119,26 +3143,72 @@ mod tests {
     }
 
     #[test]
-    fn earlier_scene_files_are_counted_under_the_name_scenes_get_now() {
+    fn changing_the_name_of_scene_files_does_not_hide_earlier_splits() {
         let folder = std::env::temp_dir().join(format!(
             "scene_splitter_test_{}_earlier_files_by_name",
             std::process::id()
         ));
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("film_scene_001.mp4"), b"").unwrap();
+        std::fs::write(folder.join("film_scene_1_of_3.mp4"), b"").unwrap();
         std::fs::write(folder.join("film part 001.mp4"), b"").unwrap();
         std::fs::write(folder.join("film part 002.mp4"), b"").unwrap();
         let video = folder.join("film.mp4");
-        let named_by_part = ExportOptions {
-            scene_name: SceneNamePattern::new("{name} part {number}").unwrap(),
-            ..ExportOptions::default()
-        };
+        let beside = SceneLocation::BesideVideo;
 
-        let by_default_name = look_for_earlier_scene_files(&video, ExportOptions::default());
-        let by_part = look_for_earlier_scene_files(&video, named_by_part);
+        // A split was written as "part", and then the default came back.
+        let mut settings = Settings::default();
+        settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
+        let named_by_part = settings.scene_names();
+        settings.remember_scene_name_in_use();
+        settings.export.scene_name = SceneNamePattern::default();
+        let by_default_after_part = settings.scene_names();
+
+        let never_named_by_part = look_for_earlier_scene_files(&video, beside, default_names());
+        let by_part = look_for_earlier_scene_files(&video, beside, named_by_part);
+        let after_part = look_for_earlier_scene_files(&video, beside, by_default_after_part);
         let _ = std::fs::remove_dir_all(&folder);
-        assert_eq!(by_default_name.map(|found| found.file_count()), Ok(1));
-        assert_eq!(by_part.map(|found| found.file_count()), Ok(2));
+
+        // Both defaults are known whatever name is in use.
+        assert_eq!(
+            never_named_by_part.map(|found| found.file_names()),
+            Ok(vec![
+                "film_scene_001.mp4".to_owned(),
+                "film_scene_1_of_3.mp4".to_owned()
+            ])
+        );
+        assert_eq!(by_part.map(|found| found.file_count()), Ok(4));
+        // And a name that a split was written with stays known.
+        let after_part = after_part.unwrap();
+        assert_eq!(after_part.file_count(), 4);
+        let namings: Vec<EarlierNaming> = after_part
+            .splits
+            .iter()
+            .map(|split| split.naming())
+            .collect();
+        assert_eq!(
+            namings,
+            [
+                EarlierNaming::AsScenesAreNamedNow,
+                EarlierNaming::AnotherWay,
+                EarlierNaming::AnotherWay
+            ]
+        );
+    }
+
+    #[test]
+    fn settings_drawn_before_a_split_began_do_not_forget_the_name_it_was_written_with() {
+        let (mut app, _) = app_with_a_video_in_review();
+        let drawn_before = app.settings.clone();
+        app.settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
+        app.settings.remember_scene_name_in_use();
+
+        app.use_settings(drawn_before);
+        assert_eq!(app.settings.export.scene_name, SceneNamePattern::default());
+        assert_eq!(
+            app.settings.scene_names_used.newest(),
+            Some(SceneNamePattern::new("{name} part {number}").unwrap())
+        );
     }
 
     #[test]
@@ -3169,7 +3239,10 @@ mod tests {
         let saved = saved.unwrap();
         assert_eq!(saved.lines().count(), 5, "{saved}");
         assert!(
-            saved.contains("2,00:00:40.000,00:01:00.000,00:00:20.000,no_such_video_scene_002.mp4")
+            saved.contains(
+                "2,00:00:40.000,00:01:00.000,00:00:20.000,no_such_video_scene_2_of_4.mp4"
+            ),
+            "{saved}"
         );
         assert!(matches!(
             note_after_refusal,
@@ -3187,13 +3260,14 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let video = folder.join("film.mp4");
 
-        let found = look_for_earlier_scene_files(&video, scenes_go(SceneLocation::BesideVideo));
+        let found =
+            look_for_earlier_scene_files(&video, SceneLocation::BesideVideo, default_names());
         let _ = std::fs::remove_dir_all(&folder);
         assert_eq!(
             found,
             Ok(EarlierSceneFiles {
                 scene_dir: folder,
-                file_names: Vec::new(),
+                splits: Vec::new(),
             })
         );
     }
@@ -3206,32 +3280,30 @@ mod tests {
         ));
         let new_folder = folder.join("film_scenes");
         std::fs::create_dir_all(&new_folder).unwrap();
-        std::fs::write(folder.join("film_scene_001.mp4"), b"").unwrap();
-        std::fs::write(new_folder.join("film_scene_001.mp4"), b"").unwrap();
-        std::fs::write(new_folder.join("film_scene_002.mp4"), b"").unwrap();
+        std::fs::write(folder.join("film_scene_1_of_3.mp4"), b"").unwrap();
+        std::fs::write(new_folder.join("film_scene_1_of_2.mp4"), b"").unwrap();
+        std::fs::write(new_folder.join("film_scene_2_of_2.mp4"), b"").unwrap();
         let video = folder.join("film.mp4");
 
-        let beside = look_for_earlier_scene_files(&video, scenes_go(SceneLocation::BesideVideo));
+        let beside =
+            look_for_earlier_scene_files(&video, SceneLocation::BesideVideo, default_names());
         let in_new_folder =
-            look_for_earlier_scene_files(&video, scenes_go(SceneLocation::NewFolder));
+            look_for_earlier_scene_files(&video, SceneLocation::NewFolder, default_names());
         let _ = std::fs::remove_dir_all(&folder);
         assert_eq!(
             beside,
-            Ok(EarlierSceneFiles {
-                scene_dir: folder,
-                file_names: vec!["film_scene_001.mp4".to_owned()],
-            })
+            Ok(found_in(folder, "film.mp4", &["film_scene_1_of_3.mp4"]))
         );
+        let in_new_folder = in_new_folder.unwrap();
         assert_eq!(
             in_new_folder,
-            Ok(EarlierSceneFiles {
-                scene_dir: new_folder,
-                file_names: vec![
-                    "film_scene_001.mp4".to_owned(),
-                    "film_scene_002.mp4".to_owned(),
-                ],
-            })
+            found_in(
+                new_folder,
+                "film.mp4",
+                &["film_scene_1_of_2.mp4", "film_scene_2_of_2.mp4"]
+            )
         );
+        assert_eq!(in_new_folder.file_count(), 2);
     }
 
     #[test]
@@ -3263,7 +3335,7 @@ mod tests {
         let three_in_the_way = || -> Result<EarlierSceneFiles, String> {
             Ok(EarlierSceneFiles {
                 scene_dir: PathBuf::from("videos"),
-                file_names: EarlierSceneFiles::numbered_names(3),
+                splits: EarlierSceneFiles::a_split_into(3),
             })
         };
         let review = app.queue.review_mut(job).unwrap();
@@ -3289,7 +3361,7 @@ mod tests {
         let three_in_the_way = || -> Result<EarlierSceneFiles, String> {
             Ok(EarlierSceneFiles {
                 scene_dir: PathBuf::from("videos"),
-                file_names: EarlierSceneFiles::numbered_names(3),
+                splits: EarlierSceneFiles::a_split_into(3),
             })
         };
         let review = app.queue.review_mut(job).unwrap();

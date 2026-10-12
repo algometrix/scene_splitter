@@ -34,7 +34,7 @@ use crate::ffmpeg::{
     STEADY_OUTPUT_LIMIT,
 };
 use crate::probe;
-use crate::scene_name::SceneNamePattern;
+use crate::scene_name::SceneNames;
 use crate::split::{self, UnfinishedScenes};
 use crate::tools;
 
@@ -266,7 +266,7 @@ pub struct ExactSplit {
 ///
 /// Every scene is written and checked, the dropped ones too, since the
 /// check counts the pictures and the sound of the whole video. Only the
-/// kept scenes then get a name, numbered without gaps as `pattern` says.
+/// kept scenes then get a name, numbered without gaps as `names` say.
 ///
 /// Like a split on keyframes, this replaces the scene files of an earlier
 /// split and writes into a folder of its own first. Unlike it, the scenes
@@ -277,7 +277,7 @@ pub fn split_on_exact_frames(
     input: &Path,
     scenes: &ScenesToWrite,
     out_dir: &Path,
-    pattern: SceneNamePattern,
+    names: impl Into<SceneNames>,
 ) -> Result<ExactSplit> {
     let cuts = scenes.cuts();
     // Everything that can be refused is refused before a file is written.
@@ -295,7 +295,7 @@ pub fn split_on_exact_frames(
         input,
         scenes,
         out_dir,
-        pattern,
+        names,
         |unfinished| {
             write_scenes(input, &source, &plan, unfinished)?;
             let proven =

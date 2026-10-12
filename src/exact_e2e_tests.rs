@@ -159,8 +159,8 @@ fn an_exact_split_leaves_out_a_dropped_scene_and_names_the_rest_by_the_pattern()
     assert_eq!(
         report.scene_files,
         vec![
-            video.folder().join("001 of 2 video.mp4"),
-            video.folder().join("002 of 2 video.mp4"),
+            video.folder().join("1 of 2 video.mp4"),
+            video.folder().join("2 of 2 video.mp4"),
         ]
     );
     assert_eq!(report.dropped_scenes, 1);

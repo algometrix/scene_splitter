@@ -23,6 +23,7 @@ use crate::plan::{
 };
 use crate::scan::UndecodedFrames;
 use crate::scene_list::SceneListFormat;
+use crate::scene_name::EarlierSplit;
 use crate::scenes::CutTimes;
 use crate::selection::{ClickKind, SceneSelection};
 use crate::settings::SettingsChange;
@@ -36,23 +37,39 @@ const CHAPTERS_NOT_READ: &str = "The chapter marks of this file could not be rea
 pub struct EarlierSceneFiles {
     /// The folder the scenes of this video would be written to now.
     pub scene_dir: PathBuf,
-    /// The names of the scene files of this video that are in it already,
-    /// in name order. The person is shown them before any is replaced.
-    pub file_names: Vec<String>,
+    /// The earlier splits of this video that left scene files in it, each
+    /// with its files. The person is shown them before any is replaced or
+    /// removed. A split named as scenes are named now comes first.
+    pub splits: Vec<EarlierSplit>,
 }
 
 impl EarlierSceneFiles {
+    /// How many scene files of earlier splits are in the folder.
     pub fn file_count(&self) -> usize {
-        self.file_names.len()
+        self.file_names().len()
     }
 
-    /// `count` file names as the default pattern gives them, for a test
-    /// that only cares how many files are in the way.
+    /// The names of those files, in name order, each once.
+    pub fn file_names(&self) -> Vec<String> {
+        let mut file_names: Vec<String> = self
+            .splits
+            .iter()
+            .flat_map(EarlierSplit::file_names)
+            .collect();
+        file_names.sort();
+        file_names.dedup();
+        file_names
+    }
+
+    /// An earlier split of "no_such_video.mp4" into `count` scenes, named as
+    /// the default pattern names them, for a test that only cares how many
+    /// files are in the way. No split at all for a count of 0.
     #[cfg(test)]
-    pub fn numbered_names(count: usize) -> Vec<String> {
-        (1..=count)
-            .map(|number| format!("no_such_video_scene_{number:03}.mp4"))
-            .collect()
+    pub fn a_split_into(count: usize) -> Vec<EarlierSplit> {
+        const VIDEO: &str = "no_such_video.mp4";
+        let file_names = crate::scene_name::default_names_for_test(VIDEO, count);
+        let file_names: Vec<&str> = file_names.iter().map(String::as_str).collect();
+        crate::scene_name::earlier_splits_for_test(VIDEO, &file_names)
     }
 }
 
@@ -304,10 +321,12 @@ pub struct ReviewSession {
     /// What the person asked for when `export_obstacle` came up, which is
     /// what goes on once they agree to replace the files.
     split_asked_for: SplitTiming,
-    /// The folder whose earlier scene files the person agreed to replace.
-    /// A video that waits to be split with the others needs this later, when
-    /// its turn comes and nobody is there to ask.
-    replacing_agreed_in: Option<PathBuf>,
+    /// The earlier scene files the person agreed to replace: the ones they
+    /// were shown, in the folder they were shown. Leave to replace those is
+    /// no leave to replace others that turn up later. A video that waits to
+    /// be split with the others needs this later, when its turn comes and
+    /// nobody is there to ask.
+    replacing_agreed_for: Option<EarlierSceneFiles>,
     /// A scan the person asked for that would throw away their edits, until
     /// they confirm or cancel it.
     rescan_awaiting_consent: Option<ScanKind>,
@@ -382,7 +401,7 @@ impl ReviewSession {
             scene_list_note: None,
             export_obstacle: None,
             split_asked_for: SplitTiming::Now,
-            replacing_agreed_in: None,
+            replacing_agreed_for: None,
             rescan_awaiting_consent: None,
             new_split_precision: CutPrecision::NearestKeyframe,
             chapter_splits,
@@ -405,13 +424,13 @@ impl ReviewSession {
     }
 
     /// Whether a split may go ahead given what was `found` where the scenes
-    /// go: nothing in the way, or only files the person already agreed to
-    /// replace in that same folder.
+    /// go: nothing in the way, or exactly the files the person already
+    /// agreed to replace, in that same folder.
     pub fn may_split_over(&self, found: &Result<EarlierSceneFiles, String>) -> bool {
         match found {
             Ok(earlier_files) => {
                 earlier_files.file_count() == 0
-                    || self.replacing_agreed_in.as_deref() == Some(&earlier_files.scene_dir)
+                    || self.replacing_agreed_for.as_ref() == Some(earlier_files)
             }
             Err(_could_not_look) => false,
         }
@@ -437,7 +456,7 @@ impl ReviewSession {
     pub fn hold_back_from_the_ready_run(&mut self, obstacle: ExportObstacle) {
         self.export_obstacle = Some(obstacle);
         self.split_asked_for = SplitTiming::WithTheReadyVideos;
-        self.replacing_agreed_in = None;
+        self.replacing_agreed_for = None;
     }
 
     /// Says where the splits the person adds from now on land: on the
@@ -536,7 +555,7 @@ impl ReviewSession {
     /// again after its split failed or after it waited to be split.
     pub fn forget_export_obstacle(&mut self) {
         self.export_obstacle = None;
-        self.replacing_agreed_in = None;
+        self.replacing_agreed_for = None;
     }
 
     /// Whether the person still has to say if a scan may throw away their
@@ -730,7 +749,7 @@ impl ReviewSession {
     ) -> Option<FollowUp> {
         self.split_asked_for = timing;
         // Leave given earlier was for what was on disk then.
-        self.replacing_agreed_in = None;
+        self.replacing_agreed_for = None;
         self.export_obstacle = self.obstacle_to_a_split(found);
         match self.export_obstacle {
             None => Some(timing.follow_up()),
@@ -765,24 +784,33 @@ impl ReviewSession {
         }
     }
 
-    /// The person agreed to replace the scene files in `confirmed_dir`. That
-    /// says nothing about any other folder. If the scenes would go somewhere
-    /// else by now, because the setting for it was changed in between, what
-    /// is there is looked at and asked about like on a first try.
+    /// The person agreed to replace the scene files in `confirmed_dir` that
+    /// the warning named. That says nothing about any other folder, nor
+    /// about other files. If the scenes would go somewhere else by now,
+    /// because the setting for it was changed in between, or other files are
+    /// found there than the warning named, what is there is asked about like
+    /// on a first try.
     fn replace_earlier_files(
         &mut self,
         confirmed_dir: &Path,
         found: Result<EarlierSceneFiles, String>,
     ) -> Option<FollowUp> {
+        let shown = match &self.export_obstacle {
+            Some(ExportObstacle::EarlierSceneFiles(shown)) => Some(shown),
+            _ => None,
+        };
         match found {
-            Ok(earlier_files) if earlier_files.scene_dir == confirmed_dir => {
+            Ok(earlier_files)
+                if earlier_files.scene_dir == confirmed_dir && shown == Some(&earlier_files) =>
+            {
                 self.export_obstacle = None;
-                self.replacing_agreed_in = Some(earlier_files.scene_dir);
+                self.replacing_agreed_for = Some(earlier_files);
                 Some(self.split_asked_for.follow_up())
             }
-            found_elsewhere_or_not_at_all => {
-                self.ask_to_split(found_elsewhere_or_not_at_all, self.split_asked_for)
-            }
+            found_elsewhere_or_other_files_or_not_at_all => self.ask_to_split(
+                found_elsewhere_or_other_files_or_not_at_all,
+                self.split_asked_for,
+            ),
         }
     }
 
@@ -1086,7 +1114,7 @@ pub mod test_sessions {
     pub fn nothing_in_the_way() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: scene_dir(),
-            file_names: EarlierSceneFiles::numbered_names(0),
+            splits: EarlierSceneFiles::a_split_into(0),
         })
     }
 }
@@ -1122,7 +1150,7 @@ mod tests {
     fn three_earlier_files() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: test_sessions::scene_dir(),
-            file_names: EarlierSceneFiles::numbered_names(3),
+            splits: EarlierSceneFiles::a_split_into(3),
         })
     }
 
@@ -1134,14 +1162,14 @@ mod tests {
     fn two_earlier_files_in_the_new_folder() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: new_folder(),
-            file_names: EarlierSceneFiles::numbered_names(2),
+            splits: EarlierSceneFiles::a_split_into(2),
         })
     }
 
     fn an_empty_new_folder() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: new_folder(),
-            file_names: EarlierSceneFiles::numbered_names(0),
+            splits: EarlierSceneFiles::a_split_into(0),
         })
     }
 
@@ -2260,7 +2288,7 @@ mod tests {
             session.export_obstacle(),
             Some(&ExportObstacle::EarlierSceneFiles(EarlierSceneFiles {
                 scene_dir: test_sessions::scene_dir(),
-                file_names: EarlierSceneFiles::numbered_names(3),
+                splits: EarlierSceneFiles::a_split_into(3),
             }))
         );
 
@@ -2290,7 +2318,7 @@ mod tests {
             session.export_obstacle(),
             Some(&ExportObstacle::EarlierSceneFiles(EarlierSceneFiles {
                 scene_dir: new_folder(),
-                file_names: EarlierSceneFiles::numbered_names(2),
+                splits: EarlierSceneFiles::a_split_into(2),
             }))
         );
 

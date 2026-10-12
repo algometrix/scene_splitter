@@ -397,7 +397,10 @@ mod csv_field_tests {
     fn an_ordinary_field_is_left_as_it_is() {
         assert_eq!(csv_field("Opening"), "Opening");
         assert_eq!(csv_field("1 + 1 = 2"), "1 + 1 = 2");
-        assert_eq!(csv_field("holiday_scene_001.mp4"), "holiday_scene_001.mp4");
+        assert_eq!(
+            csv_field("holiday_scene_1_of_5.mp4"),
+            "holiday_scene_1_of_5.mp4"
+        );
         assert_eq!(csv_field("a, b"), "\"a, b\"");
     }
 }
@@ -415,9 +418,7 @@ mod tests {
     }
 
     fn list_of(video_name: &str, frames_per_second: f64, scenes: &[TimeSpan]) -> SceneList {
-        let file_names = (1..=scenes.len())
-            .map(|number| format!("film_scene_{number:03}.mp4"))
-            .collect();
+        let file_names = crate::scene_name::default_names_for_test("film.mp4", scenes.len());
         SceneList::of(
             video_name.to_owned(),
             rate(frames_per_second),
@@ -435,8 +436,8 @@ mod tests {
         assert_eq!(
             two_scenes().in_format(SceneListFormat::Csv).unwrap(),
             "scene,start,end,length,file,title\r\n\
-             1,00:00:00.000,00:01:02.480,00:01:02.480,film_scene_001.mp4,\r\n\
-             2,00:01:02.480,01:02:05.040,01:01:02.560,film_scene_002.mp4,\r\n"
+             1,00:00:00.000,00:01:02.480,00:01:02.480,film_scene_1_of_2.mp4,\r\n\
+             2,00:01:02.480,01:02:05.040,01:01:02.560,film_scene_2_of_2.mp4,\r\n"
         );
     }
 
@@ -451,9 +452,9 @@ mod tests {
             .in_format(SceneListFormat::Csv)
             .unwrap();
         let rows: Vec<&str> = table.split(CSV_LINE_END).collect();
-        assert!(rows[1].ends_with("film_scene_001.mp4,"), "{table}");
+        assert!(rows[1].ends_with("film_scene_1_of_2.mp4,"), "{table}");
         assert!(
-            rows[2].ends_with("film_scene_002.mp4,\"The heist, part 1\""),
+            rows[2].ends_with("film_scene_2_of_2.mp4,\"The heist, part 1\""),
             "{table}"
         );
     }
@@ -493,11 +494,11 @@ mod tests {
             "a, b.mp4".to_owned(),
             rate(25.0),
             &[span(0.0, 1.0)],
-            vec!["a, b_scene_001.mp4".to_owned()],
+            vec!["a, b_scene_1_of_1.mp4".to_owned()],
         );
         let table = list.in_format(SceneListFormat::Csv).unwrap();
         assert!(
-            table.ends_with(",00:00:01.000,\"a, b_scene_001.mp4\",\r\n"),
+            table.ends_with(",00:00:01.000,\"a, b_scene_1_of_1.mp4\",\r\n"),
             "{table}"
         );
     }
@@ -574,11 +575,11 @@ mod tests {
              \n\
              001  AX       V     C        00:00:00:00 00:01:02:12 00:00:00:00 00:01:02:12\n\
              * FROM CLIP NAME: film.mp4\n\
-             * TO FILE: film_scene_001.mp4\n\
+             * TO FILE: film_scene_1_of_2.mp4\n\
              \n\
              002  AX       V     C        00:01:02:12 01:02:05:01 00:01:02:12 01:02:05:01\n\
              * FROM CLIP NAME: film.mp4\n\
-             * TO FILE: film_scene_002.mp4\n"
+             * TO FILE: film_scene_2_of_2.mp4\n"
         );
     }
 
@@ -620,13 +621,13 @@ mod tests {
                 ListedScene {
                     number: 1,
                     span: span(0.0, 10.0),
-                    file_name: "film_scene_001.mp4".to_owned(),
+                    file_name: "film_scene_1_of_2.mp4".to_owned(),
                     chapter_title: None,
                 },
                 ListedScene {
                     number: 2,
                     span: span(20.0, 30.0),
-                    file_name: "film_scene_002.mp4".to_owned(),
+                    file_name: "film_scene_2_of_2.mp4".to_owned(),
                     chapter_title: None,
                 },
             ]

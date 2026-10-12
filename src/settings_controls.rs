@@ -355,8 +355,11 @@ mod tests {
     #[test]
     fn the_name_box_starts_with_the_pattern_in_use_and_an_example_of_it() {
         let draft = SceneNameDraft::of(SceneNamePattern::default());
-        assert_eq!(draft.typed, "{name}_scene_{number}");
-        assert_eq!(draft.outcome(), Ok("My video_scene_002.mp4".to_owned()));
+        assert_eq!(draft.typed, "{name}_scene_{number}_of_{count}");
+        assert_eq!(
+            draft.outcome(),
+            Ok("My video_scene_02_of_12.mp4".to_owned())
+        );
     }
 
     #[test]
