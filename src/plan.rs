@@ -191,6 +191,17 @@ pub enum NudgeDirection {
 }
 
 /// A split that was moved to the next point where the video can be cut.
+/// How far one nudge moves a split.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NudgeStep {
+    /// To the keyframe beside it, the nearest place where a split that
+    /// copies can cut.
+    ToNextCutPoint,
+    /// By the time one picture is shown, for a split that cuts on the exact
+    /// picture.
+    OnePicture { seconds: f64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MovedCut {
     pub from: f64,
@@ -631,8 +642,8 @@ impl SplitPlan {
         Ok(time)
     }
 
-    /// Moves the split at which `scene` starts to the next keyframe in the
-    /// given direction, and returns where it was and where it is now.
+    /// Moves the split at which `scene` starts one `step` in the given
+    /// direction, and returns where it was and where it is now.
     ///
     /// The split stays between the cuts on either side of it, merged ones
     /// included. Past a merged cut it would take a part of one merged scene
@@ -641,13 +652,14 @@ impl SplitPlan {
         &mut self,
         scene: SceneIndex,
         direction: NudgeDirection,
+        step: NudgeStep,
     ) -> Result<MovedCut, NudgeCutError> {
         let position = self
             .accepted_cut_position_before(scene)
             .ok_or(NudgeCutError::NoSplitBeforeScene)?;
         let from = self.cuts[position].time;
         let to = self
-            .cut_point_beside(from, direction)
+            .one_step_from(from, direction, step)
             .ok_or(NudgeCutError::NoCutPoint(direction))?;
         self.refuse_a_move_onto_or_past_the_neighbour(position, to, direction)?;
 
@@ -662,6 +674,37 @@ impl SplitPlan {
     fn accepted_cut_position_before(&self, scene: SceneIndex) -> Option<usize> {
         let boundary = scene.0.checked_sub(1)?;
         self.accepted_cut_positions().get(boundary).copied()
+    }
+
+    /// Where a split at `time` is after one step, or `None` when that would
+    /// take it out of the video.
+    fn one_step_from(&self, time: f64, direction: NudgeDirection, step: NudgeStep) -> Option<f64> {
+        let seconds = match step {
+            NudgeStep::ToNextCutPoint => return self.cut_point_beside(time, direction),
+            NudgeStep::OnePicture { seconds } => seconds,
+        };
+        // A video whose picture length is not known has no picture to step
+        // by, and a step of nothing would look like a move.
+        if !(seconds.is_finite() && seconds > 0.0) {
+            return None;
+        }
+        let stepped = match direction {
+            NudgeDirection::Earlier => time - seconds,
+            NudgeDirection::Later => time + seconds,
+        };
+        Some(stepped).filter(|&stepped| self.whole_video.has_strictly_inside(stepped))
+    }
+
+    /// Where the review began with the cut that is at `cut_time` now. That
+    /// is `cut_time` itself unless the person moved a suggested cut there.
+    /// What the file says about the footage from a cut on, such as a
+    /// chapter title, is found by this time.
+    pub fn time_the_review_began_with(&self, cut_time: f64) -> f64 {
+        self.cuts
+            .iter()
+            .find(|cut| cut.time == cut_time)
+            .and_then(|cut| cut.source.before_it_was_moved())
+            .map_or(cut_time, |(_source, time)| time)
     }
 
     /// The keyframe next to `time` on the given side that a cut can be on.
@@ -1212,6 +1255,116 @@ mod tests {
 
     const EARLIER: NudgeDirection = NudgeDirection::Earlier;
     const LATER: NudgeDirection = NudgeDirection::Later;
+    const TO_CUT_POINT: NudgeStep = NudgeStep::ToNextCutPoint;
+    /// One picture of a video with 25 pictures a second.
+    const ONE_PICTURE: NudgeStep = NudgeStep::OnePicture { seconds: 0.04 };
+
+    #[test]
+    fn with_exact_cuts_a_split_moves_by_one_picture() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        let moved = plan
+            .nudge_cut_before(second_scene(), LATER, ONE_PICTURE)
+            .unwrap();
+        assert_eq!(
+            moved,
+            MovedCut {
+                from: 4.0,
+                to: 4.04
+            }
+        );
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.04]);
+
+        let back = plan
+            .nudge_cut_before(second_scene(), EARLIER, ONE_PICTURE)
+            .unwrap();
+        assert_eq!(back.from, 4.04);
+        assert!((back.to - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_step_of_one_picture_stops_at_the_neighbour_and_inside_the_video() {
+        let mut plan = plan_with_keyframes(&[], vec![0.0]);
+        plan.add_cut_exactly_at(0.03).unwrap();
+        plan.add_cut_exactly_at(0.06).unwrap();
+        plan.add_cut_exactly_at(9.98).unwrap();
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(1), EARLIER, ONE_PICTURE),
+            Err(NudgeCutError::NoCutPoint(EARLIER))
+        );
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(1), LATER, ONE_PICTURE),
+            Err(NudgeCutError::SplitInTheWay { at: 0.06 })
+        );
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(3), LATER, ONE_PICTURE),
+            Err(NudgeCutError::NoCutPoint(LATER))
+        );
+    }
+
+    #[test]
+    fn a_picture_of_no_length_is_no_step() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        for seconds in [0.0, -0.04, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                plan.nudge_cut_before(second_scene(), LATER, NudgeStep::OnePicture { seconds }),
+                Err(NudgeCutError::NoCutPoint(LATER))
+            );
+        }
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0]);
+    }
+
+    #[test]
+    fn a_moved_chapter_cut_still_comes_from_its_chapter_and_a_reset_puts_it_back() {
+        let mut plan = plan_with_cuts(&[]);
+        plan.propose_chapter_cuts(&[4.0]);
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
+        assert_eq!(plan.accepted_cuts().as_slice(), [6.0]);
+        assert_eq!(plan.chapter_split_count(), 1);
+        assert_eq!(plan.time_the_review_began_with(6.0), 4.0);
+        assert!(!plan.is_as_detected());
+
+        plan.merge_chapter_cuts();
+        assert!(plan.accepted_cuts().is_empty());
+
+        plan.reset_to_detected();
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0]);
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn a_chapter_cut_moved_back_to_its_mark_counts_as_untouched() {
+        let mut plan = plan_with_cuts(&[]);
+        plan.propose_chapter_cuts(&[4.0]);
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
+        plan.nudge_cut_before(second_scene(), EARLIER, TO_CUT_POINT)
+            .unwrap();
+        assert!(plan.is_as_detected());
+        assert_eq!(plan.time_the_review_began_with(4.0), 4.0);
+    }
+
+    #[test]
+    fn a_cut_nobody_moved_began_where_it_is() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.add_cut_near(8.0).unwrap();
+        for time in [4.0, 8.0, 5.0] {
+            assert_eq!(plan.time_the_review_began_with(time), time);
+        }
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
+        assert_eq!(plan.time_the_review_began_with(6.0), 4.0);
+    }
+
+    #[test]
+    fn a_chapter_cut_added_to_a_plan_keeps_one_fate_per_segment() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_chapter_cuts(&[2.0, 8.0]);
+        assert_eq!(plan.scene_fates().len(), plan.scenes().len());
+        plan.set_scene_fate(SceneIndex::new(3), SceneFate::Drop)
+            .unwrap();
+        assert_eq!(plan.scenes_to_write().dropped_count(), 1);
+    }
 
     fn second_scene() -> SceneIndex {
         SceneIndex::new(1)
@@ -1222,17 +1375,17 @@ mod tests {
         let mut plan = plan_with_cuts(&[4.0]);
 
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), LATER),
+            plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT),
             Ok(MovedCut { from: 4.0, to: 6.0 })
         );
         assert_eq!(plan.accepted_cuts().as_slice(), [6.0]);
 
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), EARLIER),
+            plan.nudge_cut_before(second_scene(), EARLIER, TO_CUT_POINT),
             Ok(MovedCut { from: 6.0, to: 4.0 })
         );
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), EARLIER),
+            plan.nudge_cut_before(second_scene(), EARLIER, TO_CUT_POINT),
             Ok(MovedCut { from: 4.0, to: 2.0 })
         );
         assert_eq!(plan.scenes(), vec![span(0.0, 2.0), span(2.0, 10.0)]);
@@ -1242,13 +1395,13 @@ mod tests {
     fn a_split_between_two_keyframes_moves_to_the_one_on_the_side_asked_for() {
         let mut plan = plan_with_cuts(&[5.0]);
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), EARLIER),
+            plan.nudge_cut_before(second_scene(), EARLIER, TO_CUT_POINT),
             Ok(MovedCut { from: 5.0, to: 4.0 })
         );
 
         let mut plan = plan_with_cuts(&[5.0]);
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), LATER),
+            plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT),
             Ok(MovedCut { from: 5.0, to: 6.0 })
         );
     }
@@ -1259,11 +1412,11 @@ mod tests {
         let untouched = plan.snapshot();
 
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), LATER),
+            plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT),
             Err(NudgeCutError::SplitInTheWay { at: 6.0 })
         );
         assert_eq!(
-            plan.nudge_cut_before(SceneIndex::new(2), EARLIER),
+            plan.nudge_cut_before(SceneIndex::new(2), EARLIER, TO_CUT_POINT),
             Err(NudgeCutError::SplitInTheWay { at: 4.0 })
         );
         assert!(plan.is_at(&untouched));
@@ -1273,7 +1426,7 @@ mod tests {
     fn a_split_does_not_move_past_a_split_that_sits_between_two_keyframes() {
         let mut plan = plan_with_cuts(&[4.0, 5.0]);
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), LATER),
+            plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT),
             Err(NudgeCutError::SplitInTheWay { at: 5.0 })
         );
     }
@@ -1285,7 +1438,7 @@ mod tests {
         plan.merge_scenes(scenes(2, 3));
 
         assert_eq!(
-            plan.nudge_cut_before(SceneIndex::new(2), LATER),
+            plan.nudge_cut_before(SceneIndex::new(2), LATER, TO_CUT_POINT),
             Err(NudgeCutError::MergedPartsInTheWay { at: 6.0 })
         );
         assert_eq!(plan.accepted_cuts().as_slice(), [2.0, 4.0]);
@@ -1296,13 +1449,13 @@ mod tests {
         let mut plan = plan_with_cuts(&[2.0]);
         // The keyframe before 2 is the first frame of the video.
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), EARLIER),
+            plan.nudge_cut_before(second_scene(), EARLIER, TO_CUT_POINT),
             Err(NudgeCutError::NoCutPoint(EARLIER))
         );
 
         let mut plan = plan_with_cuts(&[8.0]);
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), LATER),
+            plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT),
             Err(NudgeCutError::NoCutPoint(LATER))
         );
         assert_eq!(plan.accepted_cuts().as_slice(), [8.0]);
@@ -1312,11 +1465,11 @@ mod tests {
     fn the_first_scene_and_a_scene_that_does_not_exist_have_no_split_to_move() {
         let mut plan = plan_with_cuts(&[4.0]);
         assert_eq!(
-            plan.nudge_cut_before(SceneIndex::new(0), LATER),
+            plan.nudge_cut_before(SceneIndex::new(0), LATER, TO_CUT_POINT),
             Err(NudgeCutError::NoSplitBeforeScene)
         );
         assert_eq!(
-            plan.nudge_cut_before(SceneIndex::new(2), LATER),
+            plan.nudge_cut_before(SceneIndex::new(2), LATER, TO_CUT_POINT),
             Err(NudgeCutError::NoSplitBeforeScene)
         );
     }
@@ -1328,7 +1481,7 @@ mod tests {
         plan.merge_scenes(scenes(0, 1));
 
         assert_eq!(
-            plan.nudge_cut_before(SceneIndex::new(2), EARLIER),
+            plan.nudge_cut_before(SceneIndex::new(2), EARLIER, TO_CUT_POINT),
             Ok(MovedCut { from: 8.0, to: 6.0 })
         );
         assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 6.0]);
@@ -1337,7 +1490,8 @@ mod tests {
     #[test]
     fn a_reset_puts_a_moved_split_back_where_the_scan_saw_it() {
         let mut plan = plan_with_cuts(&[4.0]);
-        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
         assert!(!plan.is_as_detected());
 
         plan.reset_to_detected();
@@ -1348,8 +1502,10 @@ mod tests {
     #[test]
     fn a_reset_puts_a_split_moved_twice_back_where_the_scan_saw_it() {
         let mut plan = plan_with_cuts(&[2.0]);
-        plan.nudge_cut_before(second_scene(), LATER).unwrap();
-        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
         // A split added where the moved one was is the person's own.
         plan.add_cut_near(2.25).unwrap();
 
@@ -1361,8 +1517,10 @@ mod tests {
     #[test]
     fn a_split_moved_back_to_where_the_scan_saw_it_is_as_detected_again() {
         let mut plan = plan_with_cuts(&[4.0]);
-        plan.nudge_cut_before(second_scene(), LATER).unwrap();
-        plan.nudge_cut_before(second_scene(), EARLIER).unwrap();
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
+        plan.nudge_cut_before(second_scene(), EARLIER, TO_CUT_POINT)
+            .unwrap();
         assert!(plan.is_as_detected());
     }
 
@@ -1372,7 +1530,7 @@ mod tests {
         plan.add_cut_near(4.0).unwrap();
 
         assert_eq!(
-            plan.nudge_cut_before(second_scene(), LATER),
+            plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT),
             Ok(MovedCut { from: 4.0, to: 6.0 })
         );
         plan.reset_to_detected();
@@ -1384,7 +1542,8 @@ mod tests {
         let mut plan = plan_with_cuts(&[4.0]);
         let before_the_move = plan.snapshot();
 
-        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
+            .unwrap();
         assert!(!plan.is_at(&before_the_move));
         plan.restore(before_the_move);
         assert!(plan.is_as_detected());
@@ -1425,7 +1584,7 @@ mod tests {
         plan.add_cut_near(5.75).unwrap();
         check(&plan);
         // The added cut at 6 moves to 4.
-        plan.nudge_cut_before(SceneIndex::new(2), NudgeDirection::Earlier)
+        plan.nudge_cut_before(SceneIndex::new(2), NudgeDirection::Earlier, TO_CUT_POINT)
             .unwrap();
         check(&plan);
         plan.set_scene_fate(SceneIndex::new(1), SceneFate::Drop)

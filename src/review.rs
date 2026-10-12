@@ -23,7 +23,9 @@ use crate::focus::{self, PicturePosition, PictureStep, SceneStep};
 use crate::folder_settings::{self, DetectionInUse, DetectionSettings, SettingsScope};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::keyboard::{self, KeyboardOwner};
-use crate::plan::{CutIndex, NudgeDirection, SceneIndex, SceneLayout, SegmentIndex, SplitPlan};
+use crate::plan::{
+    CutIndex, NudgeDirection, NudgeStep, SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
+};
 use crate::review_session::{counted, ExportObstacle, ReviewRequest, ReviewSession, SceneListNote};
 use crate::scan::UndecodedFrames;
 use crate::scene_list::SceneListFormat;
@@ -95,7 +97,7 @@ const TIPS: [(&str, &str); 3] = [
 ];
 /// Every key of the review screen, and what it does. "The scene" is the
 /// one with the dark frame, which `KEYS_INTRODUCTION` says.
-const KEYS: [(&str, &str); 13] = [
+const KEYS: [(&str, &str); 15] = [
     (
         "Up, Down",
         "Go to the scene above or below. Home and End go to the first and the last.",
@@ -107,6 +109,10 @@ const KEYS: [(&str, &str); 13] = [
     ("M", "Merge the selected scenes."),
     ("U", "Take a merged scene apart again."),
     (
+        "X",
+        "Drop the scene, so no file is written for it. Again to keep it.",
+    ),
+    (
         "Alt+Left or Right",
         "Move the split at the start of the scene earlier or later.",
     ),
@@ -114,12 +120,18 @@ const KEYS: [(&str, &str); 13] = [
     ("Ctrl+A, Esc", "Select every scene, or none."),
     ("Ctrl+Enter", "Split into files."),
     (
+        "Ctrl+Shift+Enter",
+        "Split later, with the other videos that are ready.",
+    ),
+    (
         "Tab",
         "Go through the buttons and boxes. Space presses the one that is marked.",
     ),
     ("F1", "Show or hide this list."),
 ];
-const KEYS_INTRODUCTION: &str = "The keys work on the scene with the dark frame.      While the player is open, Space pauses it and Left and Right skip in it.";
+const KEYS_INTRODUCTION: &str = "The keys work on the scene with the dark frame. \
+     M, U and X work on the selected scenes when any are selected. \
+     While the player is open, Space pauses it and Left and Right skip in it.";
 const KEYS_HEADING: &str = "Keys";
 const SHOW_KEYS_LABEL: &str = "Show keys";
 const HIDE_KEYS_LABEL: &str = "Hide keys";
@@ -127,13 +139,23 @@ const KEYS_LINK_HINT: &str = "Lists what every key does on this screen (F1).";
 const KEY_NAME_WIDTH: f32 = 130.0;
 
 const SPLIT_HINT: &str = "Starts the split (Ctrl+Enter).";
-const JOIN_HINT: &str = "Makes these two scenes one. You can also drag one onto the other,      or press J on the upper one.";
+const JOIN_HINT: &str = "Makes these two scenes one. You can also drag one onto the other, \
+     or press J on the upper one.";
 const MOVE_SPLIT_EARLIER_LABEL: &str = "Move split earlier";
 const MOVE_SPLIT_LATER_LABEL: &str = "Move split later";
 const MOVE_SPLIT_EARLIER_HINT: &str =
-    "Moves the split between these two scenes to the point before it where the video can be cut      (Alt+Left on the lower scene).";
+    "Moves the split between these two scenes to the point before it where the video can be cut \
+     (Alt+Left on the lower scene).";
 const MOVE_SPLIT_LATER_HINT: &str =
-    "Moves the split between these two scenes to the point after it where the video can be cut      (Alt+Right on the lower scene).";
+    "Moves the split between these two scenes to the point after it where the video can be cut \
+     (Alt+Right on the lower scene).";
+/// With exact cuts on a split can be on any picture, so it moves by one.
+const MOVE_SPLIT_ONE_PICTURE_EARLIER_HINT: &str =
+    "Moves the split between these two scenes one picture earlier \
+     (Alt+Left on the lower scene). Cuts are exact, so the split can be on any picture.";
+const MOVE_SPLIT_ONE_PICTURE_LATER_HINT: &str =
+    "Moves the split between these two scenes one picture later \
+     (Alt+Right on the lower scene). Cuts are exact, so the split can be on any picture.";
 
 /// The frame around the scene, and the picture, the keys act on. It is
 /// thicker and darker than any other outline on the screen, so it does not
@@ -160,7 +182,7 @@ const LOOK_HARDER_EXPLANATION: &str =
 const RESCAN_WARNING: &str = "Scanning again removes the merges and splits you made on this video.";
 const SPLIT_LATER_LABEL: &str = "Split later";
 const SPLIT_LATER_EXPLANATION: &str =
-    "Keeps these scenes and shows the next video. Nothing is written yet. \
+    "Keeps these scenes and shows the next video (Ctrl+Shift+Enter). Nothing is written yet. \
      When you have reviewed the others, split them all with one button in the list on the left.";
 const LEAVE_OUT_CHAPTERS_LABEL: &str = "Leave out the chapter marks";
 const LEAVE_OUT_CHAPTERS_EXPLANATION: &str =
@@ -186,10 +208,11 @@ const CHAPTER_TITLE_FONT_SIZE: f32 = 14.0;
 
 const DROP_SCENE_LABEL: &str = "Drop this scene";
 const DROP_SCENE_HINT: &str = "Leaves this scene out of the split, so no file is written for it. \
-     X does the same for the selected scenes.";
+     X does the same for the selected scenes, or for the scene with the dark frame.";
 const KEEP_SCENE_LABEL: &str = "Keep this scene";
 const KEEP_SCENE_HINT: &str =
-    "Writes this scene to a file after all. X does the same for the selected scenes.";
+    "Writes this scene to a file after all. X does the same for the selected scenes, \
+     or for the scene with the dark frame.";
 /// On the card and in the hover text of a scene that is not written.
 const DROPPED_BADGE: &str = "Dropped, not written";
 /// On a timeline block too narrow to name its scene as well.
@@ -893,7 +916,7 @@ impl ReviewScreen {
                 ui.add_space(SPACE_BETWEEN_SCENES);
                 continue;
             }
-            match self.show_join_row_if_in_sight(ui, scene) {
+            match self.show_join_row_if_in_sight(ui, scene, session.nudge_step()) {
                 Some(BetweenScenes::Join) => input.join_with_next = Some(scene),
                 Some(BetweenScenes::MoveSplit(direction)) => {
                     input.split_to_move = Some(SplitToMove {
@@ -914,6 +937,7 @@ impl ReviewScreen {
         &mut self,
         ui: &mut egui::Ui,
         scene: SceneIndex,
+        nudge_step: NudgeStep,
     ) -> Option<BetweenScenes> {
         let room_out_of_sight = self
             .join_button_height
@@ -921,7 +945,7 @@ impl ReviewScreen {
         if room_out_of_sight.is_some() {
             return None;
         }
-        let row = show_join_row(ui, scene);
+        let row = show_join_row(ui, scene, nudge_step);
         self.join_button_height = Some(row.height);
         row.asked
     }
@@ -1717,16 +1741,22 @@ fn left_or_right_request(
     Some(ReviewRequest::NudgeSplit { scene, direction })
 }
 
-/// Enter and Space play the focused scene. Ctrl+Enter starts the split,
-/// which goes through the same questions as the button.
+/// Enter and Space play the focused scene. Ctrl+Enter starts the split
+/// and Ctrl+Shift+Enter puts the video with those to split later. Both go
+/// through the same questions as their buttons.
 fn enter_or_space_request(
     input: &egui::InputState,
     session: &ReviewSession,
 ) -> Option<ReviewRequest> {
     let enter = input.key_pressed(egui::Key::Enter);
     if enter && input.modifiers.command {
-        // One scene is the untouched video, and the button is off as well.
-        return (session.scene_count() > 1).then_some(ReviewRequest::Split);
+        let request = if input.modifiers.shift {
+            ReviewRequest::SplitLater
+        } else {
+            ReviewRequest::Split
+        };
+        // One scene is the untouched video, and the buttons are off as well.
+        return (session.scene_count() > 1).then_some(request);
     }
     let play = enter || input.key_pressed(egui::Key::Space);
     (play && input.modifiers.is_none()).then_some(ReviewRequest::PlayFocused)
@@ -1744,7 +1774,8 @@ fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<Review
             input.key_pressed(egui::Key::M),
             input.modifiers.command && input.key_pressed(egui::Key::A),
             input.modifiers.command && input.key_pressed(egui::Key::Z),
-            !input.modifiers.command && input.key_pressed(egui::Key::X),
+            // With Ctrl or Alt held a letter is some other shortcut.
+            !input.modifiers.command && !input.modifiers.alt && input.key_pressed(egui::Key::X),
         )
     });
     // This screen is behind everything else, so it is the last to be
@@ -2432,6 +2463,19 @@ fn show_note(ui: &mut egui::Ui, text: &str, tint: egui::Color32) {
         });
 }
 
+/// What the buttons that move a split say they do, which depends on how
+/// far a split moves.
+fn move_split_hint(direction: NudgeDirection, step: NudgeStep) -> &'static str {
+    match (direction, step) {
+        (NudgeDirection::Earlier, NudgeStep::ToNextCutPoint) => MOVE_SPLIT_EARLIER_HINT,
+        (NudgeDirection::Later, NudgeStep::ToNextCutPoint) => MOVE_SPLIT_LATER_HINT,
+        (NudgeDirection::Earlier, NudgeStep::OnePicture { .. }) => {
+            MOVE_SPLIT_ONE_PICTURE_EARLIER_HINT
+        }
+        (NudgeDirection::Later, NudgeStep::OnePicture { .. }) => MOVE_SPLIT_ONE_PICTURE_LATER_HINT,
+    }
+}
+
 /// What the person asked for on the row between two scene cards.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BetweenScenes {
@@ -2449,8 +2493,11 @@ struct JoinRow {
 
 /// The row between two scene cards, which is where the split between them
 /// is: a small button to join the two, and one at each end to move the
-/// split, earlier at the left and later at the right.
-fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex) -> JoinRow {
+/// split, earlier at the left and later at the right. `nudge_step` is how
+/// far those two move it, which their hover texts say.
+fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex, nudge_step: NudgeStep) -> JoinRow {
+    let earlier_hint = move_split_hint(NudgeDirection::Earlier, nudge_step);
+    let later_hint = move_split_hint(NudgeDirection::Later, nudge_step);
     let join_label = format!(
         "Join scenes {} and {}",
         scene.number(),
@@ -2458,11 +2505,11 @@ fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex) -> JoinRow {
     );
     let mut asked = None;
     let row = ui.horizontal(|ui| {
-        if show_quiet_button(ui, MOVE_SPLIT_EARLIER_LABEL, MOVE_SPLIT_EARLIER_HINT) {
+        if show_quiet_button(ui, MOVE_SPLIT_EARLIER_LABEL, earlier_hint) {
             asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Earlier));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if show_quiet_button(ui, MOVE_SPLIT_LATER_LABEL, MOVE_SPLIT_LATER_HINT) {
+            if show_quiet_button(ui, MOVE_SPLIT_LATER_LABEL, later_hint) {
                 asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Later));
             }
             // In the middle of the room the two other buttons leave.
@@ -3258,6 +3305,77 @@ mod tests {
         let mut screen = Screen::showing(test_sessions::scenes_of_twenty_seconds(1), SCREEN);
         screen.press(egui::Key::Enter, egui::Modifiers::COMMAND);
         assert_eq!(screen.last_follow_up, None);
+        screen.press(egui::Key::Enter, CTRL_SHIFT);
+        assert_eq!(screen.last_follow_up, None);
+    }
+
+    const CTRL_SHIFT: egui::Modifiers = egui::Modifiers {
+        shift: true,
+        ..egui::Modifiers::COMMAND
+    };
+
+    #[test]
+    fn ctrl_shift_enter_asks_to_split_later_like_the_button_does() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press(egui::Key::Enter, CTRL_SHIFT);
+        assert_eq!(screen.last_follow_up, Some(FollowUp::MarkReady));
+    }
+
+    #[test]
+    fn x_drops_the_scene_the_keys_are_on_and_x_again_keeps_it() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+        // Escape clears the selection and leaves the focus.
+        screen.press_plain(egui::Key::Escape);
+        assert_eq!(screen.session.selection().scenes().count(), 0);
+
+        screen.press_plain(egui::Key::X);
+        assert_eq!(screen.session.dropped_count(), 1);
+        screen.press_plain(egui::Key::X);
+        assert_eq!(screen.session.dropped_count(), 0);
+    }
+
+    #[test]
+    fn x_with_alt_or_ctrl_held_drops_nothing() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press(egui::Key::X, egui::Modifiers::ALT);
+        screen.press(egui::Key::X, egui::Modifiers::COMMAND);
+        assert_eq!(screen.session.dropped_count(), 0);
+    }
+
+    #[test]
+    fn the_buttons_that_move_a_split_say_how_far_it_moves() {
+        let one_picture = NudgeStep::OnePicture { seconds: 0.04 };
+        for direction in [NudgeDirection::Earlier, NudgeDirection::Later] {
+            let to_cut_point = move_split_hint(direction, NudgeStep::ToNextCutPoint);
+            let by_a_picture = move_split_hint(direction, one_picture);
+            assert!(to_cut_point.contains("where the video can be cut"));
+            assert!(by_a_picture.contains("one picture"));
+        }
+        assert!(move_split_hint(NudgeDirection::Earlier, one_picture).contains("Alt+Left"));
+        assert!(move_split_hint(NudgeDirection::Later, one_picture).contains("Alt+Right"));
+    }
+
+    #[test]
+    fn no_text_of_the_screen_lost_the_break_between_its_lines() {
+        // A line continuation that goes missing leaves the indent of the
+        // next line inside the sentence.
+        let texts = [
+            KEYS_INTRODUCTION,
+            JOIN_HINT,
+            MOVE_SPLIT_EARLIER_HINT,
+            MOVE_SPLIT_LATER_HINT,
+            MOVE_SPLIT_ONE_PICTURE_EARLIER_HINT,
+            MOVE_SPLIT_ONE_PICTURE_LATER_HINT,
+            SPLIT_LATER_EXPLANATION,
+            DROP_SCENE_HINT,
+            KEEP_SCENE_HINT,
+        ];
+        for text in texts {
+            assert!(!text.contains("  "), "{text}");
+        }
     }
 
     #[test]

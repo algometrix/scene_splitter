@@ -18,8 +18,8 @@ use crate::fates::{NothingToWrite, SceneFate, ScenesToWrite};
 use crate::focus::{self, PictureStep, ReviewFocus, SceneStep};
 use crate::folder_settings::DetectionSettings;
 use crate::plan::{
-    AddCutError, CutChoice, CutIndex, MovedCut, NudgeCutError, NudgeDirection, PlanSnapshot,
-    SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
+    AddCutError, CutChoice, CutIndex, MovedCut, NudgeCutError, NudgeDirection, NudgeStep,
+    PlanSnapshot, SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
 };
 use crate::scan::UndecodedFrames;
 use crate::scene_list::SceneListFormat;
@@ -60,7 +60,8 @@ pub enum SplitFeedback {
     Refused(AddCutError),
     /// What was typed is not a time.
     NotATime,
-    /// A split was moved to the next point where the video can be cut.
+    /// A split was moved one step: to the next point where the video can
+    /// be cut, or by one picture when cuts are exact.
     Moved(MovedCut),
     MoveRefused(NudgeCutError),
 }
@@ -358,8 +359,12 @@ impl ReviewSession {
 
     /// The title of the chapter that begins where this scene begins, when
     /// the file has chapter marks with titles.
+    ///
+    /// A split the person moved still begins its chapter: the title is
+    /// found by where the review began with that split.
     pub fn chapter_title(&self, scene: TimeSpan) -> Option<&str> {
-        self.chapter_splits.title_of_scene_starting_at(scene.start)
+        let began_at = self.plan.time_the_review_began_with(scene.start);
+        self.chapter_splits.title_of_scene_starting_at(began_at)
     }
 
     /// How many splits the review has now only because of a chapter mark.
@@ -384,6 +389,18 @@ impl ReviewSession {
     /// nearest keyframe, or on the very picture they chose.
     pub fn place_new_splits(&mut self, precision: CutPrecision) {
         self.new_split_precision = precision;
+    }
+
+    /// How far "Move split earlier" and "Move split later" move a split.
+    /// It follows where new splits land: a split that copies can only be
+    /// cut at certain points, and an exact one on any picture.
+    pub fn nudge_step(&self) -> NudgeStep {
+        match self.new_split_precision {
+            CutPrecision::NearestKeyframe => NudgeStep::ToNextCutPoint,
+            CutPrecision::ExactFrame => NudgeStep::OnePicture {
+                seconds: self.frame_seconds,
+            },
+        }
     }
 
     pub fn video(&self) -> &Arc<Path> {
@@ -778,7 +795,8 @@ impl ReviewSession {
     }
 
     fn nudge_split(&mut self, scene: SceneIndex, direction: NudgeDirection) {
-        let nudged = self.edit_plan(|plan| plan.nudge_cut_before(scene, direction));
+        let step = self.nudge_step();
+        let nudged = self.edit_plan(|plan| plan.nudge_cut_before(scene, direction, step));
         self.new_split_feedback = Some(match nudged {
             Ok(moved) => {
                 // The scene keeps its number but not its start, which is
@@ -801,10 +819,18 @@ impl ReviewSession {
         self.scene_list_note = None;
     }
 
-    /// Drops the selected scenes. When every one of them is dropped
-    /// already, the same key brings them back.
+    /// Drops the selected scenes or, with nothing selected, the focused
+    /// one. When every one of them is dropped already, the same key brings
+    /// them back.
+    ///
+    /// An edit clears the selection and leaves the focus, so the key goes
+    /// on working on the scene the keys are on, as the key that takes a
+    /// merged scene apart does.
     fn drop_or_keep_selected(&mut self) {
-        let selected: Vec<SceneIndex> = self.selection.scenes().collect();
+        let mut selected: Vec<SceneIndex> = self.selection.scenes().collect();
+        if selected.is_empty() {
+            selected.extend(self.focus.map(ReviewFocus::scene));
+        }
         if selected.is_empty() {
             return;
         }
@@ -2322,6 +2348,73 @@ mod tests {
                 Some("Credits"),
             ]
         );
+    }
+
+    #[test]
+    fn with_exact_cuts_a_split_moves_by_one_picture_and_keeps_its_chapter_title() {
+        let mut session = five_scenes_with_chapters();
+        assert_eq!(session.nudge_step(), NudgeStep::ToNextCutPoint);
+        session.place_new_splits(CutPrecision::ExactFrame);
+        let one_picture = session.frame_seconds();
+        assert_eq!(
+            session.nudge_step(),
+            NudgeStep::OnePicture {
+                seconds: one_picture
+            }
+        );
+
+        // The third scene starts at 30, where the chapter "The plan" does.
+        let third_scene = SceneIndex::new(2);
+        let moved = ReviewRequest::NudgeSplit {
+            scene: third_scene,
+            direction: NudgeDirection::Later,
+        };
+        session.apply(moved, &no_disk);
+
+        let scene = session.scenes()[2];
+        assert_eq!(scene.start, 30.0 + one_picture);
+        assert_eq!(session.chapter_title(scene), Some("The plan"));
+        assert_eq!(session.chapter_split_count(), 2);
+
+        session.apply(ReviewRequest::Undo, &no_disk);
+        assert_eq!(session.scenes()[2].start, 30.0);
+    }
+
+    #[test]
+    fn the_drop_key_works_on_the_focused_scene_when_none_is_selected() {
+        let mut session = five_scenes_with_chapters();
+        session.apply(
+            ReviewRequest::StepFocus {
+                step: SceneStep::Next,
+                kind: ClickKind::Single,
+            },
+            &no_disk,
+        );
+        session.apply(ReviewRequest::ClearSelection, &no_disk);
+        assert_eq!(session.selection().scenes().count(), 0);
+        assert!(session.focus().is_some());
+
+        session.apply(ReviewRequest::DropOrKeepSelected, &no_disk);
+        assert_eq!(session.dropped_count(), 1);
+        session.apply(ReviewRequest::DropOrKeepSelected, &no_disk);
+        assert_eq!(session.dropped_count(), 0);
+    }
+
+    #[test]
+    fn a_dropped_scene_keeps_its_chapter_title_and_the_files_are_numbered_without_it() {
+        let mut session = five_scenes_with_chapters();
+        // The last scene begins at 90, with the chapter "Credits".
+        let credits = SceneIndex::new(session.scene_count() - 1);
+        session.apply(ReviewRequest::DropScene(credits), &no_disk);
+
+        let scenes = session.scenes();
+        assert_eq!(
+            session.chapter_title(scenes[credits.position()]),
+            Some("Credits")
+        );
+        let to_write = session.scenes_to_write();
+        assert_eq!(to_write.dropped_count(), 1);
+        assert_eq!(to_write.kept_scenes().len(), scenes.len() - 1);
     }
 
     #[test]
