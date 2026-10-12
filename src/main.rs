@@ -5,8 +5,10 @@
 //! to scan videos ahead of time and review them in the window later.
 
 mod app;
+mod batch;
 mod black;
 mod cache;
+mod chapters;
 mod detect;
 #[cfg(test)]
 mod e2e_tests;
@@ -14,6 +16,7 @@ mod export;
 mod fates;
 mod ffmpeg;
 mod focus;
+mod folder_settings;
 mod folders;
 mod hardcut;
 mod keyboard;
@@ -48,9 +51,12 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
+use chapters::ChapterSplits;
 use detect::{Detection, ScanDepth, ScanKind, ScanMode};
 use export::{ExistingListFile, OriginalPolicy, SplitOrder};
 use fates::ScenesToWrite;
+use folder_settings::{DetectionInUse, SettingsScope};
+use hardcut::HardCutSettings;
 use scene_list::{FrameRate, SceneList, SceneListFormat};
 use scene_name::SceneNamePattern;
 use scenes::CutTimes;
@@ -61,7 +67,8 @@ use timecode::{format_timestamp, TimeSpan};
 const PROGRESS_STEP_PERCENT: u32 = 10;
 
 /// Detection and output options left out here come from the saved settings,
-/// which the window's Settings section edits.
+/// which the window edits: those remembered for the video's folder when
+/// there are some, the general ones otherwise.
 #[derive(Parser)]
 #[command(version, about)]
 struct Arguments {
@@ -128,6 +135,11 @@ struct Arguments {
     #[arg(long, requires = "video")]
     hard_cuts: bool,
 
+    /// Do not split at the chapter marks of the file. Without this, a video
+    /// with chapters is also split where each chapter begins.
+    #[arg(long, requires = "video", conflicts_with_all = ["review", "scan_only"])]
+    no_chapters: bool,
+
     /// How much of the video to decode while looking for black screens.
     #[arg(long, value_enum)]
     scan: Option<ScanMode>,
@@ -162,23 +174,31 @@ fn main() -> Result<()> {
     let for_one_video_only = arguments.list_only
         || arguments.overwrite
         || arguments.out_dir.is_some()
-        || arguments.save_list.is_some();
+        || arguments.save_list.is_some()
+        || arguments.no_chapters;
     if path.is_dir() && !arguments.scan_only && for_one_video_only {
         bail!(
-            "{} is a folder. --list-only, --out-dir, --overwrite and --save-list work on a \
-             single video. Use --scan-only to scan a folder, or give the folder alone to open \
-             it in the window.",
+            "{} is a folder. --list-only, --out-dir, --overwrite, --save-list and --no-chapters \
+             work on a single video. Use --scan-only to scan a folder, or give the folder alone \
+             to open it in the window.",
             path.display()
         );
     }
 
+    let detection = detection_at(&loaded.settings, path);
     // The window gets the tools itself, with a progress bar.
     if !arguments.scan_only && (arguments.review || path.is_dir()) {
         refuse_overrides_for_the_window(&arguments)?;
-        let first_scan = scan_kind(&arguments, &loaded.settings);
+        let first_scan = scan_kind(&arguments, detection.detection.hard_cuts);
         return app::run(loaded, Some(path.clone()), first_scan);
     }
-    let settings = settings_for_this_run(loaded.settings, &arguments)?;
+    if let SettingsScope::Folder(folder) = &detection.scope {
+        println!(
+            "Using the detection settings remembered for {}.",
+            folder.display()
+        );
+    }
+    let settings = settings_for_this_run(loaded.settings, &detection, &arguments)?;
 
     get_tools_if_missing()?;
     if arguments.scan_only {
@@ -228,8 +248,31 @@ fn refuse_overrides_for_the_window(arguments: &Arguments) -> Result<()> {
     Ok(())
 }
 
-/// The saved settings, with whatever the command line overrides.
-fn settings_for_this_run(mut settings: Settings, arguments: &Arguments) -> Result<Settings> {
+/// The detection settings saved for what the command line names: a video,
+/// or a folder whose videos are all directly inside it and so share its
+/// settings.
+fn detection_at(settings: &Settings, video_or_folder: &Path) -> DetectionInUse {
+    if !video_or_folder.is_dir() {
+        return settings.detection_for(video_or_folder);
+    }
+    match std::path::absolute(video_or_folder) {
+        Ok(folder) => settings.detection_for_folder(&folder),
+        // A folder that cannot be written out in full matches nothing that
+        // was remembered, which leaves the general settings.
+        Err(_) => settings.detection_for_folder(video_or_folder),
+    }
+}
+
+/// The settings of one command line run: the saved ones, with the detection
+/// settings in force for the video or folder, and on top of those whatever
+/// the command line overrides.
+fn settings_for_this_run(
+    mut settings: Settings,
+    saved_detection: &DetectionInUse,
+    arguments: &Arguments,
+) -> Result<Settings> {
+    settings.scan = saved_detection.detection.scan;
+    settings.hard_cuts = saved_detection.detection.hard_cuts;
     if let Some(mode) = arguments.scan {
         settings.scan.mode = mode;
     }
@@ -255,17 +298,17 @@ fn settings_for_this_run(mut settings: Settings, arguments: &Arguments) -> Resul
 }
 
 /// The scan the arguments ask for. A hard-cut scan thins its cuts with the
-/// saved settings.
-fn scan_kind(arguments: &Arguments, settings: &Settings) -> ScanKind {
+/// saved settings given.
+fn scan_kind(arguments: &Arguments, hard_cuts: HardCutSettings) -> ScanKind {
     if arguments.hard_cuts {
-        ScanKind::HardCuts(settings.hard_cuts)
+        ScanKind::HardCuts(hard_cuts)
     } else {
         ScanKind::BlackScreens
     }
 }
 
 fn scan_depth(arguments: &Arguments, settings: &Settings) -> ScanDepth {
-    scan_kind(arguments, settings).depth()
+    scan_kind(arguments, settings.hard_cuts).depth()
 }
 
 fn scan_ahead(path: &Path, arguments: &Arguments, settings: &Settings) -> Result<()> {
@@ -309,13 +352,20 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         eprintln!("Warning: in {}, {stretch}", video.display());
     }
     let detection = scan.detection;
+    let detected_cuts = detection.cuts_for(scan_kind(arguments, settings.hard_cuts));
+    let chapter_splits = if arguments.no_chapters {
+        ChapterSplits::default()
+    } else {
+        detection.chapter_splits(&detected_cuts)
+    };
+    let every_cut = detected_cuts
+        .iter()
+        .chain(&chapter_splits.cuts)
+        .copied()
+        .collect();
     // Checked once, here, so that neither the listing nor the split can be
     // handed a cut that is not inside the video.
-    let cuts = CutTimes::inside(
-        detection.video,
-        detection.cuts_for(scan_kind(arguments, settings)),
-    )
-    .map_err(|outside| {
+    let cuts = CutTimes::inside(detection.video, every_cut).map_err(|outside| {
         anyhow::anyhow!("the scan of {} made no sense: {outside}", video.display())
     })?;
 
@@ -328,10 +378,19 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         println!(
             "Sudden picture changes: {}, of which {} became cuts.",
             candidates.len(),
-            cuts.len() - detection.cuts.len()
+            detected_cuts.len() - detection.cuts.len()
         );
     }
-    print_scenes(&cuts.scenes());
+    let chapter_mark_count = detection.chapter_marks().len();
+    if chapter_mark_count > 0 && arguments.no_chapters {
+        println!("Chapter marks: {chapter_mark_count}, left out as asked.");
+    } else if chapter_mark_count > 0 {
+        println!(
+            "Chapter marks: {chapter_mark_count}. Cuts they add: {}.",
+            chapter_splits.cuts.len()
+        );
+    }
+    print_scenes(&cuts.scenes(), &chapter_splits);
     println!("Detection took {detection_seconds:.2}s.");
 
     // The command line has no review, so it has no way to drop a scene.
@@ -425,11 +484,17 @@ fn print_black_screens(black_screens: &[TimeSpan]) {
     }
 }
 
-fn print_scenes(scenes: &[TimeSpan]) {
+/// Lists the scenes, each with the title of the chapter that begins where
+/// it begins, if the file names one.
+fn print_scenes(scenes: &[TimeSpan], chapter_splits: &ChapterSplits) {
     println!("Scenes: {}", scenes.len());
     for (number, scene) in scenes.iter().enumerate() {
+        let title = chapter_splits
+            .title_of_scene_starting_at(scene.start)
+            .map(|title| format!("  {title}"))
+            .unwrap_or_default();
         println!(
-            "  {:03}  {} to {}",
+            "  {:03}  {} to {}{title}",
             number + 1,
             format_timestamp(scene.start),
             format_timestamp(scene.end)

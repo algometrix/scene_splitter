@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::{DetectionSource, SourcedDetection};
+use crate::chapters::ChapterSplits;
 use crate::detect::ScanKind;
 use crate::fates::{NothingToWrite, SceneFate, ScenesToWrite};
 use crate::focus::{self, PictureStep, ReviewFocus, SceneStep};
+use crate::folder_settings::DetectionSettings;
 use crate::plan::{
     AddCutError, CutChoice, CutIndex, MovedCut, NudgeCutError, NudgeDirection, PlanSnapshot,
     SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
@@ -150,9 +152,17 @@ pub enum ReviewRequest {
     },
     Undo,
     ResetScenes,
+    /// Join the scenes on both sides of every split that comes from a
+    /// chapter mark of the file.
+    LeaveOutChapterSplits,
     Split,
-    /// Split even though the scene files of an earlier split in this folder
-    /// will be replaced. The folder is the one the warning named.
+    /// The scenes are right, but split this video later, together with the
+    /// other videos that are ready.
+    SplitLater,
+    /// Go on although the scene files of an earlier split in this folder
+    /// will be replaced. The folder is the one the warning named. What goes
+    /// on is what was asked for when the warning came: the split, or
+    /// putting the video with those that are ready.
     ReplaceEarlierFiles {
         scene_dir: PathBuf,
     },
@@ -168,6 +178,14 @@ pub enum ReviewRequest {
     /// Change a setting that is offered on the review screen. Settings are
     /// not part of any one review, so this is left to the app.
     ChangeSettings(SettingsChange),
+    /// Change the detection settings this video is scanned with: those of
+    /// its folder when the folder has its own, the general ones otherwise.
+    /// Which of the two it is, is for the app to say.
+    ChangeDetection(DetectionSettings),
+    /// Keep the detection settings in use now for this video's folder.
+    RememberForFolder,
+    /// Forget the detection settings of this video's folder.
+    UseGeneralSettings,
 }
 
 /// What a request leaves for the rest of the app to do. The session itself
@@ -175,6 +193,8 @@ pub enum ReviewRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FollowUp {
     Export,
+    /// Put the video with those that are ready to be split.
+    MarkReady,
     Skip,
     Rescan(ScanKind),
     PlayFrom(f64),
@@ -185,6 +205,27 @@ pub enum FollowUp {
         format: SceneListFormat,
         path: PathBuf,
     },
+    ChangeDetection(DetectionSettings),
+    RememberForFolder,
+    UseGeneralSettings,
+}
+
+/// When the person wants the video they have reviewed to be split.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SplitTiming {
+    Now,
+    /// With the other videos that are ready, when the person says so.
+    WithTheReadyVideos,
+}
+
+impl SplitTiming {
+    /// What is left for the app to do once nothing stands in the way.
+    fn follow_up(self) -> FollowUp {
+        match self {
+            Self::Now => FollowUp::Export,
+            Self::WithTheReadyVideos => FollowUp::MarkReady,
+        }
+    }
 }
 
 /// Looks where the scenes of this video would go now, for scene files an
@@ -221,9 +262,18 @@ pub struct ReviewSession {
     /// How the last saving of the scene list went, once one was tried.
     scene_list_note: Option<SceneListNote>,
     export_obstacle: Option<ExportObstacle>,
+    /// What the person asked for when `export_obstacle` came up, which is
+    /// what goes on once they agree to replace the files.
+    split_asked_for: SplitTiming,
+    /// The folder whose earlier scene files the person agreed to replace.
+    /// A video that waits to be split with the others needs this later, when
+    /// its turn comes and nobody is there to ask.
+    replacing_agreed_in: Option<PathBuf>,
     /// A scan the person asked for that would throw away their edits, until
     /// they confirm or cancel it.
     rescan_awaiting_consent: Option<ScanKind>,
+    /// The titles the file's chapter marks give to scenes.
+    chapter_splits: ChapterSplits,
 }
 
 impl ReviewSession {
@@ -248,15 +298,30 @@ impl ReviewSession {
         } else {
             format!("Found {black_screens}.")
         };
+        let chapter_splits = detection.chapter_splits(cuts.as_slice());
+        let found = match splits_from_chapters_in_words(chapter_splits.cuts.len()) {
+            Some(from_chapters) => format!("{found} {from_chapters}"),
+            None => found,
+        };
         let scan_summary = match source {
             DetectionSource::FreshScan => found,
             DetectionSource::StoredScan => format!("{found} Using the scan from last time."),
         };
-        let scan_details = format!(
+        let decoded = format!(
             "{} of {} frames were decoded to find them.",
             detection.decoded_frames, detection.frame_count
         );
-        let plan = SplitPlan::from_detected_cuts(&cuts, detection.keyframe_times);
+        let chapter_mark_count = detection.chapter_marks().len();
+        let scan_details = if chapter_mark_count > 0 {
+            format!(
+                "{decoded} The file has {}.",
+                counted(chapter_mark_count, "chapter mark")
+            )
+        } else {
+            decoded
+        };
+        let mut plan = SplitPlan::from_detected_cuts(&cuts, detection.keyframe_times);
+        plan.propose_chapter_cuts(&chapter_splits.cuts);
         Self {
             video,
             plan,
@@ -272,7 +337,34 @@ impl ReviewSession {
             drop_refusal: None,
             scene_list_note: None,
             export_obstacle: None,
+            split_asked_for: SplitTiming::Now,
+            replacing_agreed_in: None,
             rescan_awaiting_consent: None,
+            chapter_splits,
+        }
+    }
+
+    /// The title of the chapter that begins where this scene begins, when
+    /// the file has chapter marks with titles.
+    pub fn chapter_title(&self, scene: TimeSpan) -> Option<&str> {
+        self.chapter_splits.title_of_scene_starting_at(scene.start)
+    }
+
+    /// How many splits the review has now only because of a chapter mark.
+    pub fn chapter_split_count(&self) -> usize {
+        self.plan.chapter_split_count()
+    }
+
+    /// Whether a split may go ahead given what was `found` where the scenes
+    /// go: nothing in the way, or only files the person already agreed to
+    /// replace in that same folder.
+    pub fn may_split_over(&self, found: &Result<EarlierSceneFiles, String>) -> bool {
+        match found {
+            Ok(earlier_files) => {
+                earlier_files.file_count == 0
+                    || self.replacing_agreed_in.as_deref() == Some(&earlier_files.scene_dir)
+            }
+            Err(_could_not_look) => false,
         }
     }
 
@@ -349,10 +441,12 @@ impl ReviewSession {
     }
 
     /// A warning about earlier scene files was given for one folder and one
-    /// plan. Whoever changes where the scenes go calls this, and so does a
-    /// review that is taken up again after its split failed.
+    /// plan, and so was the person's leave to replace them. Whoever changes
+    /// where the scenes go calls this, and so does a review that is taken up
+    /// again after its split failed or after it waited to be split.
     pub fn forget_export_obstacle(&mut self) {
         self.export_obstacle = None;
+        self.replacing_agreed_in = None;
     }
 
     /// Whether the person still has to say if a scan may throw away their
@@ -492,7 +586,16 @@ impl ReviewSession {
             }
             ReviewRequest::Undo => self.undo(),
             ReviewRequest::ResetScenes => self.edit_plan(SplitPlan::reset_to_detected),
-            ReviewRequest::Split => return self.ask_to_split(look_for_earlier_scene_files()),
+            ReviewRequest::LeaveOutChapterSplits => self.edit_plan(SplitPlan::merge_chapter_cuts),
+            ReviewRequest::Split => {
+                return self.ask_to_split(look_for_earlier_scene_files(), SplitTiming::Now);
+            }
+            ReviewRequest::SplitLater => {
+                return self.ask_to_split(
+                    look_for_earlier_scene_files(),
+                    SplitTiming::WithTheReadyVideos,
+                );
+            }
             ReviewRequest::ReplaceEarlierFiles { scene_dir } => {
                 return self.replace_earlier_files(&scene_dir, look_for_earlier_scene_files());
             }
@@ -506,6 +609,11 @@ impl ReviewSession {
             ReviewRequest::ChangeSettings(change) => {
                 return Some(FollowUp::ChangeSettings(change));
             }
+            ReviewRequest::ChangeDetection(detection) => {
+                return Some(FollowUp::ChangeDetection(detection));
+            }
+            ReviewRequest::RememberForFolder => return Some(FollowUp::RememberForFolder),
+            ReviewRequest::UseGeneralSettings => return Some(FollowUp::UseGeneralSettings),
         }
         None
     }
@@ -522,14 +630,21 @@ impl ReviewSession {
 
     /// Splitting replaces files of the same name, so existing scene files
     /// need a second, explicit confirmation.
-    fn ask_to_split(&mut self, found: Result<EarlierSceneFiles, String>) -> Option<FollowUp> {
+    fn ask_to_split(
+        &mut self,
+        found: Result<EarlierSceneFiles, String>,
+        timing: SplitTiming,
+    ) -> Option<FollowUp> {
+        self.split_asked_for = timing;
+        // Leave given earlier was for what was on disk then.
+        self.replacing_agreed_in = None;
         self.export_obstacle = match found {
             Ok(nothing_in_the_way) if nothing_in_the_way.file_count == 0 => None,
             Ok(earlier_files) => Some(ExportObstacle::EarlierSceneFiles(earlier_files)),
             Err(problem) => Some(ExportObstacle::CouldNotCheck(problem)),
         };
         match self.export_obstacle {
-            None => Some(FollowUp::Export),
+            None => Some(timing.follow_up()),
             Some(_) => None,
         }
     }
@@ -546,9 +661,12 @@ impl ReviewSession {
         match found {
             Ok(earlier_files) if earlier_files.scene_dir == confirmed_dir => {
                 self.export_obstacle = None;
-                Some(FollowUp::Export)
+                self.replacing_agreed_in = Some(earlier_files.scene_dir);
+                Some(self.split_asked_for.follow_up())
             }
-            found_elsewhere_or_not_at_all => self.ask_to_split(found_elsewhere_or_not_at_all),
+            found_elsewhere_or_not_at_all => {
+                self.ask_to_split(found_elsewhere_or_not_at_all, self.split_asked_for)
+            }
         }
     }
 
@@ -659,7 +777,7 @@ impl ReviewSession {
     /// a scene could not be dropped or that the scene list was saved.
     fn forget_what_depended_on_the_old_plan(&mut self) {
         self.selection.clear();
-        self.export_obstacle = None;
+        self.forget_export_obstacle();
         self.drop_refusal = None;
         self.scene_list_note = None;
     }
@@ -757,6 +875,16 @@ impl ReviewSession {
     }
 }
 
+/// The sentence of the scan summary about chapter marks, or `None` when no
+/// split comes from one.
+fn splits_from_chapters_in_words(chapter_split_count: usize) -> Option<String> {
+    match chapter_split_count {
+        0 => None,
+        1 => Some("1 more split comes from a chapter mark.".to_owned()),
+        several => Some(format!("{several} more splits come from chapter marks.")),
+    }
+}
+
 /// "1 scene", "3 scenes".
 pub fn counted(count: usize, noun: &str) -> String {
     let plural = if count == 1 { "" } else { "s" };
@@ -816,6 +944,7 @@ pub mod test_sessions {
             decoded_frames: 0,
             decoded_windows: 0,
             hard_cut_candidates: None,
+            chapters: None,
         }
     }
 
@@ -2015,6 +2144,243 @@ mod tests {
             &no_disk,
         );
         assert_eq!(session.scene_count(), 6);
+    }
+
+    fn chapter(start: f64, title: &str) -> crate::chapters::Chapter {
+        crate::chapters::Chapter {
+            start,
+            title: Some(title.to_owned()),
+        }
+    }
+
+    /// Five scenes of 20 seconds found by the scan, in a file with four
+    /// chapters: one that opens the video, one on a detected split, and two
+    /// where the scan found nothing.
+    fn five_scenes_with_chapters() -> ReviewSession {
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
+        detection.chapters = Some(vec![
+            chapter(0.0, "Opening"),
+            chapter(31.0, "The plan"),
+            chapter(40.0, "The heist"),
+            chapter(89.0, "Credits"),
+        ]);
+        test_sessions::fresh_scan_of(detection)
+    }
+
+    #[test]
+    fn chapter_marks_become_splits_where_the_scan_found_none() {
+        let session = five_scenes_with_chapters();
+        // The marks at 31 and 89 land on the points to cut at 30 and 90.
+        assert_eq!(
+            session.accepted_cuts().as_slice(),
+            [20.0, 30.0, 40.0, 60.0, 80.0, 90.0]
+        );
+        assert_eq!(session.chapter_split_count(), 2);
+        // The person changed nothing yet.
+        assert!(!session.is_edited());
+    }
+
+    #[test]
+    fn the_scan_summary_says_how_many_splits_come_from_chapter_marks() {
+        let session = five_scenes_with_chapters();
+        assert_eq!(
+            session.scan_summary(),
+            "Found 0 black screens. 2 more splits come from chapter marks."
+        );
+        assert_eq!(
+            session.scan_details(),
+            "0 of 3000 frames were decoded to find them. The file has 4 chapter marks."
+        );
+    }
+
+    #[test]
+    fn one_split_from_a_chapter_mark_is_said_in_the_singular() {
+        assert_eq!(splits_from_chapters_in_words(0), None);
+        assert_eq!(
+            splits_from_chapters_in_words(1).as_deref(),
+            Some("1 more split comes from a chapter mark.")
+        );
+    }
+
+    #[test]
+    fn a_stored_scan_with_chapters_says_both_things() {
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
+        detection.chapters = Some(vec![chapter(31.0, "The plan")]);
+        let session = test_sessions::review_of(SourcedDetection {
+            detection,
+            source: DetectionSource::StoredScan,
+            undecoded: Vec::new(),
+        });
+        assert_eq!(
+            session.scan_summary(),
+            "Found 0 black screens. 1 more split comes from a chapter mark. \
+             Using the scan from last time."
+        );
+    }
+
+    #[test]
+    fn a_scene_carries_the_title_of_the_chapter_that_begins_with_it() {
+        let session = five_scenes_with_chapters();
+        let titles: Vec<Option<&str>> = session
+            .scenes()
+            .into_iter()
+            .map(|scene| session.chapter_title(scene))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                Some("Opening"),
+                None,
+                Some("The plan"),
+                Some("The heist"),
+                None,
+                None,
+                Some("Credits"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_merged_scene_keeps_the_title_of_its_first_part() {
+        let mut session = five_scenes_with_chapters();
+        session.apply(ReviewRequest::MergeScenes(scenes(2, 4)), &no_disk);
+
+        let merged = session.scenes()[2];
+        assert_eq!(merged.start, 30.0);
+        assert_eq!(session.chapter_title(merged), Some("The plan"));
+    }
+
+    #[test]
+    fn a_video_without_chapters_has_no_titles_and_says_nothing_about_them() {
+        let session = test_sessions::five_scenes();
+        assert_eq!(session.chapter_split_count(), 0);
+        assert!(session
+            .scenes()
+            .into_iter()
+            .all(|scene| session.chapter_title(scene).is_none()));
+    }
+
+    #[test]
+    fn leaving_out_the_chapter_marks_keeps_what_the_scan_found_and_can_be_undone() {
+        let mut session = five_scenes_with_chapters();
+        assert_eq!(
+            session.apply(ReviewRequest::LeaveOutChapterSplits, &no_disk),
+            None
+        );
+        assert_eq!(session.accepted_cuts().as_slice(), [20.0, 40.0, 60.0, 80.0]);
+        assert_eq!(session.chapter_split_count(), 0);
+
+        session.apply(ReviewRequest::Undo, &no_disk);
+        assert_eq!(session.chapter_split_count(), 2);
+    }
+
+    #[test]
+    fn resetting_the_scenes_brings_the_chapter_splits_back() {
+        let mut session = five_scenes_with_chapters();
+        session.apply(ReviewRequest::LeaveOutChapterSplits, &no_disk);
+        session.apply(ReviewRequest::ResetScenes, &no_disk);
+        assert_eq!(session.chapter_split_count(), 2);
+        assert_eq!(session.scene_count(), 7);
+    }
+
+    #[test]
+    fn splitting_later_with_nothing_in_the_way_marks_the_video_ready() {
+        let mut session = test_sessions::five_scenes();
+        assert_eq!(
+            session.apply(ReviewRequest::SplitLater, &no_earlier_files),
+            Some(FollowUp::MarkReady)
+        );
+        assert_eq!(session.export_obstacle(), None);
+    }
+
+    #[test]
+    fn splitting_later_over_earlier_files_asks_first_and_then_marks_ready() {
+        let mut session = test_sessions::five_scenes();
+        assert_eq!(
+            session.apply(ReviewRequest::SplitLater, &three_earlier_files),
+            None
+        );
+        assert!(matches!(
+            session.export_obstacle(),
+            Some(ExportObstacle::EarlierSceneFiles(_))
+        ));
+
+        // Agreeing does what was asked for: wait with the ready videos, not
+        // split at once.
+        assert_eq!(
+            session.apply(replace_in(test_sessions::scene_dir()), &three_earlier_files),
+            Some(FollowUp::MarkReady)
+        );
+        assert_eq!(session.export_obstacle(), None);
+    }
+
+    #[test]
+    fn agreeing_to_replace_after_asking_to_split_now_still_splits_now() {
+        let mut session = test_sessions::five_scenes();
+        // First "Split later", then a change of mind.
+        session.apply(ReviewRequest::SplitLater, &three_earlier_files);
+        session.apply(ReviewRequest::Split, &three_earlier_files);
+        assert_eq!(
+            session.apply(replace_in(test_sessions::scene_dir()), &three_earlier_files),
+            Some(FollowUp::Export)
+        );
+    }
+
+    #[test]
+    fn a_split_may_go_over_nothing_or_over_files_the_person_agreed_to_replace() {
+        let mut session = test_sessions::five_scenes();
+        assert!(session.may_split_over(&no_earlier_files()));
+        assert!(!session.may_split_over(&three_earlier_files()));
+        assert!(!session.may_split_over(&unreadable_folder()));
+
+        session.apply(ReviewRequest::SplitLater, &three_earlier_files);
+        session.apply(replace_in(test_sessions::scene_dir()), &three_earlier_files);
+        assert!(session.may_split_over(&three_earlier_files()));
+        // The leave was for that folder and no other.
+        assert!(!session.may_split_over(&two_earlier_files_in_the_new_folder()));
+        assert!(!session.may_split_over(&unreadable_folder()));
+    }
+
+    #[test]
+    fn leave_to_replace_files_does_not_outlast_a_change_of_the_scenes() {
+        let mut session = test_sessions::five_scenes();
+        session.apply(ReviewRequest::SplitLater, &three_earlier_files);
+        session.apply(replace_in(test_sessions::scene_dir()), &three_earlier_files);
+
+        session.apply(ReviewRequest::MergeScenes(scenes(0, 1)), &no_disk);
+        assert!(!session.may_split_over(&three_earlier_files()));
+    }
+
+    #[test]
+    fn leave_to_replace_files_does_not_outlast_a_change_of_where_scenes_go() {
+        let mut session = test_sessions::five_scenes();
+        session.apply(ReviewRequest::SplitLater, &three_earlier_files);
+        session.apply(replace_in(test_sessions::scene_dir()), &three_earlier_files);
+
+        session.forget_export_obstacle();
+        assert!(!session.may_split_over(&three_earlier_files()));
+    }
+
+    #[test]
+    fn changes_of_detection_settings_are_left_to_the_app() {
+        let mut session = test_sessions::five_scenes();
+        let mut detection = DetectionSettings::default();
+        detection.scan.criteria.min_seconds = 0.5;
+
+        assert_eq!(
+            session.apply(ReviewRequest::ChangeDetection(detection), &no_disk),
+            Some(FollowUp::ChangeDetection(detection))
+        );
+        assert_eq!(
+            session.apply(ReviewRequest::RememberForFolder, &no_disk),
+            Some(FollowUp::RememberForFolder)
+        );
+        assert_eq!(
+            session.apply(ReviewRequest::UseGeneralSettings, &no_disk),
+            Some(FollowUp::UseGeneralSettings)
+        );
+        // None of them is an edit of the scenes.
+        assert!(!session.is_edited());
     }
 
     #[test]

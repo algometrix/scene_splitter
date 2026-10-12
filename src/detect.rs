@@ -9,6 +9,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 use crate::black::{self, BlackCriteria};
+use crate::chapters::{self, Chapter, ChapterSplits};
 use crate::hardcut::{self, HardCutCandidate, HardCutSettings};
 use crate::scan::{self, UndecodedFrames};
 use crate::timecode::TimeSpan;
@@ -86,6 +87,11 @@ pub struct Detection {
     /// not look for hard cuts.
     #[serde(default)]
     pub hard_cut_candidates: Option<Vec<HardCutCandidate>>,
+    /// The chapter marks the file carries, or `None` for a scan stored
+    /// before chapters were read. Left out of a stored scan in that case, so
+    /// the file keeps the layout earlier versions wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapters: Option<Vec<Chapter>>,
 }
 
 impl Detection {
@@ -103,6 +109,23 @@ impl Detection {
             ScanKind::BlackScreens => self.cuts.clone(),
             ScanKind::HardCuts(settings) => self.cuts_with_hard_cuts(&settings),
         }
+    }
+
+    /// The chapter marks of the file: none when it has none, or when they
+    /// were never read.
+    pub fn chapter_marks(&self) -> &[Chapter] {
+        self.chapters.as_deref().unwrap_or_default()
+    }
+
+    /// What the chapter marks add to `detected_cuts`, the cuts a review or a
+    /// split starts from.
+    pub fn chapter_splits(&self, detected_cuts: &[f64]) -> ChapterSplits {
+        chapters::chapter_splits(
+            self.chapter_marks(),
+            detected_cuts,
+            &self.keyframe_times,
+            self.video,
+        )
     }
 
     /// The black-screen cuts plus the hard cuts chosen by `settings`. Without
@@ -188,6 +211,7 @@ pub fn scan_for_scene_changes(
     on_progress: OnScanProgress,
 ) -> Result<ScanOutcome> {
     let index = probe::read_packet_index(video)?;
+    let chapters = probe::read_chapters(video)?;
     let packets = &index.packets;
     let criteria = &settings.criteria;
 
@@ -262,6 +286,7 @@ pub fn scan_for_scene_changes(
             decoded_frames,
             decoded_windows: windows.len(),
             hard_cut_candidates,
+            chapters: Some(chapters),
         },
         undecoded,
     })

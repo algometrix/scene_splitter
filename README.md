@@ -49,11 +49,14 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 
 - **Fast scan.** A two hour 480p video is scanned in about two seconds, because black frames show up in the packet sizes before anything is decoded.
 - **Hard cuts.** An optional slower scan finds scene changes that have no black screen.
+- **Chapter marks.** If the file has chapters, each chapter start is offered as a split, and a scene shows the title of the chapter that begins with it.
 - **Review before writing.** Merge scenes by dragging, add a split by time, move a split to the next point where the video can be cut, move a part back out of a merged scene, undo, or reset.
 - **Review without the mouse.** Every step of a review has a key, and the window lists them.
 - **Drop scenes.** Mark adverts or credits as not to be written. The split leaves them out, numbers the other files without gaps, and always keeps the original.
 - **Your own file names.** Choose how scene files are named, with placeholders such as `{name}` and `{number}`.
 - **Scene list without splitting.** Save the scenes with their times as a table (CSV), as chapter marks for ffmpeg, or as an edit list (EDL).
+- **Review now, split later.** Mark each reviewed video with "Split later", then split all of them with one button.
+- **Settings per folder.** A folder can have detection settings of its own, for videos from a source that needs them.
 - **Built-in player.** Click a preview picture to play from there, step frame by frame with the mouse wheel, and split the scene at the current position.
 - **Verified before the original is removed.** After a split, the app checks every packet of the scene files against the original. Only then does it move the original to the Recycle Bin or Trash.
 - **Scan ahead.** Scan a whole folder from the command line, and review the results in the window later.
@@ -106,6 +109,31 @@ You can also run it through Cargo: `cargo run --release -- <arguments>`.
 
    While any scene is dropped, the button reads "Split into 3 files, 1 scene dropped", and the choice about the original gives way to a sentence: the original stays where it is. A split with dropped scenes never moves the original, whatever is set, because the new files do not hold all of it. The app does not change your saved choice, and does not ask the one-time question for such a split.
 7. When the split is done, the app shows whether the check passed and what happened to the original. "Open folder" shows the scene files.
+
+### Chapter marks
+
+If the video file has chapters, the scan reads them and offers each chapter start as a split, beside the ones it found itself. The line under the toolbar says how many splits come from chapter marks.
+
+- A chapter mark is moved to the nearest point where the video can be cut (a keyframe).
+- A mark at a split the scan found, or within one second of it, adds no second split there.
+- A scene shows the title of the chapter that begins where it begins, on its card and when you point at its block on the timeline. A long title is cut short on the card, and pointing at it shows all of it. Titles are not used in file names.
+- "Leave out the chapter marks" joins the scenes again wherever only a chapter mark separates them. Undo brings them back, and so does "Reset scenes".
+
+A scan stored by an earlier version of the app has no chapters in it. The app reads them the first time it reuses that scan, without scanning again.
+
+### Split later, then split all ready videos
+
+"Split later", beside "Split into N files", keeps the scenes of the video as you reviewed them and shows the next video. Nothing is written yet. The queue lists the video as "Ready to split".
+
+When videos are ready, a "Split N ready videos" button appears above the list in the left panel. It splits them one after another, each into the scenes you reviewed. While it runs, the left panel shows how many are done. At the end it says how many were split and checked, and what happened to the rest. "Dismiss" puts that summary away.
+
+Every safeguard of a single split applies to each video:
+
+- If scene files from an earlier split are in the way when you press "Split later", the app asks before it marks the video ready. If such files turn up afterwards, the video is not split. It goes back into review with the question open.
+- The one-time question about the Recycle Bin or Trash is asked once, before the first video is split, and the answer goes for all of them.
+- A video whose split fails keeps its review and offers "Back to review". The videos after it are still split.
+
+Click a ready video to see its page. "Edit the scenes again" takes it back into review, as you left it. It is then no longer ready, until you press "Split later" again. Videos you mark ready while a run is under way wait for the next run.
 
 When something goes wrong, the app says so in plain words and shows the technical reason under it. You can select that text, and "Copy details" puts all of it on the clipboard.
 
@@ -201,6 +229,7 @@ Splitting from the command line always scans the video afresh. Only the window a
 | `--list-format <csv, chapters or edl>` | The format of the scene list. Left out, it follows the file's ending: `.csv`, `.txt` (or `.ffmetadata`) for chapters, `.edl`. |
 | `--keep-original` | Keep the original video, whatever the saved setting says. |
 | `--hard-cuts` | Also look for hard cuts (scene changes with no black screen). This decodes every frame and is much slower. It uses the saved sensitivity and shortest scene. |
+| `--no-chapters` | Do not split at the chapter marks of the file. Without it, a video with chapters is also split where each chapter begins. |
 | `--scan suspicious` | Decode only where packet sizes hint at a black screen. |
 | `--scan every-frame` | Decode every frame. Use it when the black screens are noisy or grainy. |
 | `--min-black <seconds>` | Shortest black screen that counts as a scene change. |
@@ -208,18 +237,20 @@ Splitting from the command line always scans the video afresh. Only the window a
 | `--black-fraction <0 to 1>` | Share of a frame's pixels that must be black. |
 | `--help`, `--version` | Print the help text or the version. |
 
-Options you leave out take their value from the saved [settings](#settings). Out of the box these are `--scan suspicious`, `--min-black 0.25`, `--max-luma 32` and `--black-fraction 0.98`.
+Options you leave out take their value from the saved [settings](#settings). Out of the box these are `--scan suspicious`, `--min-black 0.25`, `--max-luma 32` and `--black-fraction 0.98`. If the video's folder has [detection settings of its own](#settings-for-one-folder), those are the saved settings for that video, and the command says so. An option you give still wins.
+
+A video with chapters is listed and split at its chapter marks too, and the list of scenes shows the chapter titles. `--no-chapters` leaves the marks out.
 
 A command line split exits with an error code when the scenes could not be verified or the original could not be moved, so a script can tell.
 
 Which options work together:
 
-- `--scan-only` cannot be combined with `--review`, `--list-only`, `--out-dir`, `--overwrite`, `--keep-original`, `--scene-name` or `--save-list`.
-- `--review` cannot be combined with `--list-only`, `--out-dir`, `--overwrite`, `--keep-original`, `--scene-name` or `--save-list`.
+- `--scan-only` cannot be combined with `--review`, `--list-only`, `--out-dir`, `--overwrite`, `--keep-original`, `--scene-name`, `--save-list` or `--no-chapters`.
+- `--review` cannot be combined with `--list-only`, `--out-dir`, `--overwrite`, `--keep-original`, `--scene-name`, `--save-list` or `--no-chapters`. In the window, "Leave out the chapter marks" does the job of `--no-chapters`.
 - `--list-only` cannot be combined with `--keep-original`.
 - `--hard-cuts` works with every command. With `--review` or a folder, the window opens with the hard-cut scan already chosen for the queued videos.
 - The detection options (`--scan`, `--min-black`, `--max-luma`, `--black-fraction`), `--keep-original` and `--scene-name` apply to a command line run. The app refuses them when the command opens the window, where the Settings section does that job.
-- A folder without `--scan-only` opens the window. The app refuses `--list-only`, `--out-dir`, `--overwrite` and `--save-list` with a folder, since they work on a single video.
+- A folder without `--scan-only` opens the window. The app refuses `--list-only`, `--out-dir`, `--overwrite`, `--save-list` and `--no-chapters` with a folder, since they work on a single video.
 - `--list-format` needs `--save-list`.
 
 To save the scenes of a video without splitting it:
@@ -242,7 +273,7 @@ scene_splitter D:\videos --scan-only --hard-cuts
 
 The second form also runs the slow hard-cut pass. When you later open the same videos in the window, they are ready for review at once, and "Look for sudden picture changes" returns without another slow scan.
 
-The window reuses a stored scan only if its detection settings match the ones the scan was made with. If you pass detection options to `--scan-only`, set the same values in the window.
+The window reuses a stored scan only if its detection settings match the ones the scan was made with. `--scan-only` and the window both use the settings remembered for the folder when there are some, so they agree by themselves. If you pass detection options to `--scan-only`, set the same values in the window.
 
 ## Settings
 
@@ -254,9 +285,24 @@ The Settings section is at the bottom of the left panel. It holds:
 - Whether the tips are shown on the review screen.
 - For missed scenes: how much to detect, and the shortest scene to allow.
 - Under "Advanced: what counts as a black screen": the shortest black screen, how dark counts as black, how much of the picture must be black, and "Check every picture", the slow scan for grainy black screens.
-- "Restore default settings". This leaves your choice about originals as it is, and does not bring back the one-time question about the Recycle Bin or Trash.
+- "Folders with their own detection settings", once there are some, each with "Forget".
+- "Restore default settings". This leaves your choice about originals as it is, and does not bring back the one-time question about the Recycle Bin or Trash. It also forgets the settings remembered for folders.
 
 If the settings could not be loaded or saved, the reason is shown at the top of the section, with "Copy details".
+
+### Settings for one folder
+
+Videos from different sources need different detection settings: old tapes have grainy black screens, a screen recording has none. So a folder can have detection settings of its own. These are the black screen settings and, for missed scenes, how much to detect and the shortest scene.
+
+- A video is scanned with the settings remembered for the folder it is in. If that folder has none, it is scanned with the general settings, the ones in the Settings section.
+- Only the exact folder counts. A subfolder does not inherit the settings of the folder above it.
+- On the review screen, "Black screen settings" under the toolbar opens a card above the scenes with the black screen settings this video is scanned with. "Scenes missed?" shows the settings for missed scenes. Both say plainly whether these are the general settings or the ones remembered for the folder.
+- "Remember for this folder" keeps the settings as they are now for that folder. From then on, what you change on the review screen of one of its videos applies to that folder alone, and changes in the Settings section do not reach it.
+- "Use the general settings for this folder" forgets them again. So does "Forget" beside the folder in the Settings section.
+- While a folder has no settings of its own, changing a setting on the review screen changes the general one.
+- A changed setting applies the next time a video is scanned. Press "Scan again" to use it on the video you are looking at.
+
+The command line follows the same rule. See [Command line](#command-line).
 
 The app saves settings as you change them, to `scene_splitter/settings.json` in the settings folder (see [Where files are kept](#where-files-are-kept)). Changed detection settings apply to videos scanned from then on. The window and the command line share the file.
 
@@ -342,7 +388,9 @@ Only when all three pass does the original go to the Recycle Bin (the Trash on m
 
 **Dropped scenes.** ffmpeg cuts the whole video in one pass, so a split with dropped scenes first writes every scene into the `unfinished_` folder, the dropped ones too. It notes the size and checksum of every packet of each dropped scene, moves only the kept scenes to their names, and removes the rest with the folder. The check then joins, in scene order, the packets read back from the kept files and the packets noted for the dropped scenes, and compares the result with the original. It passes only when every kept file holds exactly the packets of its own stretch of the original. Such a split needs as much free room while it runs as a split of every scene. The original is always kept after it.
 
-**Cache.** The app stores each scan as a JSON file in the scan cache. It reuses a stored scan only when the video's path, size, modified time and the detection settings all match. The stored hard-cut data lets you change sensitivity and shortest scene later without another slow scan. If the system clears the temp folder, the only cost is a rescan.
+**Chapter marks.** `ffprobe` lists the chapters of the file with the scan. Each chapter start goes to the nearest keyframe. A start within one second of a cut the scan found, or one that lands on the same keyframe, joins that cut instead of adding another, so a chapter that begins at a black screen does not leave a scene of a few frames. A chapter that begins with the video adds no cut.
+
+**Cache.** The app stores each scan as a JSON file in the scan cache. It reuses a stored scan only when the video's path, size, modified time and the detection settings in force for that video all match. The stored hard-cut data lets you change sensitivity and shortest scene later without another slow scan. If the system clears the temp folder, the only cost is a rescan.
 
 ## Platforms
 
@@ -362,6 +410,7 @@ What differs between systems:
 - Scene files contain the first video stream and the audio streams. Other streams, such as subtitles or cover art, are not copied. An original that holds such streams fails verification on purpose, so it is never recycled.
 - A folder you add leaves out scene files from an earlier split only if they have the default name (`<video name>_scene_001`). With another name pattern, scene files in that folder are queued like any other video.
 - The player does not show which scenes are dropped. The review screen does.
+- Scene files do not carry chapters. An MP4 file written by ffmpeg keeps its chapters in a stream of their own, and other tools may do the same. That stream counts as one of the streams that are not copied. Such a video is split at its chapter marks like any other, but the check does not pass, so its original is kept. A Matroska (MKV) file keeps chapters beside its streams and passes the check.
 - The window has been run by hand on Windows only. See [Platforms](#platforms).
 
 ## Running the tests

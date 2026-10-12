@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::ScanSettings;
 use crate::export::{ExportOptions, OriginalPolicy};
+use crate::folder_settings::{
+    self, DetectionInUse, DetectionSettings, FolderSettings, SettingsScope,
+};
 use crate::folders;
 use crate::hardcut::HardCutSettings;
 
@@ -19,12 +22,18 @@ const SETTINGS_FILE: &str = "settings.json";
 
 /// A missing part of the file falls back to its default, so a file written
 /// by an older version keeps working.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// `scan` and `hard_cuts` are the general detection settings. A video in a
+/// folder listed in `folders` is scanned with that folder's instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub scan: ScanSettings,
     pub export: ExportOptions,
     pub hard_cuts: HardCutSettings,
+    /// The folders whose videos are scanned with settings of their own.
+    /// Empty in a file from before folders could have any.
+    pub folders: FolderSettings,
     /// Whether the review screen explains how to use it.
     pub show_tips: bool,
     /// Whether the person has already been asked what should happen to the
@@ -49,6 +58,7 @@ impl Default for Settings {
             scan: ScanSettings::default(),
             export: ExportOptions::default(),
             hard_cuts: HardCutSettings::default(),
+            folders: FolderSettings::default(),
             show_tips: true,
             recycling_question: RecyclingQuestion::NotAskedYet,
         }
@@ -56,10 +66,11 @@ impl Default for Settings {
 }
 
 /// One change to the settings, asked for on a screen that only draws them.
+/// Detection settings are not changed this way: whose they are depends on
+/// the video, so that change names its video (`change_detection_for`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettingsChange {
     ExportOptions(ExportOptions),
-    HardCuts(HardCutSettings),
     ShowTips,
     HideTips,
 }
@@ -121,6 +132,7 @@ impl Settings {
     }
 
     /// Every setting as it was at first, except what happens to originals.
+    /// What was remembered for folders is forgotten with the rest.
     ///
     /// That is the person's answer to a question, not a preference with a
     /// default: someone who said "keep the original" and later resets the
@@ -136,14 +148,80 @@ impl Settings {
     }
 
     /// The settings after one change the person made on a screen.
-    pub fn changed_by(mut self, change: SettingsChange) -> Self {
+    pub fn changed_by(&self, change: SettingsChange) -> Self {
+        let mut changed = self.clone();
         match change {
-            SettingsChange::ExportOptions(export) => self.export = export,
-            SettingsChange::HardCuts(hard_cuts) => self.hard_cuts = hard_cuts,
-            SettingsChange::ShowTips => self.show_tips = true,
-            SettingsChange::HideTips => self.show_tips = false,
+            SettingsChange::ExportOptions(export) => changed.export = export,
+            SettingsChange::ShowTips => changed.show_tips = true,
+            SettingsChange::HideTips => changed.show_tips = false,
         }
-        self
+        changed
+    }
+
+    /// The detection settings of videos whose folder has none of its own.
+    pub fn general_detection(&self) -> DetectionSettings {
+        DetectionSettings {
+            scan: self.scan,
+            hard_cuts: self.hard_cuts,
+        }
+    }
+
+    /// The detection settings a video is scanned with: those remembered for
+    /// its folder, else the general ones.
+    pub fn detection_for(&self, video: &Path) -> DetectionInUse {
+        match folder_settings::folder_of(video) {
+            Some(folder) => self.detection_for_folder(&folder),
+            // A path that names no folder has no folder to have settings.
+            None => self.general_detection_in_use(),
+        }
+    }
+
+    /// The detection settings of the videos directly inside `folder`.
+    pub fn detection_for_folder(&self, folder: &Path) -> DetectionInUse {
+        match self.folders.for_folder(folder) {
+            Some((remembered_folder, detection)) => DetectionInUse {
+                detection: *detection,
+                scope: SettingsScope::Folder(remembered_folder.to_path_buf()),
+            },
+            None => self.general_detection_in_use(),
+        }
+    }
+
+    fn general_detection_in_use(&self) -> DetectionInUse {
+        DetectionInUse {
+            detection: self.general_detection(),
+            scope: SettingsScope::General,
+        }
+    }
+
+    /// Keeps the detection settings in force for `video` now as the settings
+    /// of its folder, whatever the general ones become later.
+    pub fn remember_detection_for_folder_of(&mut self, video: &Path) {
+        let Some(folder) = folder_settings::folder_of(video) else {
+            return;
+        };
+        let in_force = self.detection_for_folder(&folder).detection;
+        self.folders.remember(&folder, in_force);
+    }
+
+    /// Forgets the settings of the folder `video` is in, so the general
+    /// ones apply to it again.
+    pub fn use_general_detection_for_folder_of(&mut self, video: &Path) {
+        if let Some(folder) = folder_settings::folder_of(video) {
+            self.folders.forget(&folder);
+        }
+    }
+
+    /// Changes the detection settings `video` is scanned with: those of its
+    /// folder when it has its own, and the general ones otherwise.
+    pub fn change_detection_for(&mut self, video: &Path, detection: DetectionSettings) {
+        match self.detection_for(video).scope {
+            SettingsScope::Folder(folder) => self.folders.remember(&folder, detection),
+            SettingsScope::General => {
+                self.scan = detection.scan;
+                self.hard_cuts = detection.hard_cuts;
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -154,12 +232,13 @@ impl Settings {
     /// Fails for values no scan could work with, whether they came from a
     /// hand-edited file or from the command line.
     pub fn validate(&self) -> Result<()> {
-        if let Err(problem) = self.scan.criteria.validate() {
+        if let Err(problem) = self.general_detection().validate() {
             bail!("{problem}");
         }
-        if !self.hard_cuts.min_scene_seconds.is_finite() || self.hard_cuts.min_scene_seconds <= 0.0
-        {
-            bail!("the shortest scene for hard cuts must be longer than zero");
+        for (folder, detection) in self.folders.iter() {
+            if let Err(problem) = detection.validate() {
+                bail!("in the settings for {}, {problem}", folder.display());
+            }
         }
         Ok(())
     }
@@ -398,19 +477,6 @@ mod tests {
         };
         let changed = before.changed_by(SettingsChange::ExportOptions(export));
         assert_eq!(changed, Settings { export, ..before });
-
-        let hard_cuts = HardCutSettings {
-            sensitivity: Sensitivity::Low,
-            min_scene_seconds: 600.0,
-        };
-        let changed = before.changed_by(SettingsChange::HardCuts(hard_cuts));
-        assert_eq!(
-            changed,
-            Settings {
-                hard_cuts,
-                ..before
-            }
-        );
     }
 
     #[test]
@@ -459,6 +525,192 @@ mod tests {
         let mut settings = Settings::default();
         settings.hard_cuts.min_scene_seconds = -1.0;
         assert!(settings.validate().is_err());
+    }
+
+    /// A video in a folder of films, and one in a folder of old tapes.
+    fn a_film() -> PathBuf {
+        std::env::temp_dir().join("films").join("film.mp4")
+    }
+
+    fn a_tape() -> PathBuf {
+        std::env::temp_dir().join("tapes").join("tape.mp4")
+    }
+
+    fn tapes_folder() -> PathBuf {
+        std::env::temp_dir().join("tapes")
+    }
+
+    /// Detection settings that suit grainy tapes and differ from the
+    /// defaults in both of their parts.
+    fn for_grainy_tapes() -> DetectionSettings {
+        let mut detection = DetectionSettings::default();
+        detection.scan.mode = ScanMode::EveryFrame;
+        detection.scan.criteria.max_dark_luma = 48;
+        detection.hard_cuts.sensitivity = Sensitivity::High;
+        detection
+    }
+
+    fn settings_with_tapes_remembered() -> Settings {
+        let mut settings = Settings::default();
+        settings
+            .folders
+            .remember(&tapes_folder(), for_grainy_tapes());
+        settings
+    }
+
+    #[test]
+    fn a_video_is_scanned_with_the_general_settings_unless_its_folder_has_its_own() {
+        let settings = settings_with_tapes_remembered();
+
+        assert_eq!(
+            settings.detection_for(&a_film()),
+            DetectionInUse {
+                detection: DetectionSettings::default(),
+                scope: SettingsScope::General,
+            }
+        );
+        assert_eq!(
+            settings.detection_for(&a_tape()),
+            DetectionInUse {
+                detection: for_grainy_tapes(),
+                scope: SettingsScope::Folder(tapes_folder()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_video_in_a_subfolder_is_scanned_with_the_general_settings() {
+        let settings = settings_with_tapes_remembered();
+        let in_a_subfolder = tapes_folder().join("1994").join("tape.mp4");
+        assert_eq!(
+            settings.detection_for(&in_a_subfolder).scope,
+            SettingsScope::General
+        );
+    }
+
+    #[test]
+    fn remembering_for_a_folder_keeps_the_settings_in_force_now() {
+        let mut settings = Settings::default();
+        settings.scan.criteria.min_seconds = 0.5;
+        settings.remember_detection_for_folder_of(&a_tape());
+        let remembered = settings.detection_for(&a_tape());
+        assert_eq!(remembered.scope, SettingsScope::Folder(tapes_folder()));
+        assert_eq!(remembered.detection.scan.criteria.min_seconds, 0.5);
+
+        // The general settings move on, the folder's stay.
+        settings.scan.criteria.min_seconds = 2.0;
+        assert_eq!(
+            settings
+                .detection_for(&a_tape())
+                .detection
+                .scan
+                .criteria
+                .min_seconds,
+            0.5
+        );
+        assert_eq!(
+            settings
+                .detection_for(&a_film())
+                .detection
+                .scan
+                .criteria
+                .min_seconds,
+            2.0
+        );
+    }
+
+    #[test]
+    fn remembering_again_does_not_replace_a_folders_settings_with_the_general_ones() {
+        let mut settings = settings_with_tapes_remembered();
+        settings.remember_detection_for_folder_of(&a_tape());
+        assert_eq!(
+            settings.detection_for(&a_tape()).detection,
+            for_grainy_tapes()
+        );
+    }
+
+    #[test]
+    fn using_the_general_settings_for_a_folder_forgets_its_own() {
+        let mut settings = settings_with_tapes_remembered();
+        settings.use_general_detection_for_folder_of(&a_tape());
+
+        assert_eq!(
+            settings.detection_for(&a_tape()).scope,
+            SettingsScope::General
+        );
+        assert!(settings.folders.is_empty());
+    }
+
+    #[test]
+    fn a_change_of_detection_goes_to_the_settings_the_video_is_scanned_with() {
+        let mut settings = settings_with_tapes_remembered();
+        let mut changed = for_grainy_tapes();
+        changed.hard_cuts.min_scene_seconds = 90.0;
+
+        // The tape's folder has its own settings, so those change.
+        settings.change_detection_for(&a_tape(), changed);
+        assert_eq!(settings.detection_for(&a_tape()).detection, changed);
+        assert_eq!(settings.general_detection(), DetectionSettings::default());
+
+        // The film's folder has none, so the general ones change.
+        settings.change_detection_for(&a_film(), changed);
+        assert_eq!(settings.general_detection(), changed);
+        assert_eq!(settings.scan, changed.scan);
+        assert_eq!(settings.hard_cuts, changed.hard_cuts);
+    }
+
+    #[test]
+    fn folder_settings_are_saved_and_come_back() {
+        let file = SettingsFile::for_test("folders_round_trip");
+        let settings = settings_with_tapes_remembered();
+        settings.save_to(&file.0).unwrap();
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
+    }
+
+    #[test]
+    fn a_file_from_before_folder_settings_loads_with_none() {
+        let file = SettingsFile::for_test("before_folders");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        // Every part an earlier version wrote, and nothing about folders.
+        std::fs::write(
+            &file.0,
+            r#"{
+                "scan": {"mode": "EveryFrame", "criteria":
+                    {"max_dark_luma": 40, "min_dark_fraction": 0.9, "min_seconds": 0.5}},
+                "export": {"scene_location": "NewFolder", "original_policy": "Keep"},
+                "hard_cuts": {"sensitivity": "High", "min_scene_seconds": 300.0},
+                "show_tips": false,
+                "recycling_question": "Answered"
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert!(loaded.folders.is_empty());
+        assert_eq!(loaded.scan.mode, ScanMode::EveryFrame);
+        assert_eq!(loaded.scan.criteria.max_dark_luma, 40);
+        assert_eq!(loaded.hard_cuts.min_scene_seconds, 300.0);
+        assert_eq!(
+            loaded.detection_for(&a_tape()).scope,
+            SettingsScope::General
+        );
+    }
+
+    #[test]
+    fn impossible_values_remembered_for_a_folder_are_refused_with_the_folder_named() {
+        let mut impossible = DetectionSettings::default();
+        impossible.scan.criteria.min_seconds = 0.0;
+        let mut settings = Settings::default();
+        settings.folders.remember(&tapes_folder(), impossible);
+
+        let problem = settings.validate().unwrap_err().to_string();
+        assert!(problem.contains("tapes"), "{problem}");
+    }
+
+    #[test]
+    fn restoring_the_defaults_forgets_what_was_remembered_for_folders() {
+        let restored = settings_with_tapes_remembered().restored_to_defaults();
+        assert!(restored.folders.is_empty());
     }
 
     #[test]
