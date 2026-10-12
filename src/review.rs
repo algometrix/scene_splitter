@@ -41,7 +41,7 @@ use crate::timecode::{format_clock, format_length, format_timestamp, TimeSpan};
 
 const NEW_CUT_FIELD_WIDTH: f32 = 90.0;
 /// The room the "Add a split at" label, box and button take together.
-const NEW_CUT_CONTROLS_WIDTH: f32 = 340.0;
+const ORIGINAL_STAYS_SUMMARY: &str = "The original stays where it is.";
 const PREVIEW_ROUNDING: f32 = 6.0;
 const SPACE_BETWEEN_SCENES: f32 = 10.0;
 const FILE_NAME_FONT_SIZE: f32 = 16.0;
@@ -599,9 +599,9 @@ impl ReviewScreen {
     /// if it is playing it.
     ///
     /// The header stays put and holds only what is needed all the time: the
-    /// name, the main action, the timeline and the editing buttons. The
-    /// numbers, hints and tips scroll with the scenes, so the scenes always
-    /// have room however small the window is.
+    /// name, the main action with what it does to the original, the timeline
+    /// and the editing buttons. Everything else scrolls with the scenes, so
+    /// the scenes have most of the window however small it is.
     ///
     /// `keyboard` says whether the keys pressed in this frame are this
     /// screen's to act on.
@@ -628,9 +628,7 @@ impl ReviewScreen {
         let asked_in_header = egui::TopBottomPanel::top("review_header")
             .frame(theme::header_panel(ctx))
             .show_separator_line(false)
-            .show(ctx, |ui| {
-                self.show_header(ui, session, settings, &detection, playhead)
-            })
+            .show(ctx, |ui| self.show_header(ui, session, settings, playhead))
             .inner;
         requests.extend(asked_in_header);
         let settings_card = self.black_screen_settings;
@@ -676,8 +674,8 @@ impl ReviewScreen {
         self.scroll_to_keys_list = self.keys_list == KeysList::Shown;
     }
 
-    /// The part that scrolls away above the scenes: the key numbers, what
-    /// deserves attention, the tips and the list of keys.
+    /// The part that scrolls away above the scenes: the options, the key
+    /// numbers, what deserves attention, the tips and the list of keys.
     fn show_overview(
         &mut self,
         ui: &mut egui::Ui,
@@ -686,7 +684,8 @@ impl ReviewScreen {
         detection: &DetectionInUse,
         settings_card: SettingsCard,
     ) -> Vec<ReviewRequest> {
-        let mut requests = show_notes(ui, session, detection, settings_card);
+        let mut requests = self.show_options(ui, session, settings, detection);
+        requests.extend(show_notes(ui, session, detection, settings_card));
         if settings.show_tips {
             match show_tips_card(ui, self.keys_list) {
                 TipsCard::HideAsked => {
@@ -714,40 +713,45 @@ impl ReviewScreen {
         ui: &mut egui::Ui,
         session: &ReviewSession,
         settings: &Settings,
-        detection: &DetectionInUse,
         playhead: Option<f64>,
     ) -> Vec<ReviewRequest> {
-        let palette = theme::palette(ui.ctx());
         let mut requests = Vec::new();
         requests.extend(show_title_and_main_action(ui, session));
+        show_what_the_split_will_do(ui, session, settings.export);
         requests.extend(show_export_obstacle(ui, session));
+        requests.extend(self.show_timeline(ui, session, playhead));
+        ui.horizontal_wrapped(|ui| {
+            requests.extend(show_merge_controls(ui, session));
+            requests.extend(show_undo_and_reset(ui, session));
+            if !settings.show_tips && ui.button("Show tips").clicked() {
+                requests.push(ReviewRequest::ChangeSettings(SettingsChange::ShowTips));
+            }
+        });
+        show_status_line(ui, session);
+        show_scene_list_note(ui, session);
+        requests.extend(show_rescan_consent(ui, session));
+        requests
+    }
+
+    /// The choices and the less used controls. They start the part that
+    /// scrolls, so they are in view when a review opens and out of the way
+    /// once the person works down the scenes.
+    fn show_options(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &ReviewSession,
+        settings: &Settings,
+        detection: &DetectionInUse,
+    ) -> Vec<ReviewRequest> {
+        let mut requests = Vec::new();
         requests.extend(show_export_options(
             ui,
             session.video(),
             settings.export,
             session.dropped_count(),
         ));
-        requests.extend(self.show_timeline(ui, session, playhead));
-        ui.horizontal_wrapped(|ui| {
-            requests.extend(show_merge_controls(ui, session));
-            requests.extend(show_undo_and_reset(ui, session));
-            ui.separator();
-            // The label, box and button stay together: when they do not all
-            // fit on this row they start the next one.
-            if ui.available_size_before_wrap().x < NEW_CUT_CONTROLS_WIDTH {
-                ui.end_row();
-            }
-            requests.extend(show_new_split_controls(ui, session));
-            if !settings.show_tips && ui.button("Show tips").clicked() {
-                requests.push(ReviewRequest::ChangeSettings(SettingsChange::ShowTips));
-            }
-        });
-        if let Some(refusal) = session.drop_refusal() {
-            ui.colored_label(palette.warning_text, refusal.to_string());
-        }
+        requests.extend(show_new_split_controls(ui, session));
         requests.extend(self.show_scan_row(ui, session, detection));
-        show_scene_list_note(ui, session);
-        requests.extend(show_rescan_consent(ui, session));
         requests
     }
 
@@ -760,9 +764,6 @@ impl ReviewScreen {
     ) -> Vec<ReviewRequest> {
         let mut requests = Vec::new();
         ui.horizontal_wrapped(|ui| {
-            // Same text size as the links beside it, so the line reads level.
-            ui.label(theme::muted(ui, session.scan_summary()))
-                .on_hover_text(session.scan_details());
             if session.chapter_split_count() > 0 {
                 let leave_out = whole_link(ui, LEAVE_OUT_CHAPTERS_LABEL)
                     .on_hover_text(LEAVE_OUT_CHAPTERS_EXPLANATION);
@@ -2154,7 +2155,6 @@ fn show_undo_and_reset(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
 }
 
 fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<ReviewRequest> {
-    let palette = theme::palette(ui.ctx());
     let mut requests = Vec::new();
     // One unit, so a narrow window wraps all three together.
     ui.horizontal(|ui| {
@@ -2178,21 +2178,69 @@ fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<Re
             requests.push(ReviewRequest::AddTypedSplit);
         }
     });
-    if let Some(feedback) = session.new_split_feedback() {
-        // A split that was not added is said in the colour of a warning, so
-        // it is not taken for one that was.
-        let words = if feedback.is_refusal() {
-            egui::RichText::new(feedback.in_words()).color(palette.warning_text)
-        } else {
-            theme::muted(ui, feedback.in_words())
-        };
-        ui.label(words);
-    }
     requests
 }
 
-/// The quiet way to save the list of scenes without splitting: a link that
-/// opens the three formats, then the system's dialog for where to save.
+/// One line that is always there, so the header keeps its height and the
+/// buttons under the pointer stay put when an action answers. It says what
+/// the last action came to, wherever the list is scrolled to, since the
+/// action may have been a key. With nothing to answer it says what the scan
+/// found.
+fn show_status_line(ui: &mut egui::Ui, session: &ReviewSession) {
+    let palette = theme::palette(ui.ctx());
+    let warning = |words: String| egui::RichText::new(words).color(palette.warning_text);
+    let (words, details) = if let Some(refusal) = session.drop_refusal() {
+        (warning(refusal.to_string()), None)
+    } else if let Some(feedback) = session.new_split_feedback() {
+        // A split that was not added is said in the colour of a warning, so
+        // it is not taken for one that was.
+        let words = if feedback.is_refusal() {
+            warning(feedback.in_words())
+        } else {
+            theme::muted(ui, feedback.in_words())
+        };
+        (words, None)
+    } else {
+        (
+            theme::muted(ui, session.scan_summary()),
+            Some(session.scan_details()),
+        )
+    };
+    let whole_text = words.text().to_owned();
+    let line = ui.add(egui::Label::new(words).truncate());
+    // The line is cut short in a narrow window, so the whole of it is one
+    // hover away.
+    line.on_hover_text(match details {
+        Some(details) => format!(
+            "{whole_text}
+{details}"
+        ),
+        None => whole_text,
+    });
+}
+
+/// One quiet line under the main action: what happens to the original and
+/// where the scenes go. The choices themselves scroll with the scenes, but
+/// what the split button will do has to be in view wherever the button is.
+fn show_what_the_split_will_do(ui: &mut egui::Ui, session: &ReviewSession, export: ExportOptions) {
+    let original =
+        match OriginalAlwaysKept::for_split(session.dropped_count(), export.cut_precision) {
+            Some(why) => why.in_plain_words().to_owned(),
+            None => match export.original_policy {
+                crate::export::OriginalPolicy::Keep => ORIGINAL_STAYS_SUMMARY.to_owned(),
+                crate::export::OriginalPolicy::RecycleOnceVerified => {
+                    format!("The original goes to the {TRASH_NAME} after the check.")
+                }
+            },
+        };
+    let summary = match split::scene_dir(session.video(), export.scene_location) {
+        Ok(folder) => format!("{original} Scenes go to {}", folder.display()),
+        Err(_) => original,
+    };
+    ui.add(egui::Label::new(theme::caption(ui, summary.clone())).truncate())
+        .on_hover_text(summary);
+}
+
 /// A link that starts the next row when this one has no room for all of it.
 /// Broken over two rows, one link reads as two.
 fn whole_link(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -2215,6 +2263,8 @@ fn start_next_row_unless_it_fits(ui: &mut egui::Ui, label: &str) {
     }
 }
 
+/// The quiet way to save the list of scenes without splitting: a link that
+/// opens the three formats, then the system's dialog for where to save.
 fn show_save_scene_list_menu(ui: &mut egui::Ui, video: &Path) -> Option<ReviewRequest> {
     let mut request = None;
     start_next_row_unless_it_fits(ui, SAVE_SCENE_LIST_LABEL);
@@ -3486,6 +3536,28 @@ mod tests {
         screen.press_ctrl_z();
         screen.press_ctrl_z();
         assert!(!screen.session.is_edited());
+    }
+
+    #[test]
+    fn the_header_leaves_most_of_the_smallest_window_to_the_scenes() {
+        // What is left of the smallest window, 900 by 600 points, beside
+        // the queue.
+        const SMALLEST_PANEL: egui::Vec2 = egui::vec2(600.0, 600.0);
+        const MOST_THE_HEADER_MAY_TAKE: f32 = 0.35;
+        let mut screen = Screen::showing(test_sessions::five_scenes(), SMALLEST_PANEL);
+        let header_height = screen.view.list_area.top();
+        assert!(
+            header_height <= SMALLEST_PANEL.y * MOST_THE_HEADER_MAY_TAKE,
+            "the header is {header_height} points high"
+        );
+
+        // An answer to an action does not make the header taller, or the
+        // button under the pointer would move away before the next click.
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert!(!screen.split_feedback().is_empty());
+        assert_eq!(screen.view.list_area.top(), header_height);
     }
 
     #[test]

@@ -129,8 +129,8 @@ You can also run it through Cargo: `cargo run --release -- <arguments>`.
    - "Earlier" and "Later", after "Move this split" in the row between two cards, move the split between those scenes to the next point where the video can be cut. With [exact cuts](#exact-cuts) on, they move it by one picture instead, since an exact cut can be on any picture. The line under the toolbar says the old and the new time. A split does not move onto or past the split beside it, into the parts of a merged scene, or to the ends of the video. The app says which of these stopped it.
    - "Drop this scene" on a card marks the scene as not to be written, for adverts or credits. X does the same for the selected scenes or, with none selected, for the scene with the thick frame. X again keeps them. A dropped scene turns grey, its card says "Dropped, not written" and offers "Keep this scene", and its timeline block is a grey outline that reads "Scene 2 dropped", or is struck through when there is no room. The other cards then say which file they become ("File 2 of 3"), because files are numbered without the dropped scenes. Merging a dropped scene with a kept one keeps the whole merged scene. Merging dropped scenes with each other leaves the result dropped. The app refuses to drop every scene.
    - Undo takes back the last change, a moved split or a dropped scene included. "Reset scenes" returns to the scenes as found, with moved splits back in place and every scene written.
-5. If the video has scene changes with no black screen, press "Scenes missed?" under the toolbar. Choose how much to detect (only obvious changes, most changes, or even subtle changes) and the shortest scene to allow, then press "Look for sudden picture changes". This scan looks at every picture and is much slower.
-6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
+5. If the video has scene changes with no black screen, press "Scenes missed?" in the row of links above the scenes. Choose how much to detect (only obvious changes, most changes, or even subtle changes) and the shortest scene to allow, then press "Look for sudden picture changes". This scan looks at every picture and is much slower.
+6. At the top of the list, above the scenes, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
 
    While any scene is dropped, the button reads "Split into 3 files, 1 scene dropped". While any scene is dropped or [exact cuts](#exact-cuts) are on, the original is always kept. See [When the original is always kept](#when-the-original-is-always-kept).
 7. When the split is done, the app shows whether the check passed and what happened to the original. "Open folder" shows the scene files.
@@ -141,7 +141,7 @@ If the scan could not read a stretch of the video, a note above the scenes says 
 
 The first time, a "How to use this screen" card sits above the scenes with three tips. "Hide tips" removes it, and Settings or "Show tips" brings it back. A scan or rescan asks first if it would throw away merges or splits you made.
 
-The window can be made as small as 900 by 600. Below the name and the toolbar, everything scrolls with the scenes. Only the scene cards in view are drawn, to keep a long list of scenes quick to scroll.
+The window can be made as small as 900 by 600. The name, the split buttons, a line that says what the split will do to the original, the timeline, the editing buttons and one status line stay at the top. Everything else scrolls with the scenes: the choices about the original and the folder, "Add a split at", and the row of links. Only the scene cards in view are drawn, to keep a long list of scenes quick to scroll.
 
 On a high-resolution screen the preview pictures and the player's picture are decoded larger, so they stay sharp.
 
@@ -160,7 +160,7 @@ In both cases the choice about the original on the review screen gives way to on
 
 ### Chapter marks
 
-If the video file has chapters, the scan reads them and offers each chapter start as a split, beside the ones it found itself. The line under the toolbar says how many splits come from chapter marks.
+If the video file has chapters, the scan reads them and offers each chapter start as a split, beside the ones it found itself. The status line under the toolbar says how many splits come from chapter marks.
 
 - A chapter mark is moved to the nearest point where the video can be cut (a keyframe).
 - If the chapter marks of a file cannot be read, the video is still scanned and can be split, without them. The line under the toolbar says that they could not be read, and they are looked for again the next time the video is added.
@@ -190,7 +190,7 @@ Click a ready video to see its page. It says how many files the split will write
 
 ### Scene list
 
-"Save the scene list", on the line under the toolbar, saves the scenes without splitting anything. Pick a format, then say where to save:
+"Save the scene list", in the row of links above the scenes, saves the scenes without splitting anything. Pick a format, then say where to save:
 
 | Format | What it holds |
 | --- | --- |
@@ -227,7 +227,7 @@ On macOS, use Cmd where this page says Ctrl.
 | F1 | Show or hide the list of keys |
 | Tab, Shift+Tab | Go through the buttons and boxes. Space or Enter presses the one that is marked, and Esc gives the keys back to the scenes |
 
-"Keys" on the line under the toolbar, "Show keys" on the tips card, and F1 show this list in the window, above the scenes.
+"Keys" in the row of links above the scenes, "Show keys" on the tips card, and F1 show this list in the window, above the scenes.
 
 While the player is open, Space and the plain Left and Right keys are the player's, and so are A, D and S, which the review does not use. Enter still plays the scene with the frame, and the other review keys work as before. While you type in a box, the keys are text. No key is used for two things on one screen.
 
@@ -366,7 +366,7 @@ A folder remembers only how scenes are found. How scenes are written is one choi
 
 - A video is scanned with the settings remembered for the folder it is in. If that folder has none, it is scanned with the general settings, the ones in the Settings section.
 - Only the exact folder counts. A subfolder does not inherit the settings of the folder above it.
-- On the review screen, "Black screen settings" under the toolbar opens a card above the scenes with the black screen settings this video is scanned with. "Scenes missed?" shows the settings for missed scenes. Both say plainly whether these are the general settings or the ones remembered for the folder.
+- On the review screen, "Black screen settings" in the row of links above the scenes opens a card above the scenes with the black screen settings this video is scanned with. "Scenes missed?" shows the settings for missed scenes. Both say plainly whether these are the general settings or the ones remembered for the folder.
 - "Remember these settings for this folder" keeps the black screen settings and the settings for missed scenes as they are now for that folder. From then on, what you change on the review screen of one of its videos applies to that folder alone, and changes in the Settings section do not reach it.
 - "Use the general settings for this folder" forgets them again. So does "Forget" beside the folder in the Settings section.
 - While a folder has no settings of its own, changing a setting on the review screen changes the general one.
