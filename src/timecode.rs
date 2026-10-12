@@ -68,6 +68,19 @@ pub fn format_length(seconds: f64) -> String {
     }
 }
 
+/// Formats a length of time that is only roughly known, as it follows the
+/// word "about": "50 s", "3 min 44 s", "1 h 52 min". From an hour on the
+/// seconds say nothing and are left out.
+pub fn format_rough_length(seconds: f64) -> String {
+    const SECONDS_PER_HOUR: f64 = 3600.0;
+    let whole_seconds = seconds.max(0.0).round();
+    if whole_seconds < SECONDS_PER_HOUR {
+        return format_length(seconds);
+    }
+    let total_minutes = (whole_seconds / SECONDS_PER_MINUTE).round() as u64;
+    format!("{} h {:02} min", total_minutes / 60, total_minutes % 60)
+}
+
 /// Reads "1:03:12", "63:12.5" or "3792" as seconds. Returns `None` for
 /// anything that is not a time.
 pub fn parse_timestamp(text: &str) -> Option<f64> {
@@ -140,6 +153,22 @@ mod tests {
         assert_eq!(format_length(224.0), "3 min 44 s");
         assert_eq!(format_length(3910.0), "1 h 05 min 10 s");
         assert_eq!(format_length(7719.0), "2 h 08 min 39 s");
+    }
+
+    #[test]
+    fn rough_lengths_leave_the_seconds_out_from_an_hour_on() {
+        assert_eq!(format_rough_length(50.0), "50 s");
+        assert_eq!(format_rough_length(224.0), "3 min 44 s");
+        assert_eq!(format_rough_length(3569.0), "59 min 29 s");
+        assert_eq!(format_rough_length(3600.0), "1 h 00 min");
+        assert_eq!(format_rough_length(6749.0), "1 h 52 min");
+        assert_eq!(format_rough_length(7190.0), "2 h 00 min");
+    }
+
+    #[test]
+    fn a_rough_length_that_rounds_to_an_hour_reads_as_an_hour() {
+        assert_eq!(format_rough_length(3580.0), "59 min 40 s");
+        assert_eq!(format_rough_length(3599.6), "1 h 00 min");
     }
 
     #[test]

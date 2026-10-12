@@ -21,6 +21,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -29,7 +30,7 @@ use crate::exact_cut::{
     plan_exact_cuts, CopyStart, ExactCutPlan, FfmpegTime, FrameTable, PartKind, PlanError,
     ScenePart, ScenePlan, StoredFrame, EXACT_CUT_SETTING,
 };
-use crate::exact_fallback::WhyNotExact;
+use crate::exact_fallback::{ExactCutLook, WhyNotExact};
 use crate::exact_verify::{self, ExactCutProof, VerifyError};
 use crate::fates::ScenesToWrite;
 use crate::ffmpeg::{
@@ -433,18 +434,27 @@ pub fn plan_of(input: &Path, cuts: &crate::scenes::CutTimes) -> Result<ExactCutP
     Ok(plan_exact_cuts(&table, cuts).map_err(ExactCutError::Plan)?)
 }
 
-/// Whether an exact cut of `input` can be tried, as far as that shows
-/// without listing its pictures: `None`, or why it cannot. For telling the
-/// person before the split what the split will do.
+/// Looks at `input` the way an exact split does before it writes anything,
+/// for telling the person before the split what the split will do: whether
+/// the video can be cut on exact pictures at all, and if so its pictures,
+/// from which the cut can be planned for any splits.
 ///
-/// Fails when the video or ffmpeg could not be asked. The split then finds
-/// the same trouble and reports it.
-pub fn why_no_exact_cut_at_a_glance(input: &Path) -> Result<Option<WhyNotExact>, ExactCutError> {
-    match refuse_what_is_known_at_a_glance(input, Encoder::LIBX264) {
-        Ok(_can_be_tried) => Ok(None),
+/// What shows at a glance is asked first, so a video that is refused there
+/// is known in a moment. Listing the pictures reads the index of an MP4 or
+/// MOV file, which takes a fraction of a second for minutes of video, and
+/// reads through a Matroska file from end to end. Never call this where a
+/// window is drawn.
+///
+/// A video or an ffmpeg that could not be asked is reported as one that
+/// can be tried. The split then finds the same trouble and says what it is.
+pub fn look_at_exact_cut(input: &Path) -> ExactCutLook {
+    let pictures = refuse_what_is_known_at_a_glance(input, Encoder::LIBX264)
+        .and_then(|_can_be_tried| read_frame_table(input));
+    match pictures {
+        Ok(pictures) => ExactCutLook::PicturesListed(Arc::new(pictures)),
         Err(refusal) => match refusal.calls_for_a_normal_cut() {
-            Some(why) => Ok(Some(why)),
-            None => Err(refusal),
+            Some(why_not_exact) => ExactCutLook::CannotBeCut(why_not_exact),
+            None => ExactCutLook::CanBeTried,
         },
     }
 }

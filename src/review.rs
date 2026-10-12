@@ -2074,8 +2074,9 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
 }
 
 /// Says before the split that this video will not be cut on the exact
-/// pictures, why, and how it will be cut instead. Nothing is shown for a
-/// video that can be, or while exact cuts are off.
+/// pictures, why, and how it will be cut instead, or that cutting it there
+/// encodes most of it again. Nothing is shown for a video that is cut as
+/// the person expects, or while exact cuts are off.
 fn show_exact_cut_notice(ui: &mut egui::Ui, session: &ReviewSession, cut_precision: CutPrecision) {
     let Some(notice) = session.exact_cut_notice_for(cut_precision) else {
         return;
@@ -4189,6 +4190,54 @@ mod tests {
             screen.right_edge_of_all_text()
         );
         assert_eq!(screen.view.scene_cards.len(), 5);
+    }
+
+    #[test]
+    fn a_video_that_is_mostly_encoded_again_says_so_above_the_split_in_the_smallest_window() {
+        let notice = "An exact cut encodes most of this video again (about 1 min 20 s of \
+                      1 min 40 s). That takes much longer than cutting at the nearest points \
+                      instead.";
+        let mut screen = Screen::showing(test_sessions::five_scenes(), SMALLEST_WINDOW_MAIN_PANEL);
+        let header_without_notice = screen.view.list_area.top();
+        screen
+            .session
+            .note_exact_cut_look(test_sessions::look_with_clean_starts_only_at(&[80]));
+
+        // With exact cuts off nothing is encoded again, so nothing is said.
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        assert_eq!(times_painted(&screen, notice), 0);
+
+        screen.settings.export.cut_precision = CutPrecision::ExactFrame;
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        assert_eq!(times_painted(&screen, notice), 1);
+        // It wraps inside the panel, and the scenes are all still there.
+        assert!(
+            screen.right_edge_of_all_text() <= SMALLEST_WINDOW_MAIN_PANEL.x,
+            "{}",
+            screen.right_edge_of_all_text()
+        );
+        assert_eq!(screen.view.scene_cards.len(), 5);
+
+        // The warning takes room from the scenes, but no more of it than
+        // the notice about a video that cannot be cut exactly.
+        let header_with_warning = screen.view.list_area.top();
+        assert!(header_with_warning > header_without_notice);
+        let mut other = Screen::showing(test_sessions::five_scenes(), SMALLEST_WINDOW_MAIN_PANEL);
+        other
+            .session
+            .note_exact_cut_look(crate::exact_fallback::ExactCutLook::CannotBeCut(
+                crate::exact_fallback::WhyNotExact::EncoderMissing,
+            ));
+        other.settings.export.cut_precision = CutPrecision::ExactFrame;
+        other.frame(Vec::new(), egui::Modifiers::NONE);
+        other.frame(Vec::new(), egui::Modifiers::NONE);
+        let header_with_the_other_notice = other.view.list_area.top();
+        assert!(
+            header_with_warning <= header_with_the_other_notice,
+            "{header_with_warning} against {header_with_the_other_notice}, \
+             {header_without_notice} without either"
+        );
     }
 
     #[test]

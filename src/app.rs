@@ -540,8 +540,9 @@ impl SceneSplitterApp {
 
     /// While exact cuts are on, the review says before the split when its
     /// video cannot be cut that way and will be cut at the nearest points
-    /// instead. That takes a look at the file, which is made once for each
-    /// review, in the background, when the review is first on show.
+    /// instead, and when cutting it that way encodes most of it again.
+    /// That takes a look at the file, which is made once for each review,
+    /// in the background, when the review is first on show.
     fn look_whether_the_video_on_show_can_be_cut_exactly(&mut self, ctx: &egui::Context) {
         if self.settings.export.cut_precision != CutPrecision::ExactFrame {
             return;
@@ -564,12 +565,9 @@ impl SceneSplitterApp {
         // without a result, the review is simply told nothing before the
         // split, and the video is not marked as failed over it.
         std::thread::spawn(move || {
-            let look = match exact_split::why_no_exact_cut_at_a_glance(&video) {
-                Ok(Some(why_not_exact)) => ExactCutLook::CannotBeCut(why_not_exact),
-                // A video that could not be looked at fails in the split
-                // itself, which says why.
-                Ok(None) | Err(_) => ExactCutLook::CanBeTried,
-            };
+            // Listing the pictures of a long video takes a while, which is
+            // why it happens here and not where the window is drawn.
+            let look = exact_split::look_at_exact_cut(&video);
             let event = JobEvent::ExactCutLookedAt(look);
             if updates_sender.send(JobUpdate { job, event }).is_ok() {
                 ctx.request_repaint();

@@ -423,12 +423,19 @@ impl ReviewSession {
     }
 
     /// What to tell the person before a split that cuts with `precision`:
-    /// that this video will not be cut on the exact pictures, and why. Only
-    /// while exact cuts are asked for and a look at the file found a reason.
+    /// that this video will not be cut on the exact pictures and why, or
+    /// that cutting it there encodes most of it again. Only while exact
+    /// cuts are asked for and a look at the file found something to tell.
+    ///
+    /// The notice is worked out from the splits as they are now each time
+    /// it is asked for, so it cannot fall behind them.
     pub fn exact_cut_notice_for(&self, precision: CutPrecision) -> Option<String> {
         match precision {
             CutPrecision::NearestKeyframe => None,
-            CutPrecision::ExactFrame => self.exact_cut_look.notice_before_the_split(),
+            CutPrecision::ExactFrame => self
+                .exact_cut_look
+                .forecast_for(&self.plan.accepted_cuts())
+                .notice_before_the_split(),
         }
     }
 
@@ -1128,6 +1135,30 @@ pub mod test_sessions {
         }
     }
 
+    /// What a look at the video of `five_scenes` says when it has listed
+    /// its pictures, 30 a second, and found that a copy can start only at
+    /// the start of the video and at these seconds.
+    pub fn look_with_clean_starts_only_at(clean_start_seconds: &[u32]) -> ExactCutLook {
+        use crate::exact_cut::{FrameTable, StoredFrame};
+        const PICTURES_A_SECOND: u32 = 30;
+        const VIDEO_SECONDS: u32 = 100;
+        let stored = (0..VIDEO_SECONDS * PICTURES_A_SECOND)
+            .map(|picture| {
+                let shown_at = f64::from(picture) / f64::from(PICTURES_A_SECOND);
+                let starts_a_second = picture % PICTURES_A_SECOND == 0;
+                let second = picture / PICTURES_A_SECOND;
+                StoredFrame {
+                    shown_at,
+                    decoded_at: Some(shown_at),
+                    reorder_ticks: Some(0),
+                    is_keyframe: starts_a_second
+                        && (second == 0 || clean_start_seconds.contains(&second)),
+                }
+            })
+            .collect();
+        ExactCutLook::PicturesListed(Arc::new(FrameTable::from_stored_order(stored).unwrap()))
+    }
+
     /// The folder the scenes of the test video go to, unless a test says
     /// otherwise.
     pub fn scene_dir() -> PathBuf {
@@ -1734,6 +1765,47 @@ mod tests {
             session.exact_cut_notice_for(CutPrecision::NearestKeyframe),
             None
         );
+    }
+
+    #[test]
+    fn a_video_that_is_mostly_encoded_again_says_so_and_the_notice_follows_the_splits() {
+        // The splits are at 20, 40, 60 and 80 s, and a copy can start only
+        // at 0 and 80 s: the first four scenes are encoded again.
+        let mut session = Session::five_scenes();
+        session
+            .0
+            .note_exact_cut_look(test_sessions::look_with_clean_starts_only_at(&[80]));
+        let notice = "An exact cut encodes most of this video again (about 1 min 20 s of \
+                      1 min 40 s). That takes much longer than cutting at the nearest points \
+                      instead.";
+        let notice_now =
+            |session: &Session| session.0.exact_cut_notice_for(CutPrecision::ExactFrame);
+        assert_eq!(notice_now(&session).as_deref(), Some(notice));
+        // With exact cuts off nothing is encoded, so there is nothing to say.
+        assert_eq!(
+            session
+                .0
+                .exact_cut_notice_for(CutPrecision::NearestKeyframe),
+            None
+        );
+
+        // The first four scenes become one, which leaves the split at 80 s:
+        // a copy can start there, and nothing is encoded again.
+        session.ask(ReviewRequest::MergeScenes(scene(0)..=scene(3)));
+        assert_eq!(session.scene_ends(), vec![80.0, 100.0]);
+        assert_eq!(notice_now(&session), None);
+
+        session.ask(ReviewRequest::Undo);
+        assert_eq!(notice_now(&session).as_deref(), Some(notice));
+    }
+
+    #[test]
+    fn a_video_whose_pictures_were_listed_and_is_cut_where_a_copy_can_start_has_no_notice() {
+        let mut session = test_sessions::five_scenes();
+        session.note_exact_cut_look(test_sessions::look_with_clean_starts_only_at(&[
+            20, 40, 60, 80,
+        ]));
+        assert_eq!(session.exact_cut_notice_for(CutPrecision::ExactFrame), None);
     }
 
     #[test]
