@@ -10,7 +10,7 @@ use crate::export::OriginalPolicy;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::scene_name::{PatternError, Placeholder, SceneNamePattern};
 use crate::split::SceneLocation;
-use crate::theme;
+use crate::theme::{self, ThemeChoice};
 use crate::timecode::SECONDS_PER_MINUTE;
 
 /// The range offered for the shortest scene a hard-cut scan may produce.
@@ -20,6 +20,10 @@ const SHORTEST_BLACK_SECONDS: std::ops::RangeInclusive<f64> = 0.05..=10.0;
 const BLACK_SHARE_PERCENT: std::ops::RangeInclusive<f64> = 50.0..=100.0;
 const PERCENT: f64 = 100.0;
 
+const THEME_LABEL: &str = "Colours";
+const THEME_EXPLANATION: &str =
+    "Light or dark. \"Same as the system\" changes with your computer's own setting.";
+const THEME_BOX_ID: &str = "settings_theme";
 const SCENE_NAME_LABEL: &str = "Name scene files";
 const SCENE_NAME_HINT_INTRODUCTION: &str =
     "What each scene file is called. The ending of the video's name, such as .mp4, is added. \
@@ -91,6 +95,7 @@ pub fn show_scene_name_box(
     draft: &mut SceneNameDraft,
     in_use: &mut SceneNamePattern,
 ) {
+    let palette = theme::palette(ui.ctx());
     if draft.in_step_with != *in_use {
         draft.show_again(*in_use);
     }
@@ -104,20 +109,20 @@ pub fn show_scene_name_box(
     }
     match draft.outcome() {
         Ok(example) => {
-            ui.add(egui::Label::new(theme::caption(format!("For example: {example}"))).wrap());
+            ui.add(egui::Label::new(theme::caption(ui, format!("For example: {example}"))).wrap());
         }
         Err(problem) => {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(problem.to_string()).color(theme::WARNING_TEXT),
+                    egui::RichText::new(problem.to_string()).color(palette.warning_text),
                 )
                 .wrap(),
             );
             ui.add(
-                egui::Label::new(theme::caption(format!(
-                    "{SCENE_NAME_REFUSED_NOTE} {}",
-                    in_use.example()
-                )))
+                egui::Label::new(theme::caption(
+                    ui,
+                    format!("{SCENE_NAME_REFUSED_NOTE} {}", in_use.example()),
+                ))
                 .wrap(),
             );
             // A box left with something unusable in it would go on showing
@@ -127,6 +132,19 @@ pub fn show_scene_name_box(
             }
         }
     }
+}
+
+/// Whether the window is light, dark, or as the system is, in the row the
+/// caller has opened. The window changes as soon as one is picked.
+pub fn show_theme_choice(ui: &mut egui::Ui, theme: &mut ThemeChoice) {
+    ui.label(THEME_LABEL).on_hover_text(THEME_EXPLANATION);
+    egui::ComboBox::from_id_salt(THEME_BOX_ID)
+        .selected_text(theme.label())
+        .show_ui(ui, |ui| {
+            for choice in ThemeChoice::ALL {
+                ui.selectable_value(theme, choice, choice.label());
+            }
+        });
 }
 
 /// How much the slow scan detects and the shortest scene it may leave, in

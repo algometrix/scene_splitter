@@ -1,7 +1,7 @@
 //! The choices a person makes once and expects the app to remember: how
-//! black screens are detected, how hard cuts are thinned, where scenes go
-//! and what their files are called. The window and the command line read
-//! the same file.
+//! black screens are detected, how hard cuts are thinned, where scenes go,
+//! what their files are called, and whether the window is light or dark.
+//! The window and the command line read the same file.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use crate::folder_settings::{
 };
 use crate::folders;
 use crate::hardcut::HardCutSettings;
+use crate::theme::ThemeChoice;
 
 const APP_FOLDER: &str = "scene_splitter";
 const SETTINGS_FILE: &str = "settings.json";
@@ -39,6 +40,9 @@ pub struct Settings {
     /// Whether the person has already been asked what should happen to the
     /// original of a video they split.
     pub recycling_question: RecyclingQuestion,
+    /// Whether the window is light, dark, or as the system is. A file from
+    /// before there was a choice follows the system.
+    pub theme: ThemeChoice,
 }
 
 /// The first split that would move an original to the Recycle Bin or Trash
@@ -61,6 +65,7 @@ impl Default for Settings {
             folders: FolderSettings::default(),
             show_tips: true,
             recycling_question: RecyclingQuestion::NotAskedYet,
+            theme: ThemeChoice::FollowSystem,
         }
     }
 }
@@ -322,6 +327,7 @@ mod tests {
         settings.hard_cuts.min_scene_seconds = 300.0;
         settings.show_tips = false;
         settings.recycling_question = RecyclingQuestion::Answered;
+        settings.theme = ThemeChoice::Dark;
         settings
     }
 
@@ -356,6 +362,44 @@ mod tests {
         assert_eq!(loaded.scan, ScanSettings::default());
         assert_eq!(loaded.hard_cuts, HardCutSettings::default());
         assert!(loaded.show_tips);
+    }
+
+    #[test]
+    fn a_file_from_before_the_dark_theme_follows_the_system() {
+        let file = SettingsFile::for_test("before_dark_theme");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(&file.0, SETTINGS_OF_AN_EARLIER_VERSION).unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.theme, ThemeChoice::FollowSystem);
+        assert!(!loaded.show_tips);
+    }
+
+    #[test]
+    fn every_theme_choice_is_saved_and_comes_back() {
+        let file = SettingsFile::for_test("theme_choice");
+        for theme in ThemeChoice::ALL {
+            let settings = Settings {
+                theme,
+                ..Settings::default()
+            };
+            settings.save_to(&file.0).unwrap();
+            assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
+        }
+    }
+
+    #[test]
+    fn a_theme_the_app_does_not_know_is_an_error() {
+        let file = SettingsFile::for_test("unknown_theme");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(&file.0, r#"{ "theme": "Sepia" }"#).unwrap();
+        assert!(Settings::load_from(&file.0).is_err());
+    }
+
+    #[test]
+    fn restoring_the_defaults_follows_the_system_again() {
+        let restored = changed_settings().restored_to_defaults();
+        assert_eq!(restored.theme, ThemeChoice::FollowSystem);
     }
 
     #[test]

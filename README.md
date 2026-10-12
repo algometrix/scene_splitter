@@ -85,6 +85,7 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 - **Verified before the original is removed.** After a split, the app checks every packet of the scene files against the original. Only then does it move the original to the Recycle Bin or Trash.
 - **Scan ahead.** Scan a whole folder from the command line, and review the results in the window later.
 - **No ffmpeg setup.** The app fetches ffmpeg on first run and checks it against a built-in checksum.
+- **Light and dark.** The window follows your system's light or dark setting, or stays in the one you choose.
 
 ![The player, with frame stepping and a split button](docs/player.png)
 
@@ -336,12 +337,24 @@ The Settings section is at the bottom of the left panel. It holds:
 - Whether scenes are written beside the video or in a new `<video name>_scenes` folder next to it.
 - "Name scene files": how scene files are named. See [Scene file names](#scene-file-names).
 - Whether the tips are shown on the review screen.
+- "Colours", under "How the window looks": "Same as the system", "Light" or "Dark". See [Light and dark](#light-and-dark).
 - For missed scenes: how much to detect, and the shortest scene to allow.
 - Under "Advanced: what counts as a black screen": the shortest black screen, how dark counts as black, how much of the picture must be black, and "Check every picture", the slow scan for grainy black screens.
 - "Folders with their own detection settings", once there are some, each with "Forget".
-- "Restore default settings". This leaves your choice about originals as it is, and does not bring back the one-time question about the Recycle Bin or Trash. It also forgets the settings remembered for folders.
+- "Restore default settings". This leaves your choice about originals as it is, and does not bring back the one-time question about the Recycle Bin or Trash. It also forgets the settings remembered for folders, and the window follows the system's light or dark setting again.
 
 If the settings could not be loaded or saved, the reason is shown at the top of the section, with "Copy details".
+
+### Light and dark
+
+"Colours" in the Settings section has three choices:
+
+- "Same as the system" is the default. The window is dark when your system is set to dark and light when it is set to light, and it changes when the system does. On a system that does not say which it prefers, the window is light.
+- "Light" and "Dark" keep the window that way whatever the system is set to.
+
+The window changes as soon as you pick one, with no restart, and the choice is saved with the other settings. A settings file from an earlier version has no such choice and follows the system.
+
+Both looks are made to be read: text has a contrast of at least 4.5 to 1 against whatever it is written on, and a scene keeps the same hue in both, lighter on the dark page, so "the orange scene" is orange in either. A video picture is always shown on black, as a film is.
 
 ### Settings for one folder
 

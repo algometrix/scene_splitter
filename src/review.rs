@@ -33,7 +33,7 @@ use crate::selection::ClickKind;
 use crate::settings::{Settings, SettingsChange};
 use crate::settings_controls;
 use crate::split;
-use crate::theme::{self, scene_color};
+use crate::theme::{self, CardTint};
 use crate::thumbnails::{self, PictureSize, Thumbnail};
 use crate::timecode::{format_clock, format_length, format_timestamp, TimeSpan};
 
@@ -45,8 +45,6 @@ const SPACE_BETWEEN_SCENES: f32 = 10.0;
 const FILE_NAME_FONT_SIZE: f32 = 16.0;
 const SCENE_LENGTH_FONT_SIZE: f32 = 16.0;
 
-const SELECTED_TINT_STRENGTH: f32 = 0.12;
-const WILL_MERGE_TINT_STRENGTH: f32 = 0.30;
 const CARD_COLOR_BAR_WIDTH: f32 = 6.0;
 const CARD_MARGIN: egui::Margin = egui::Margin {
     left: CARD_COLOR_BAR_WIDTH + 12.0,
@@ -158,12 +156,11 @@ const MOVE_SPLIT_ONE_PICTURE_LATER_HINT: &str =
      (Alt+Right on the lower scene). Cuts are exact, so the split can be on any picture.";
 
 /// The frame around the scene, and the picture, the keys act on. It is
-/// thicker and darker than any other outline on the screen, so it does not
-/// rest on colour alone.
+/// thicker and stronger than any other outline on the screen, so it does
+/// not rest on colour alone.
 const FOCUS_RING_WIDTH: f32 = 3.0;
-const FOCUS_RING_COLOR: egui::Color32 = theme::TEXT;
-/// A light line inside the dark one, which keeps the frame visible around a
-/// dark picture.
+/// A line of the opposite lightness inside the frame, which keeps the frame
+/// visible around a picture of its own lightness.
 const PICTURE_FOCUS_INNER_WIDTH: f32 = 2.0;
 /// Room kept around a focused picture that is scrolled into view.
 const FOCUSED_PICTURE_MARGIN: f32 = 8.0;
@@ -585,6 +582,7 @@ impl ReviewScreen {
         playhead: Option<f64>,
         keyboard: KeyboardOwner,
     ) -> Vec<ReviewRequest> {
+        let palette = theme::palette(ctx);
         self.decode_previews_for_the_sharpness_of_the_screen(ctx);
         self.receive_loaded_previews(ctx);
         let mut requests = shortcut_requests(ctx, keyboard);
@@ -597,7 +595,7 @@ impl ReviewScreen {
         let detection = settings.detection_for(session.video());
 
         let asked_in_header = egui::TopBottomPanel::top("review_header")
-            .frame(theme::header_panel())
+            .frame(theme::header_panel(ctx))
             .show_separator_line(false)
             .show(ctx, |ui| {
                 self.show_header(ui, session, settings, &detection, playhead)
@@ -610,7 +608,7 @@ impl ReviewScreen {
         }
 
         let (asked_in_overview, input) = egui::CentralPanel::default()
-            .frame(theme::panel(theme::BACKGROUND))
+            .frame(theme::panel(palette.page))
             .show(ctx, |ui| {
                 self.list_area = ui.max_rect();
                 egui::ScrollArea::vertical()
@@ -688,6 +686,7 @@ impl ReviewScreen {
         detection: &DetectionInUse,
         playhead: Option<f64>,
     ) -> Vec<ReviewRequest> {
+        let palette = theme::palette(ui.ctx());
         let mut requests = Vec::new();
         requests.extend(show_title_and_main_action(ui, session));
         requests.extend(show_export_obstacle(ui, session));
@@ -713,7 +712,7 @@ impl ReviewScreen {
             }
         });
         if let Some(refusal) = session.drop_refusal() {
-            ui.colored_label(theme::WARNING_TEXT, refusal.to_string());
+            ui.colored_label(palette.warning_text, refusal.to_string());
         }
         requests.extend(self.show_scan_row(ui, session, detection));
         show_scene_list_note(ui, session);
@@ -731,7 +730,7 @@ impl ReviewScreen {
         let mut requests = Vec::new();
         ui.horizontal_wrapped(|ui| {
             // Same text size as the links beside it, so the line reads level.
-            ui.label(theme::muted(session.scan_summary()))
+            ui.label(theme::muted(ui, session.scan_summary()))
                 .on_hover_text(session.scan_details());
             if session.chapter_split_count() > 0 {
                 let leave_out = ui
@@ -799,6 +798,7 @@ impl ReviewScreen {
         session: &ReviewSession,
         playhead: Option<f64>,
     ) -> Option<ReviewRequest> {
+        let palette = theme::palette(ui.ctx());
         let plan = session.plan();
         let whole_video = plan.whole_video();
         let layouts = plan.scene_layouts();
@@ -824,12 +824,12 @@ impl ReviewScreen {
             // A faint line where two detected pieces were merged.
             for &cut_index in &layout.merged_cuts {
                 let cut_x = x_at_time(plan.cut_time(cut_index), whole_video, bar.x_range());
-                let line = egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(140));
+                let line = egui::Stroke::new(1.0_f32, palette.faint_on_fill);
                 painter.vline(cut_x, block.y_range(), line);
             }
         }
         if let Some(playhead) = playhead {
-            let line = egui::Stroke::new(PLAYHEAD_WIDTH, theme::TEXT);
+            let line = egui::Stroke::new(PLAYHEAD_WIDTH, palette.text);
             let playhead_x = x_at_time(playhead, whole_video, bar.x_range());
             painter.vline(playhead_x, bar.y_range(), line);
         }
@@ -1023,6 +1023,7 @@ impl ReviewScreen {
         drop_target: Option<SceneIndex>,
         input: &mut SceneListInput,
     ) -> egui::Rect {
+        let palette = theme::palette(ui.ctx());
         let SceneCard {
             scene,
             layout,
@@ -1031,9 +1032,9 @@ impl ReviewScreen {
         // A dropped scene gives up its colour, on its card as on the
         // timeline, and says in words that it is not written.
         let (own_color, plain_fill) = if fate.is_dropped() {
-            (theme::DROPPED, theme::DROPPED_FILL)
+            (palette.dropped, palette.dropped_fill)
         } else {
-            (scene_color(scene.position()), theme::CARD)
+            (palette.scene_color(scene.position()), palette.card)
         };
         let (color, fill, outline) = match self.highlight(session, scene, drop_target) {
             Highlight::None => {
@@ -1041,22 +1042,22 @@ impl ReviewScreen {
                 (
                     color,
                     plain_fill,
-                    egui::Stroke::new(1.0_f32, theme::CARD_BORDER),
+                    egui::Stroke::new(1.0_f32, palette.card_border),
                 )
             }
             Highlight::Selected => {
                 let color = own_color;
                 (
                     color,
-                    tinted_card(color, SELECTED_TINT_STRENGTH),
+                    palette.tinted_card(color, CardTint::Selected),
                     egui::Stroke::new(2.0_f32, color),
                 )
             }
             Highlight::WillMerge { first_scene } => {
-                let color = scene_color(first_scene.position());
+                let color = palette.scene_color(first_scene.position());
                 (
                     color,
-                    tinted_card(color, WILL_MERGE_TINT_STRENGTH),
+                    palette.tinted_card(color, CardTint::WillMerge),
                     egui::Stroke::new(2.0_f32, color),
                 )
             }
@@ -1070,7 +1071,7 @@ impl ReviewScreen {
             .fill(fill)
             .rounding(theme::CARD_ROUNDING)
             .stroke(outline)
-            .shadow(theme::soft_shadow())
+            .shadow(palette.soft_shadow())
             .inner_margin(CARD_MARGIN)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1187,7 +1188,7 @@ impl ReviewScreen {
             }
             if layout.is_merged() {
                 ui.vertical(|ui| {
-                    ui.label(theme::muted(format_length(segment.seconds())));
+                    ui.label(theme::muted(ui, format_length(segment.seconds())));
                     if show_move_out_button(ui) {
                         input.segment_to_isolate = Some(layout.segment_index(position_in_scene));
                     }
@@ -1493,24 +1494,29 @@ fn paint_timeline_block(
     scene: SceneIndex,
     layout: &SceneLayout,
 ) {
-    painter.rect_filled(block, TIMELINE_ROUNDING, scene_color(scene.position()));
+    let palette = theme::palette(painter.ctx());
+    painter.rect_filled(
+        block,
+        TIMELINE_ROUNDING,
+        palette.scene_color(scene.position()),
+    );
     if is_long_scene(layout.span) {
-        let outline = egui::Stroke::new(LONG_SCENE_OUTLINE_WIDTH, theme::DANGER);
+        let outline = egui::Stroke::new(LONG_SCENE_OUTLINE_WIDTH, palette.danger);
         painter.rect_stroke(block, TIMELINE_ROUNDING, outline);
     }
     if block.width() < TIMELINE_MIN_LABELLED_WIDTH {
         return;
     }
-    let white = egui::Color32::WHITE;
+    let on_fill = palette.on_fill;
     let heavier = theme::semibold_font(TIMELINE_LABEL_FONT_SIZE);
-    let name = painter.layout_no_wrap(scene_name(scene), heavier.clone(), white);
-    let number = painter.layout_no_wrap(scene.number().to_string(), heavier, white);
+    let name = painter.layout_no_wrap(scene_name(scene), heavier.clone(), on_fill);
+    let number = painter.layout_no_wrap(scene.number().to_string(), heavier, on_fill);
     // Lighter than the name, so the two read as a name and a figure and not
     // as one run of numbers.
     let lighter = egui::FontId::proportional(TIMELINE_LABEL_FONT_SIZE);
     let seconds = layout.span.seconds();
-    let length = painter.layout_no_wrap(format_length(seconds), lighter.clone(), white);
-    let short_length = painter.layout_no_wrap(format_clock(seconds), lighter, white);
+    let length = painter.layout_no_wrap(format_length(seconds), lighter.clone(), on_fill);
+    let short_length = painter.layout_no_wrap(format_clock(seconds), lighter, on_fill);
     let widths = TimelineLabelWidths {
         name: name.size().x,
         length: length.size().x,
@@ -1518,7 +1524,7 @@ fn paint_timeline_block(
         number: number.size().x,
     };
     let paint_centred = |text: std::sync::Arc<egui::Galley>| {
-        painter.galley(block.center() - text.size() / 2.0, text, white);
+        painter.galley(block.center() - text.size() / 2.0, text, on_fill);
     };
     let paint_name_with = |length: std::sync::Arc<egui::Galley>| {
         let both = widths.name + TIMELINE_LABEL_GAP + length.size().x;
@@ -1526,9 +1532,9 @@ fn paint_timeline_block(
         let length_left = left + widths.name + TIMELINE_LABEL_GAP;
         let middle = block.center().y;
         let name_top = middle - name.size().y / 2.0;
-        painter.galley(egui::pos2(left, name_top), name.clone(), white);
+        painter.galley(egui::pos2(left, name_top), name.clone(), on_fill);
         let length_top = middle - length.size().y / 2.0;
-        painter.galley(egui::pos2(length_left, length_top), length, white);
+        painter.galley(egui::pos2(length_left, length_top), length, on_fill);
     };
     match timeline_label(widths, block.width()) {
         TimelineLabel::NameAndLength => paint_name_with(length),
@@ -1544,8 +1550,9 @@ fn paint_timeline_block(
 /// for it. A block too narrow for the word is struck through instead, so
 /// the difference never rests on colour alone.
 fn paint_dropped_timeline_block(painter: &egui::Painter, block: egui::Rect, scene: SceneIndex) {
-    let outline = egui::Stroke::new(1.0_f32, theme::DROPPED);
-    painter.rect_filled(block, TIMELINE_ROUNDING, theme::DROPPED_FILL);
+    let palette = theme::palette(painter.ctx());
+    let outline = egui::Stroke::new(1.0_f32, palette.dropped);
+    painter.rect_filled(block, TIMELINE_ROUNDING, palette.dropped_fill);
     painter.rect_stroke(block, TIMELINE_ROUNDING, outline);
     if block.width() >= TIMELINE_MIN_LABELLED_WIDTH {
         let font = theme::semibold_font(TIMELINE_LABEL_FONT_SIZE);
@@ -1554,9 +1561,9 @@ fn paint_dropped_timeline_block(painter: &egui::Painter, block: egui::Rect, scen
             DROPPED_SHORT_LABEL.to_owned(),
         ];
         for label in labels {
-            let text = painter.layout_no_wrap(label, font.clone(), theme::MUTED_TEXT);
+            let text = painter.layout_no_wrap(label, font.clone(), palette.muted_text);
             if label_fits(text.size().x, block.width()) {
-                painter.galley(block.center() - text.size() / 2.0, text, theme::MUTED_TEXT);
+                painter.galley(block.center() - text.size() / 2.0, text, palette.muted_text);
                 return;
             }
         }
@@ -1634,20 +1641,22 @@ fn shows_part_of(rows: &[PartRow], picture: PicturePosition) -> bool {
 
 /// Frames what the keys act on, just outside its own edge.
 fn paint_focus_ring(painter: &egui::Painter, around: egui::Rect, rounding: f32) {
+    let palette = theme::palette(painter.ctx());
     let half_width = FOCUS_RING_WIDTH / 2.0;
     painter.rect_stroke(
         around.expand(half_width),
         rounding + half_width,
-        egui::Stroke::new(FOCUS_RING_WIDTH, FOCUS_RING_COLOR),
+        egui::Stroke::new(FOCUS_RING_WIDTH, palette.focus_ring),
     );
 }
 
 fn paint_picture_focus(painter: &egui::Painter, picture: egui::Rect) {
+    let palette = theme::palette(painter.ctx());
     let half_width = PICTURE_FOCUS_INNER_WIDTH / 2.0;
     painter.rect_stroke(
         picture.shrink(half_width),
         PREVIEW_ROUNDING,
-        egui::Stroke::new(PICTURE_FOCUS_INNER_WIDTH, egui::Color32::WHITE),
+        egui::Stroke::new(PICTURE_FOCUS_INNER_WIDTH, palette.focus_ring_inner),
     );
     paint_focus_ring(painter, picture, PREVIEW_ROUNDING);
 }
@@ -1807,7 +1816,7 @@ fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Opt
             let label = split_button_label(scene_count - dropped_count, dropped_count);
             // One scene is the untouched video, there is nothing to write.
             let export_button = ui
-                .add_enabled(scene_count > 1, theme::primary_button(label))
+                .add_enabled(scene_count > 1, theme::primary_button(ui, label))
                 .on_hover_text(SPLIT_HINT)
                 .on_disabled_hover_text("There is only one scene, so there is nothing to split.");
             if export_button.clicked() {
@@ -1866,6 +1875,7 @@ fn original_always_kept_hint(why: OriginalAlwaysKept) -> String {
 
 /// Why the split has not started, with the way past it when there is one.
 fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    let palette = theme::palette(ui.ctx());
     let mut request = None;
     match session.export_obstacle()? {
         ExportObstacle::EarlierSceneFiles(earlier_files) => {
@@ -1874,9 +1884,9 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
                 counted(earlier_files.file_count, "scene file")
             );
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(theme::WARNING_TEXT, warning)
+                ui.colored_label(palette.warning_text, warning)
                     .on_hover_text(format!("They are in {}", earlier_files.scene_dir.display()));
-                if ui.add(theme::danger_button("Replace them")).clicked() {
+                if ui.add(theme::danger_button(ui, "Replace them")).clicked() {
                     // The answer is for the files in this folder and no other.
                     request = Some(ReviewRequest::ReplaceEarlierFiles {
                         scene_dir: earlier_files.scene_dir.clone(),
@@ -1887,7 +1897,7 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
         ExportObstacle::CouldNotCheck(problem) => {
             ui.horizontal_wrapped(|ui| {
                 ui.add(theme::selectable(
-                    egui::RichText::new(problem).color(theme::DANGER),
+                    egui::RichText::new(problem).color(palette.danger),
                 ));
                 theme::copy_details_button(ui, problem);
             });
@@ -1915,7 +1925,7 @@ fn show_export_options(
         // gives way to saying so, before the split.
         match OriginalAlwaysKept::for_split(dropped_count, export_options.cut_precision) {
             Some(why) => {
-                ui.label(theme::muted(why.in_plain_words()))
+                ui.label(theme::muted(ui, why.in_plain_words()))
                     .on_hover_text(original_always_kept_hint(why));
             }
             None => {
@@ -1938,7 +1948,7 @@ fn show_export_options(
             let destination = dir.display().to_string();
             ui.add(
                 // Body size, so it lines up with the checkbox text before it.
-                egui::Label::new(theme::muted(format!("Scenes go to {destination}"))).truncate(),
+                egui::Label::new(theme::muted(ui, format!("Scenes go to {destination}"))).truncate(),
             )
             .on_hover_text(destination);
         }
@@ -2004,6 +2014,7 @@ fn show_undo_and_reset(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
 }
 
 fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<ReviewRequest> {
+    let palette = theme::palette(ui.ctx());
     let mut requests = Vec::new();
     // One unit, so a narrow window wraps all three together.
     ui.horizontal(|ui| {
@@ -2031,9 +2042,9 @@ fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<Re
         // A split that was not added is said in the colour of a warning, so
         // it is not taken for one that was.
         let words = if feedback.is_refusal() {
-            egui::RichText::new(feedback.in_words()).color(theme::WARNING_TEXT)
+            egui::RichText::new(feedback.in_words()).color(palette.warning_text)
         } else {
-            theme::muted(feedback.in_words())
+            theme::muted(ui, feedback.in_words())
         };
         ui.label(words);
     }
@@ -2096,20 +2107,24 @@ fn scene_list_file_name(video: &Path, format: SceneListFormat) -> String {
 
 /// How the last saving of the scene list went.
 fn show_scene_list_note(ui: &mut egui::Ui, session: &ReviewSession) {
+    let palette = theme::palette(ui.ctx());
     match session.scene_list_note() {
         None => {}
         Some(SceneListNote::Saved(path)) => {
             let saved_to = path.display().to_string();
             ui.add(
-                egui::Label::new(theme::muted(format!("Saved the scene list to {saved_to}")))
-                    .truncate(),
+                egui::Label::new(theme::muted(
+                    ui,
+                    format!("Saved the scene list to {saved_to}"),
+                ))
+                .truncate(),
             )
             .on_hover_text(saved_to);
         }
         Some(SceneListNote::NotSaved(reason)) => {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(theme::WARNING_TEXT, SCENE_LIST_NOT_SAVED);
-                ui.add(theme::selectable(theme::caption(reason)));
+                ui.colored_label(palette.warning_text, SCENE_LIST_NOT_SAVED);
+                ui.add(theme::selectable(theme::caption(ui, reason)));
                 theme::copy_details_button(ui, reason);
             });
         }
@@ -2118,13 +2133,17 @@ fn show_scene_list_note(ui: &mut egui::Ui, session: &ReviewSession) {
 
 /// Asks before a scan throws away the person's edits.
 fn show_rescan_consent(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    let palette = theme::palette(ui.ctx());
     if !session.is_asking_before_rescan() {
         return None;
     }
     let mut request = None;
     ui.horizontal_wrapped(|ui| {
-        ui.colored_label(theme::WARNING_TEXT, RESCAN_WARNING);
-        if ui.add(theme::danger_button("Scan again anyway")).clicked() {
+        ui.colored_label(palette.warning_text, RESCAN_WARNING);
+        if ui
+            .add(theme::danger_button(ui, "Scan again anyway"))
+            .clicked()
+        {
             request = Some(ReviewRequest::RescanAnyway);
         }
         if ui.button("Cancel").clicked() {
@@ -2142,6 +2161,7 @@ fn show_notes(
     detection: &DetectionInUse,
     settings_card: SettingsCard,
 ) -> Vec<ReviewRequest> {
+    let palette = theme::palette(ui.ctx());
     let plan = session.plan();
     let mut requests = Vec::new();
     if settings_card != SettingsCard::Hidden {
@@ -2158,7 +2178,7 @@ fn show_notes(
         )));
     }
     for stretch in session.undecoded() {
-        show_note(ui, &undecoded_warning(stretch), theme::ROSE_TILE);
+        show_note(ui, &undecoded_warning(stretch), palette.rose_tile);
     }
     for (position, span) in plan.scenes().into_iter().enumerate() {
         if is_long_scene(span) {
@@ -2167,7 +2187,7 @@ fn show_notes(
                 SceneIndex::new(position).number(),
                 format_length(span.seconds())
             );
-            show_note(ui, &warning, theme::ROSE_TILE);
+            show_note(ui, &warning, palette.rose_tile);
         }
     }
     requests
@@ -2185,13 +2205,13 @@ fn show_black_screen_settings_card(
 ) -> (egui::Rect, Vec<ReviewRequest>) {
     let mut requests = Vec::new();
     let mut wanted = in_use.detection.scan;
-    let card = theme::card()
+    let card = theme::card(ui)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(theme::semibold(BLACK_SCREEN_SETTINGS_HEADING, 14.0));
             requests.extend(show_settings_scope(ui, video, &in_use.scope));
             settings_controls::show_black_screen_controls(ui, &mut wanted);
-            ui.label(theme::caption(BLACK_SCREEN_SETTINGS_APPLY_NOTE));
+            ui.label(theme::caption(ui, BLACK_SCREEN_SETTINGS_APPLY_NOTE));
         })
         .response
         .rect;
@@ -2214,7 +2234,7 @@ fn show_settings_scope(
     let mut request = None;
     ui.horizontal_wrapped(|ui| match scope {
         SettingsScope::General => {
-            ui.label(theme::muted(GENERAL_SETTINGS_IN_USE));
+            ui.label(theme::muted(ui, GENERAL_SETTINGS_IN_USE));
             let folder = folder_settings::folder_of(video)
                 .map(|folder| folder.display().to_string())
                 .unwrap_or_default();
@@ -2229,7 +2249,7 @@ fn show_settings_scope(
         }
         SettingsScope::Folder(folder) => {
             let folder = folder.display().to_string();
-            ui.label(theme::muted(FOLDER_SETTINGS_IN_USE))
+            ui.label(theme::muted(ui, FOLDER_SETTINGS_IN_USE))
                 .on_hover_text(&folder);
             let use_general = ui.button(USE_GENERAL_SETTINGS_LABEL).on_hover_text(format!(
                 "Forgets the detection settings remembered for {folder}. \
@@ -2268,6 +2288,7 @@ fn undecoded_warning(stretch: &UndecodedFrames) -> String {
 /// The numbers a person wants at a glance: how many scenes the split would
 /// write, how long the video is, and how long its longest scene is.
 fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
+    let palette = theme::palette(ui.ctx());
     let scenes = plan.scenes();
     let piece_count = plan.segments().len();
     let longest_scene = scenes
@@ -2280,21 +2301,21 @@ fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
         ui,
         &scenes.len().to_string(),
         scene_noun,
-        theme::MINT_TILE,
-        theme::TEXT,
+        palette.mint_tile,
+        palette.text,
     );
     theme::stat_tile(
         ui,
         &format_length(plan.whole_video().seconds()),
         "whole video",
-        theme::LAVENDER_TILE,
-        theme::TEXT,
+        palette.lavender_tile,
+        palette.text,
     );
     if let Some(longest) = longest_scene {
         let (tint, value_color) = if is_long_scene(longest) {
-            (theme::ROSE_TILE, theme::DANGER)
+            (palette.rose_tile, palette.danger)
         } else {
-            (theme::PEACH_TILE, theme::TEXT)
+            (palette.peach_tile, palette.text)
         };
         theme::stat_tile(
             ui,
@@ -2310,8 +2331,8 @@ fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
             ui,
             &dropped_count.to_string(),
             DROPPED_TILE_CAPTION,
-            theme::DROPPED_FILL,
-            theme::MUTED_TEXT,
+            palette.dropped_fill,
+            palette.muted_text,
         );
     }
     if piece_count > scenes.len() {
@@ -2319,8 +2340,8 @@ fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
             ui,
             &piece_count.to_string(),
             "parts, merged into these scenes",
-            theme::BACKGROUND,
-            theme::MUTED_TEXT,
+            palette.page,
+            palette.muted_text,
         );
     }
 }
@@ -2337,8 +2358,9 @@ enum TipsCard {
 /// How to use the review screen, for someone seeing it for the first time.
 /// It scrolls away with the scenes, can be hidden, and the choice is kept.
 fn show_tips_card(ui: &mut egui::Ui, keys_list: KeysList) -> TipsCard {
+    let palette = theme::palette(ui.ctx());
     let mut tips_card = TipsCard::Kept;
-    theme::card().show(ui, |ui| {
+    theme::card(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(theme::semibold("How to use this screen", 14.0));
@@ -2370,7 +2392,7 @@ fn show_tips_card(ui: &mut egui::Ui, keys_list: KeysList) -> TipsCard {
             .max_col_width(room_for_a_tip)
             .show(ui, |ui| {
                 for (topic, tip) in TIPS {
-                    ui.label(theme::semibold(topic, 13.0).color(theme::PRIMARY));
+                    ui.label(theme::semibold(topic, 13.0).color(palette.primary));
                     ui.add(egui::Label::new(tip).wrap());
                     ui.end_row();
                 }
@@ -2389,8 +2411,9 @@ struct KeysCard {
 /// Every key of the review screen with what it does, for a person who
 /// reviews without the mouse.
 fn show_keys_card(ui: &mut egui::Ui) -> KeysCard {
+    let palette = theme::palette(ui.ctx());
     let mut hide_asked = false;
-    let card = theme::card().show(ui, |ui| {
+    let card = theme::card(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(theme::semibold(KEYS_HEADING, 14.0));
@@ -2398,7 +2421,7 @@ fn show_keys_card(ui: &mut egui::Ui) -> KeysCard {
                 hide_asked = ui.button(HIDE_KEYS_LABEL).clicked();
             });
         });
-        ui.add(egui::Label::new(theme::muted(KEYS_INTRODUCTION)).wrap());
+        ui.add(egui::Label::new(theme::muted(ui, KEYS_INTRODUCTION)).wrap());
         let room_for_an_action =
             (ui.available_width() - KEY_NAME_WIDTH - TIP_COLUMN_GAP).max(MIN_TIP_WIDTH);
         egui::Grid::new("keys")
@@ -2409,7 +2432,7 @@ fn show_keys_card(ui: &mut egui::Ui) -> KeysCard {
             .max_col_width(room_for_an_action)
             .show(ui, |ui| {
                 for (key, action) in KEYS {
-                    ui.label(theme::semibold(key, 13.0).color(theme::PRIMARY));
+                    ui.label(theme::semibold(key, 13.0).color(palette.primary));
                     ui.add(egui::Label::new(action).wrap());
                     ui.end_row();
                 }
@@ -2432,21 +2455,22 @@ enum LookHarder {
 /// Says that the video is still in one piece, with the one button that is
 /// most likely to help.
 fn show_nothing_found_note(ui: &mut egui::Ui) -> LookHarder {
+    let palette = theme::palette(ui.ctx());
     let mut look_harder = LookHarder::NotAsked;
     egui::Frame::none()
-        .fill(theme::PEACH_TILE)
+        .fill(palette.peach_tile)
         .rounding(theme::CONTROL_ROUNDING)
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(NOTHING_FOUND_HINT);
             let button = ui
-                .add(theme::primary_button(LOOK_HARDER_LABEL))
+                .add(theme::primary_button(ui, LOOK_HARDER_LABEL))
                 .on_hover_text(LOOK_HARDER_EXPLANATION);
             if button.clicked() {
                 look_harder = LookHarder::Asked;
             }
-            ui.label(theme::muted(NOTHING_FOUND_BY_HAND_HINT));
+            ui.label(theme::muted(ui, NOTHING_FOUND_BY_HAND_HINT));
         });
     look_harder
 }
@@ -2529,7 +2553,7 @@ fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex, nudge_step: NudgeStep) ->
 /// A small button without a frame, for the row between two cards, where
 /// framed buttons would read as part of a card. Returns true when clicked.
 fn show_quiet_button(ui: &mut egui::Ui, label: &str, hint: &str) -> bool {
-    ui.add(egui::Button::new(theme::caption(label)).frame(false))
+    ui.add(egui::Button::new(theme::caption(ui, label)).frame(false))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(hint)
         .clicked()
@@ -2559,10 +2583,13 @@ fn show_separate_button(
 /// the person asked to see every part.
 fn show_hidden_parts_row(ui: &mut egui::Ui, hidden_count: usize, part_count: usize) -> bool {
     ui.horizontal_wrapped(|ui| {
-        ui.label(theme::muted(format!(
-            "{} in between are not shown.",
-            counted(hidden_count, "part")
-        )));
+        ui.label(theme::muted(
+            ui,
+            format!(
+                "{} in between are not shown.",
+                counted(hidden_count, "part")
+            ),
+        ));
         ui.button(format!("Show all {part_count} parts"))
             .on_hover_text("Shows every part of this merged scene, with its pictures and buttons.")
             .clicked()
@@ -2619,18 +2646,6 @@ fn preview_size_for(available_width: f32, gap: f32) -> egui::Vec2 {
         .floor()
         .clamp(MIN_PREVIEW_WIDTH, MAX_PREVIEW_WIDTH);
     egui::vec2(width, (width * PREVIEW_ASPECT).round())
-}
-
-/// A white card with a wash of the scene's colour over it.
-fn tinted_card(color: egui::Color32, strength: f32) -> egui::Color32 {
-    let wash = |card: u8, scene: u8| {
-        (f32::from(card) + (f32::from(scene) - f32::from(card)) * strength).round() as u8
-    };
-    egui::Color32::from_rgb(
-        wash(theme::CARD.r(), color.r()),
-        wash(theme::CARD.g(), color.g()),
-        wash(theme::CARD.b(), color.b()),
-    )
 }
 
 fn click_kind(modifiers: egui::Modifiers) -> ClickKind {
@@ -2711,6 +2726,7 @@ fn show_scene_heading(
     color: egui::Color32,
     chapter_title: Option<&str>,
 ) -> Option<SceneFate> {
+    let palette = theme::palette(ui.ctx());
     let SceneCard {
         scene,
         layout,
@@ -2718,7 +2734,7 @@ fn show_scene_heading(
     } = scene_card;
     let mut fate_wanted = None;
     ui.horizontal_wrapped(|ui| {
-        let badge = theme::semibold(scene_name(scene), 13.0).color(egui::Color32::WHITE);
+        let badge = theme::semibold(scene_name(scene), 13.0).color(palette.on_fill);
         theme::pill_at_least(ui, badge, color, SCENE_BADGE_MIN_WIDTH);
         if let Some(title) = chapter_title {
             ui.label(theme::semibold(
@@ -2730,19 +2746,22 @@ fn show_scene_heading(
 
         let length = theme::semibold(format_length(layout.span.seconds()), SCENE_LENGTH_FONT_SIZE);
         if is_long_scene(layout.span) {
-            theme::pill(ui, length.color(egui::Color32::WHITE), theme::DANGER);
+            theme::pill(ui, length.color(palette.on_fill), palette.danger);
             // Said in words too, so the warning does not rest on colour alone.
-            ui.label(egui::RichText::new("over 45 min").color(theme::DANGER));
+            ui.label(egui::RichText::new("over 45 min").color(palette.danger));
         } else {
             ui.label(length);
         }
         // To the second is enough here, since cuts land on keyframes anyway.
         // The exact times are one hover away.
-        ui.label(theme::muted(format!(
-            "{} to {}",
-            format_clock(layout.span.start),
-            format_clock(layout.span.end)
-        )))
+        ui.label(theme::muted(
+            ui,
+            format!(
+                "{} to {}",
+                format_clock(layout.span.start),
+                format_clock(layout.span.end)
+            ),
+        ))
         .on_hover_text(format!(
             "{} to {}",
             format_timestamp(layout.span.start),
@@ -2750,20 +2769,20 @@ fn show_scene_heading(
         ));
         if layout.is_merged() {
             let note = egui::RichText::new(format!("{} parts merged", layout.segments.len()))
-                .color(theme::PRIMARY);
-            theme::pill(ui, note, theme::PRIMARY_TINT);
+                .color(palette.primary);
+            theme::pill(ui, note, palette.primary_tint);
         }
         match fate {
             CardFate::Written => {}
             CardFate::WrittenAsFile { number, of } => {
-                ui.label(theme::muted(format!("File {number} of {of}")))
+                ui.label(theme::muted(ui, format!("File {number} of {of}")))
                     .on_hover_text(
                         "Dropped scenes are not written, so the files are numbered without them.",
                     );
             }
             CardFate::Dropped => {
-                let badge = theme::semibold(DROPPED_BADGE, 13.0).color(egui::Color32::WHITE);
-                theme::pill(ui, badge, theme::DROPPED);
+                let badge = theme::semibold(DROPPED_BADGE, 13.0).color(palette.on_fill);
+                theme::pill(ui, badge, palette.dropped);
             }
         }
         let (label, hint, wanted) = if fate.is_dropped() {
@@ -2789,15 +2808,16 @@ fn show_move_out_button(ui: &mut egui::Ui) -> bool {
 }
 
 fn show_placeholder(ui: &mut egui::Ui, size: egui::Vec2, text: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let (area, response) = ui.allocate_exact_size(size, egui::Sense::click());
     ui.painter()
-        .rect_filled(area, PREVIEW_ROUNDING, theme::BACKGROUND);
+        .rect_filled(area, PREVIEW_ROUNDING, palette.page);
     ui.painter().text(
         area.center(),
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::default(),
-        theme::MUTED_TEXT,
+        palette.muted_text,
     );
     response
 }
@@ -2996,9 +3016,10 @@ mod tests {
 
         /// How many focus frames the last frame painted.
         fn focus_rings(&self) -> usize {
+            let ring_color = theme::palette(&self.ctx).focus_ring;
             self.shapes
                 .iter()
-                .map(|clipped| focus_rings_in(&clipped.shape))
+                .map(|clipped| focus_rings_in(&clipped.shape, ring_color))
                 .sum()
         }
 
@@ -3046,12 +3067,15 @@ mod tests {
         }
     }
 
-    fn focus_rings_in(shape: &egui::Shape) -> usize {
+    fn focus_rings_in(shape: &egui::Shape, ring_color: egui::Color32) -> usize {
         match shape {
-            egui::Shape::Vec(shapes) => shapes.iter().map(focus_rings_in).sum(),
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .map(|shape| focus_rings_in(shape, ring_color))
+                .sum(),
             egui::Shape::Rect(rect) => {
                 let is_focus_ring =
-                    rect.stroke.width == FOCUS_RING_WIDTH && rect.stroke.color == FOCUS_RING_COLOR;
+                    rect.stroke.width == FOCUS_RING_WIDTH && rect.stroke.color == ring_color;
                 usize::from(is_focus_ring)
             }
             _ => 0,
@@ -4442,16 +4466,5 @@ mod tests {
         screen.frame(Vec::new(), egui::Modifiers::NONE);
         screen.click_scene(1, egui::Modifiers::NONE);
         assert_eq!(screen.settings, settings_before);
-    }
-
-    #[test]
-    fn a_tinted_card_sits_between_white_and_the_scene_colour() {
-        let red = egui::Color32::from_rgb(255, 0, 0);
-        assert_eq!(tinted_card(red, 0.0), theme::CARD);
-        assert_eq!(tinted_card(red, 1.0), red);
-        assert_eq!(
-            tinted_card(red, 0.2),
-            egui::Color32::from_rgb(255, 204, 204)
-        );
     }
 }

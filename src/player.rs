@@ -905,6 +905,7 @@ impl Player {
 
     /// Draws the picture and returns whether the pointer is over it.
     fn show_picture(&self, ui: &mut egui::Ui, scene: Option<SceneIndex>) -> bool {
+        let palette = theme::palette(ui.ctx());
         let size = self.picture_size;
         let response = match (&self.state, &self.picture) {
             (PlayState::Failed(reason), _) => {
@@ -921,7 +922,8 @@ impl Player {
             (_, Some(picture)) => ui.image((picture.id(), size)),
             (_, None) => {
                 let (area, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-                ui.painter().rect_filled(area, 0.0, egui::Color32::BLACK);
+                ui.painter()
+                    .rect_filled(area, 0.0, palette.picture_backdrop);
                 response
             }
         };
@@ -929,7 +931,7 @@ impl Player {
             // The frame changes colour the moment the scene does, which is
             // seen without reading anything.
             let frame =
-                egui::Stroke::new(PICTURE_FRAME_WIDTH, theme::scene_color(scene.position()));
+                egui::Stroke::new(PICTURE_FRAME_WIDTH, palette.scene_color(scene.position()));
             ui.painter()
                 .rect_stroke(response.rect.shrink(PICTURE_FRAME_WIDTH / 2.0), 0.0, frame);
         }
@@ -947,6 +949,7 @@ impl Player {
         scenes: &[TimeSpan],
         scene: Option<SceneIndex>,
     ) {
+        let palette = theme::palette(ui.ctx());
         let size = egui::vec2(self.picture_size.x, SCENE_BAR_HEIGHT);
         let (bar, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         // The handle is a circle, and half of it must not hang over the end.
@@ -960,7 +963,7 @@ impl Player {
                 track.center(),
                 egui::vec2(track.width(), SCENE_BAR_BLOCK_HEIGHT),
             );
-            painter.rect_filled(block, SCENE_BAR_ROUNDING, theme::MUTED_TEXT);
+            painter.rect_filled(block, SCENE_BAR_ROUNDING, palette.muted_text);
         }
         for (position, span) in scenes.iter().enumerate() {
             let is_on_screen = scene == Some(SceneIndex::new(position));
@@ -975,7 +978,7 @@ impl Player {
                 egui::pos2(left, track.center().y - height / 2.0),
                 egui::pos2(right, track.center().y + height / 2.0),
             );
-            let colour = theme::scene_color(position);
+            let colour = palette.scene_color(position);
             let fill = if is_on_screen {
                 colour
             } else {
@@ -989,8 +992,8 @@ impl Player {
         painter.circle(
             handle,
             SCENE_BAR_HANDLE_RADIUS,
-            egui::Color32::WHITE,
-            egui::Stroke::new(2.0_f32, theme::TEXT),
+            palette.card,
+            egui::Stroke::new(2.0_f32, palette.text),
         );
 
         let pointed_time = response
@@ -1029,6 +1032,7 @@ impl Player {
         scene: Option<SceneIndex>,
         split_would_land_at: Option<f64>,
     ) {
+        let palette = theme::palette(ui.ctx());
         ui.set_max_width(self.picture_size.x);
         let paused = !matches!(self.state, PlayState::Playing(_));
         ui.horizontal_wrapped(|ui| {
@@ -1096,7 +1100,7 @@ impl Player {
 
         ui.horizontal_wrapped(|ui| {
             let split_button = ui
-                .add(theme::primary_button("Split near here (S)"))
+                .add(theme::primary_button(ui, "Split near here (S)"))
                 .on_hover_text(
                     "Cuts the scene playing now in two, at the closest point where the video can be split.",
                 );
@@ -1109,8 +1113,8 @@ impl Player {
                 theme::pill(
                     ui,
                     theme::semibold(scene_name(scene, scenes.len()), 14.0)
-                        .color(egui::Color32::WHITE),
-                    theme::scene_color(scene.position()),
+                        .color(palette.on_fill),
+                    palette.scene_color(scene.position()),
                 )
                 .on_hover_text(scene_times(span));
             }
@@ -1127,7 +1131,7 @@ impl Player {
             // so it is not taken for one that was.
             let words = egui::RichText::new(feedback.in_words());
             let words = if feedback.is_refusal() {
-                words.color(theme::WARNING_TEXT)
+                words.color(palette.warning_text)
             } else {
                 words
             };
@@ -1136,7 +1140,7 @@ impl Player {
         if let Some(problem) = &self.still_problem {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(
-                    theme::DANGER,
+                    palette.danger,
                     "The picture at this place could not be shown.",
                 );
                 theme::copy_details_button(ui, problem);
@@ -1146,15 +1150,16 @@ impl Player {
         // is shown once the person has stopped on a picture.
         if let (true, Some(split_point)) = (paused, split_would_land_at) {
             ui.add(
-                egui::Label::new(theme::caption(landing_description(
-                    self.position(),
-                    split_point,
-                )))
+                egui::Label::new(theme::caption(
+                    ui,
+                    landing_description(self.position(), split_point),
+                ))
                 .wrap(),
             );
         }
         ui.add(
             egui::Label::new(theme::caption(
+                ui,
                 "Esc closes the player. Pause, then step by frames to find the exact picture.",
             ))
             .wrap(),
@@ -1199,20 +1204,21 @@ fn scene_times(scene: TimeSpan) -> String {
 /// Writes the scene that has just begun over the top of the picture, large
 /// enough to be seen while watching the video and not the controls.
 fn show_scene_notice(ui: &egui::Ui, picture: egui::Rect, scene: SceneIndex) {
+    let palette = theme::palette(ui.ctx());
     let painter = ui.painter();
     let text = painter.layout_no_wrap(
         format!("Scene {}", scene.number()),
         egui::FontId::proportional(22.0),
-        egui::Color32::WHITE,
+        palette.on_fill,
     );
     let padding = egui::vec2(14.0, 6.0);
     let label = egui::Rect::from_min_size(
         picture.left_top() + egui::vec2(SCENE_NOTICE_MARGIN, SCENE_NOTICE_MARGIN),
         text.size() + padding * 2.0,
     );
-    painter.rect_filled(label, 8.0, theme::scene_color(scene.position()));
-    painter.rect_stroke(label, 8.0, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
-    painter.galley(label.min + padding, text, egui::Color32::WHITE);
+    painter.rect_filled(label, 8.0, palette.scene_color(scene.position()));
+    painter.rect_stroke(label, 8.0, egui::Stroke::new(2.0_f32, palette.on_fill));
+    painter.galley(label.min + padding, text, palette.on_fill);
 }
 
 /// How large to draw the picture so that the whole player fits a window of

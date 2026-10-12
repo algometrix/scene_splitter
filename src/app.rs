@@ -103,6 +103,7 @@ const EDIT_AGAIN_LABEL: &str = "Edit the scenes again";
 const EDIT_AGAIN_EXPLANATION: &str =
     "Takes this video back into review. It is then no longer ready, \
      until you press \"Split later\" again.";
+const WINDOW_SETTINGS_HEADING: &str = "How the window looks";
 const FOLDERS_HEADING: &str = "Folders with their own detection settings";
 const FOLDERS_EXPLANATION: &str =
     "Videos in these folders are not scanned with the settings above. \
@@ -431,6 +432,9 @@ impl SceneSplitterApp {
     /// One frame of the window: take in what happened in the background,
     /// draw everything, and do what the person asked for.
     fn run_frame(&mut self, ctx: &egui::Context) {
+        // Before anything is drawn, so a choice made in the settings during
+        // the last frame shows in this one.
+        theme::show_in(ctx, self.settings.theme);
         self.follow_setup();
         self.apply_job_updates();
         self.advance_batch(ctx);
@@ -452,7 +456,7 @@ impl SceneSplitterApp {
 
         let mut requests = Vec::new();
         egui::SidePanel::left("queue")
-            .frame(theme::panel(theme::SIDEBAR))
+            .frame(theme::panel(theme::palette(ctx).sidebar))
             .default_width(QUEUE_PANEL_WIDTH)
             .width_range(QUEUE_PANEL_WIDTHS)
             .show(ctx, |ui| {
@@ -1343,14 +1347,14 @@ fn status_label(status: &JobStatus) -> String {
     }
 }
 
-fn status_color(status: &JobStatus) -> egui::Color32 {
+fn status_color(palette: &theme::Palette, status: &JobStatus) -> egui::Color32 {
     match status {
-        JobStatus::Waiting | JobStatus::Skipped(_) => theme::MUTED_TEXT,
-        JobStatus::Scanning(_) | JobStatus::Exporting(_) => theme::ACCENT,
+        JobStatus::Waiting | JobStatus::Skipped(_) => palette.muted_text,
+        JobStatus::Scanning(_) | JobStatus::Exporting(_) => palette.accent,
         // Both wait for the person, which is what this colour says.
-        JobStatus::Reviewing(_) | JobStatus::ReadyToSplit(_) => theme::PRIMARY,
-        JobStatus::Finished(report) if report.is_clean() => theme::SUCCESS,
-        JobStatus::Finished(_) | JobStatus::Failed { .. } => theme::DANGER,
+        JobStatus::Reviewing(_) | JobStatus::ReadyToSplit(_) => palette.primary,
+        JobStatus::Finished(report) if report.is_clean() => palette.success,
+        JobStatus::Finished(_) | JobStatus::Failed { .. } => palette.danger,
     }
 }
 
@@ -1372,23 +1376,25 @@ fn show_queue(
     problems: &[String],
     settings_section: SettingsSection,
 ) -> Vec<AppRequest> {
+    let palette = theme::palette(ui.ctx());
     let mut requests = Vec::new();
-    ui.label(theme::semibold("Scene Splitter", 20.0).color(theme::PRIMARY));
+    ui.label(theme::semibold("Scene Splitter", 20.0).color(palette.primary));
     let add_button = ui
-        .add(theme::primary_button("Add videos"))
+        .add(theme::primary_button(ui, "Add videos"))
         .on_hover_text("Choose videos or a folder, or paste a path (Ctrl+O).");
     if add_button.clicked() {
         requests.push(AppRequest::OpenAddDialog);
     }
-    ui.label(theme::caption("Or drop videos or a folder anywhere."));
+    ui.label(theme::caption(ui, "Or drop videos or a folder anywhere."));
     if !add_feedback.is_empty() {
-        ui.label(theme::caption(add_feedback));
+        ui.label(theme::caption(ui, add_feedback));
     }
 
     ui.add_space(4.0);
     ui.label(theme::semibold("Videos", 14.0));
     if queue.is_empty() {
         ui.label(theme::caption(
+            ui,
             "Videos you add are listed here with their progress. Click one to open it.",
         ));
     }
@@ -1432,14 +1438,14 @@ fn show_ready_videos(
         let progress = batch.progress();
         ui.label(theme::semibold(BATCH_RUNNING_HEADING, 13.0));
         theme::progress_bar(ui, progress.fraction(), BATCH_BAR_HEIGHT);
-        ui.label(theme::caption(format!(
-            "{} of {} done",
-            progress.done, progress.video_count
-        )));
+        ui.label(theme::caption(
+            ui,
+            format!("{} of {} done", progress.done, progress.video_count),
+        ));
     }
     if let Some(batch) = batch.filter(|batch| batch.is_over()) {
         ui.label(theme::semibold(BATCH_OVER_HEADING, 13.0));
-        ui.add(theme::selectable(theme::caption(batch.summary())).wrap());
+        ui.add(theme::selectable(theme::caption(ui, batch.summary())).wrap());
         if ui.button("Dismiss").clicked() {
             requests.push(AppRequest::DismissBatchSummary);
         }
@@ -1459,14 +1465,15 @@ fn show_ready_videos(
 /// What went wrong outside any one video, with a way to copy it and a way to
 /// put it out of sight. Draws nothing when nothing went wrong.
 fn show_problems(ui: &mut egui::Ui, problems: &[String]) -> Option<AppRequest> {
+    let palette = theme::palette(ui.ctx());
     if problems.is_empty() {
         return None;
     }
     let mut request = None;
     ui.add_space(4.0);
-    ui.label(theme::semibold("Something went wrong", 14.0).color(theme::DANGER));
+    ui.label(theme::semibold("Something went wrong", 14.0).color(palette.danger));
     for problem in problems {
-        ui.add(theme::selectable(theme::caption(problem)).wrap());
+        ui.add(theme::selectable(theme::caption(ui, problem)).wrap());
     }
     ui.horizontal_wrapped(|ui| {
         theme::copy_details_button(ui, &problems.join("\n"));
@@ -1495,9 +1502,10 @@ fn show_settings(
     problem: &str,
     scene_name_draft: &mut SceneNameDraft,
 ) {
+    let palette = theme::palette(ui.ctx());
     if !problem.is_empty() {
         ui.add(theme::selectable(
-            egui::RichText::new(problem).color(theme::DANGER),
+            egui::RichText::new(problem).color(palette.danger),
         ));
         theme::copy_details_button(ui, problem);
     }
@@ -1526,6 +1534,12 @@ fn show_settings(
     ui.checkbox(&mut settings.show_tips, "Show tips on the review screen");
 
     ui.add_space(4.0);
+    ui.label(theme::semibold(WINDOW_SETTINGS_HEADING, 13.0));
+    ui.horizontal_wrapped(|ui| {
+        settings_controls::show_theme_choice(ui, &mut settings.theme);
+    });
+
+    ui.add_space(4.0);
     ui.label(theme::semibold("Looking for missed scenes", 13.0));
     ui.horizontal_wrapped(|ui| {
         settings_controls::show_hard_cut_controls(
@@ -1545,6 +1559,7 @@ fn show_settings(
 
     ui.add_space(4.0);
     ui.label(theme::caption(
+        ui,
         "Changes are saved straight away. Detection settings apply the next time a video is scanned.",
     ));
     let restore = ui.button("Restore default settings").on_hover_text(
@@ -1565,7 +1580,7 @@ fn show_folders_with_their_own_settings(ui: &mut egui::Ui, settings: &mut Settin
     }
     ui.add_space(4.0);
     ui.label(theme::semibold(FOLDERS_HEADING, 13.0));
-    ui.label(theme::caption(FOLDERS_EXPLANATION));
+    ui.label(theme::caption(ui, FOLDERS_EXPLANATION));
     let mut folder_to_forget = None;
     for (folder, _) in settings.folders.iter() {
         let shown = folder.display().to_string();
@@ -1574,7 +1589,7 @@ fn show_folders_with_their_own_settings(ui: &mut egui::Ui, settings: &mut Settin
             if forget.clicked() {
                 folder_to_forget = Some(folder.to_path_buf());
             }
-            ui.add(egui::Label::new(theme::caption(&shown)).truncate())
+            ui.add(egui::Label::new(theme::caption(ui, &shown)).truncate())
                 .on_hover_text(&shown);
         });
     }
@@ -1585,10 +1600,11 @@ fn show_folders_with_their_own_settings(ui: &mut egui::Ui, settings: &mut Settin
 
 /// One video in the sidebar. Clicking it asks for it to be shown.
 fn show_job_card(ui: &mut egui::Ui, job: &Job, is_current: bool) -> Option<AppRequest> {
+    let palette = theme::palette(ui.ctx());
     let (fill, border) = if is_current {
-        (theme::PRIMARY_TINT, theme::PRIMARY)
+        (palette.primary_tint, palette.primary)
     } else {
-        (theme::CARD, theme::CARD_BORDER)
+        (palette.card, palette.card_border)
     };
     let card = egui::Frame::none()
         .fill(fill)
@@ -1606,9 +1622,9 @@ fn show_job_card(ui: &mut egui::Ui, job: &Job, is_current: bool) -> Option<AppRe
                 ui.painter().circle_filled(
                     dot.center(),
                     STATUS_DOT_SIZE / 2.0,
-                    status_color(job.status()),
+                    status_color(palette, job.status()),
                 );
-                ui.label(theme::caption(status_label(job.status())));
+                ui.label(theme::caption(ui, status_label(job.status())));
             });
             if let JobStatus::Scanning(Some(progress)) = job.status() {
                 theme::progress_bar(ui, progress.fraction, SIDEBAR_SCAN_BAR_HEIGHT);
@@ -1629,27 +1645,31 @@ fn show_job_card(ui: &mut egui::Ui, job: &Job, is_current: bool) -> Option<AppRe
 /// The first-run screen, with the way to try the download again when it
 /// failed.
 fn show_setup(ctx: &egui::Context, setup: &Setup) -> Option<AppRequest> {
+    let palette = theme::palette(ctx);
     let mut retry = false;
     show_centered_card(ctx, |ui| match setup {
         Setup::Ready => {}
         Setup::Downloading { progress, .. } => {
             ui.label(theme::semibold("Setting up (one time only)", 16.0));
-            ui.label(theme::muted(format!(
+            ui.label(theme::muted(
+                ui,
+                format!(
                 "Scene Splitter is downloading the video tools it needs (ffmpeg {}, about {} MB). \
                  You can add videos now. Scanning starts when the download is done.",
                 tools::FFMPEG_VERSION,
                 megabytes(progress.total_bytes.max(progress.received_bytes))
-            )));
+            ),
+            ));
             ui.add(egui::ProgressBar::new(progress.fraction()).show_percentage());
         }
         Setup::Failed(reason) => {
             ui.label(
                 theme::semibold("The video tools could not be downloaded", 16.0)
-                    .color(theme::DANGER),
+                    .color(palette.danger),
             );
             ui.label("Check your internet connection and press Try again.");
             show_details(ui, reason);
-            retry = ui.add(theme::primary_button("Try again")).clicked();
+            retry = ui.add(theme::primary_button(ui, "Try again")).clicked();
         }
     });
     retry.then_some(AppRequest::GetToolsAgain)
@@ -1663,7 +1683,7 @@ fn show_details(ui: &mut egui::Ui, details: &str) -> egui::Response {
     egui::ScrollArea::vertical()
         .max_height(DETAILS_MAX_HEIGHT)
         .show(ui, |ui| {
-            ui.add(theme::selectable(theme::caption(details)));
+            ui.add(theme::selectable(theme::caption(ui, details)));
         });
     theme::copy_details_button(ui, details)
 }
@@ -1675,13 +1695,14 @@ fn megabytes(bytes: u64) -> u64 {
 /// A card in the middle of the main area, for everything that is not the
 /// review screen. It narrows with the window instead of being cut off.
 fn show_centered_card(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let palette = theme::palette(ctx);
     egui::CentralPanel::default()
-        .frame(theme::panel(theme::BACKGROUND))
+        .frame(theme::panel(palette.page))
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() / 5.0);
                 let width = MESSAGE_CARD_WIDTH.min(ui.available_width() - CARD_SIDE_ROOM);
-                theme::card().show(ui, |ui| {
+                theme::card(ui).show(ui, |ui| {
                     ui.set_width(width);
                     ui.vertical_centered(add_contents);
                 });
@@ -1692,6 +1713,7 @@ fn show_centered_card(ctx: &egui::Context, add_contents: impl FnOnce(&mut egui::
 /// The add dialog: the system's own file and folder pickers, and a box to
 /// paste a path into. Returns what the person chose, if anything yet.
 fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppRequest> {
+    let palette = theme::palette(ctx);
     let clicked_outside = theme::show_backdrop(ctx, "add_dialog_backdrop", egui::Order::Middle);
     let mut paths_to_add: Option<Vec<PathBuf>> = None;
     let mut open = true;
@@ -1704,7 +1726,7 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
         .show(ctx, |ui| {
             ui.set_width(ADD_DIALOG_WIDTH.min(ctx.screen_rect().width() - CARD_SIDE_ROOM));
             ui.horizontal_wrapped(|ui| {
-                if ui.add(theme::primary_button("Choose videos")).clicked() {
+                if ui.add(theme::primary_button(ui, "Choose videos")).clicked() {
                     // The system's picker blocks until it is closed, which
                     // is what a person expects of it.
                     paths_to_add = rfd::FileDialog::new()
@@ -1719,6 +1741,7 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
                 }
             });
             ui.label(theme::caption(
+                ui,
                 "A folder adds the videos in it, but not those in its subfolders.",
             ));
 
@@ -1744,9 +1767,10 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
                 }
             });
             if !dialog.problem.is_empty() {
-                ui.colored_label(theme::DANGER, &dialog.problem);
+                ui.colored_label(palette.danger, &dialog.problem);
             }
             ui.label(theme::caption(
+                ui,
                 "You can also drop videos or a folder anywhere in the window.",
             ));
         });
@@ -1862,16 +1886,19 @@ fn show_recycling_question(
                 .wrap(),
             );
             ui.add(
-                egui::Label::new(theme::caption(format!(
-                    "You can restore the original from the {TRASH_NAME}. This is asked only \
+                egui::Label::new(theme::caption(
+                    ui,
+                    format!(
+                        "You can restore the original from the {TRASH_NAME}. This is asked only \
                      once. You can change your choice under the name of any video, or in \
                      Settings."
-                )))
+                    ),
+                ))
                 .wrap(),
             );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                let move_it = theme::primary_button(format!("Move it to the {TRASH_NAME}"));
+                let move_it = theme::primary_button(ui, format!("Move it to the {TRASH_NAME}"));
                 if ui.add(move_it).clicked() {
                     answer = Some(RecyclingAnswer::MoveOriginal);
                 }
@@ -1903,16 +1930,17 @@ fn show_recycling_question(
 /// The first screen, before any video is added: what the app does and the
 /// three steps of using it, and the button that starts the first of them.
 fn show_welcome(ctx: &egui::Context) -> Option<AppRequest> {
+    let palette = theme::palette(ctx);
     let mut add_videos = false;
     show_centered_card(ctx, |ui| {
         ui.label(theme::semibold("Cut a long video into its scenes", 20.0));
-        ui.label(theme::muted(DROP_EXPLANATION));
+        ui.label(theme::muted(ui, DROP_EXPLANATION));
         ui.add_space(4.0);
         add_videos = ui
-            .add(theme::primary_button("Add videos"))
+            .add(theme::primary_button(ui, "Add videos"))
             .on_hover_text("Ctrl+O")
             .clicked();
-        ui.label(theme::caption(DROP_PROMPT));
+        ui.label(theme::caption(ui, DROP_PROMPT));
         ui.add_space(10.0);
         // The text column wraps only when told how wide it may be, and that
         // has to be measured out here: inside the grid no width is known yet.
@@ -1925,14 +1953,14 @@ fn show_welcome(ctx: &egui::Context) -> Option<AppRequest> {
                 for (number, (step, explanation)) in WELCOME_STEPS.iter().enumerate() {
                     theme::pill(
                         ui,
-                        theme::semibold((number + 1).to_string(), 13.0).color(egui::Color32::WHITE),
-                        theme::PRIMARY,
+                        theme::semibold((number + 1).to_string(), 13.0).color(palette.on_fill),
+                        palette.primary,
                     );
                     ui.vertical(|ui| {
                         ui.set_max_width(room_for_text);
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.label(theme::semibold(*step, 14.0));
-                        ui.add(egui::Label::new(theme::muted(*explanation)).wrap());
+                        ui.add(egui::Label::new(theme::muted(ui, *explanation)).wrap());
                     });
                     ui.end_row();
                 }
@@ -1944,7 +1972,7 @@ fn show_welcome(ctx: &egui::Context) -> Option<AppRequest> {
 fn show_message(ctx: &egui::Context, title: &str, text: &str) {
     show_centered_card(ctx, |ui| {
         ui.add(egui::Label::new(theme::semibold(title, 16.0)).truncate());
-        ui.label(theme::muted(text));
+        ui.label(theme::muted(ui, text));
     });
 }
 
@@ -1954,6 +1982,7 @@ fn show_skipped(ctx: &egui::Context, job: JobId, name: &str) -> Option<AppReques
     show_centered_card(ctx, |ui| {
         ui.add(egui::Label::new(theme::semibold(name, 16.0)).truncate());
         ui.label(theme::muted(
+            ui,
             "Skipped. Nothing was written and the video was not changed.",
         ));
         if ui.button("Review it after all").clicked() {
@@ -2008,9 +2037,9 @@ fn show_ready(
         ui.add(egui::Label::new(theme::semibold(name, 16.0)).truncate());
         ui.label(split.in_words());
         if let Some(why) = split.original_always_kept {
-            ui.label(theme::muted(why.in_plain_words()));
+            ui.label(theme::muted(ui, why.in_plain_words()));
         }
-        ui.label(theme::muted(READY_EXPLANATION));
+        ui.label(theme::muted(ui, READY_EXPLANATION));
         let edit_again = ui
             .button(EDIT_AGAIN_LABEL)
             .on_hover_text(EDIT_AGAIN_EXPLANATION);
@@ -2031,9 +2060,10 @@ fn show_failed(
     failure: &Failure,
     review: Option<&ReviewSession>,
 ) -> Option<AppRequest> {
+    let palette = theme::palette(ctx);
     let mut request = None;
     show_centered_card(ctx, |ui| {
-        ui.label(theme::semibold("This video could not be finished", 16.0).color(theme::DANGER));
+        ui.label(theme::semibold("This video could not be finished", 16.0).color(palette.danger));
         ui.add(egui::Label::new(theme::semibold(name, 14.0)).truncate());
         ui.label(&failure.plain_words);
         if let Some(details) = &failure.details {
@@ -2045,7 +2075,7 @@ fn show_failed(
             match review {
                 Some(review) => {
                     let back = ui
-                        .add(theme::primary_button("Back to review"))
+                        .add(theme::primary_button(ui, "Back to review"))
                         .on_hover_text(format!(
                             "Shows the {} again as you left them, so you can split once more.",
                             counted(review.scene_count(), "scene")
@@ -2073,14 +2103,15 @@ fn show_failed(
 
 /// The result of a split, and what to do next.
 fn show_finished(ctx: &egui::Context, name: &str, report: &ExportReport) -> Option<AppRequest> {
+    let palette = theme::palette(ctx);
     let mut request = None;
     show_centered_card(ctx, |ui| {
         let (verdict, verdict_color) = if report.is_clean() {
-            ("Done", theme::SUCCESS)
+            ("Done", palette.success)
         } else {
             (
                 "The files were written, but check the note below",
-                theme::DANGER,
+                palette.danger,
             )
         };
         ui.label(theme::semibold(verdict, 20.0).color(verdict_color));
@@ -2090,7 +2121,7 @@ fn show_finished(ctx: &egui::Context, name: &str, report: &ExportReport) -> Opti
             show_details(ui, &details);
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.add(theme::primary_button("Open folder")).clicked() {
+            if ui.add(theme::primary_button(ui, "Open folder")).clicked() {
                 request = Some(AppRequest::OpenFolder(report.out_dir.clone()));
             }
             let add_more = egui::Button::new("Add more videos")
@@ -2138,11 +2169,14 @@ fn show_scan_progress(ctx: &egui::Context, text: &str, progress: ScanProgress) {
     show_centered_card(ctx, |ui| {
         ui.label(theme::semibold(text, 16.0));
         theme::progress_bar(ui, progress.fraction, SCAN_BAR_HEIGHT);
-        ui.label(theme::muted(format!(
-            "{}% done. {}",
-            percent_done(progress.fraction),
-            scan_stage_in_words(progress.stage)
-        )));
+        ui.label(theme::muted(
+            ui,
+            format!(
+                "{}% done. {}",
+                percent_done(progress.fraction),
+                scan_stage_in_words(progress.stage)
+            ),
+        ));
     });
 }
 
@@ -3203,5 +3237,120 @@ mod tests {
         let ctx = egui::Context::default();
         app.apply_request(&ctx, AppRequest::DismissProblems);
         assert!(app.problems.is_empty());
+    }
+
+    /// What one frame painted with: the colour of every filled shape and of
+    /// every piece of text. A picture is left out, since it is a film frame
+    /// and not one of the app's colours.
+    fn colours_painted(shape: &egui::Shape, colours: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    colours_painted(shape, colours);
+                }
+            }
+            egui::Shape::Rect(rect) if rect.fill_texture_id == egui::TextureId::default() => {
+                colours.push(rect.fill);
+            }
+            egui::Shape::Text(text) => {
+                colours.push(text.fallback_color);
+                let sections = &text.galley.job.sections;
+                colours.extend(sections.iter().map(|section| section.format.color));
+            }
+            _ => {}
+        }
+    }
+
+    impl Window {
+        /// Shows the window in `theme` as if that had been saved, so that
+        /// drawing it writes no settings file.
+        fn choose_theme(&mut self, theme: theme::ThemeChoice) {
+            self.app.settings.theme = theme;
+            self.app.saved_settings = self.app.settings.clone();
+        }
+
+        /// Draws one frame and returns every colour it painted with.
+        fn colours_of_a_frame(&mut self) -> Vec<egui::Color32> {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW)),
+                ..Default::default()
+            };
+            let output = self.ctx.run(input, |ctx| self.app.run_frame(ctx));
+            let mut colours = Vec::new();
+            for clipped in &output.shapes {
+                colours_painted(&clipped.shape, &mut colours);
+            }
+            colours
+        }
+    }
+
+    /// The surfaces and the text that make a palette what it is. None of
+    /// them may show while the other palette is in use.
+    fn telltale_colours(palette: &theme::Palette) -> [egui::Color32; 5] {
+        [
+            palette.page,
+            palette.sidebar,
+            palette.card,
+            palette.text,
+            palette.muted_text,
+        ]
+    }
+
+    #[test]
+    fn a_theme_chosen_in_the_settings_shows_in_the_very_next_frame() {
+        let mut window = Window::with_a_video_in_review();
+        window.open_the_player();
+        let light = theme::Palette::of(egui::Theme::Light);
+        let dark = theme::Palette::of(egui::Theme::Dark);
+
+        window.choose_theme(theme::ThemeChoice::Dark);
+        let painted = window.colours_of_a_frame();
+        assert!(painted.contains(&dark.page));
+        assert!(painted.contains(&dark.card));
+        for colour in telltale_colours(light) {
+            assert!(!painted.contains(&colour), "{colour:?} is a light colour");
+        }
+
+        window.choose_theme(theme::ThemeChoice::Light);
+        let painted = window.colours_of_a_frame();
+        assert!(painted.contains(&light.page));
+        for colour in telltale_colours(dark) {
+            assert!(!painted.contains(&colour), "{colour:?} is a dark colour");
+        }
+    }
+
+    #[test]
+    fn the_screens_outside_the_review_draw_in_the_dark_palette() {
+        let (_, job) = app_with_a_video_in_review();
+        let unverified = ExportReport {
+            scene_files: Vec::new(),
+            out_dir: PathBuf::from("scenes"),
+            dropped_scenes: 0,
+            verification: export::Verification::Failed("a packet differs".to_owned()),
+            original: export::OriginalOutcome::KeptBecauseUnverified,
+        };
+        let failure = Failure::could_not_split("the disk is full".to_owned());
+        let screens: [&dyn Fn(&egui::Context); 4] = [
+            &|ctx| drop(show_welcome(ctx)),
+            &|ctx| drop(show_finished(ctx, "a video.mp4", &unverified)),
+            &|ctx| drop(show_failed(ctx, job, "a video.mp4", &failure, None)),
+            &|ctx| show_busy(ctx, "Reading the video"),
+        ];
+        let light = theme::Palette::of(egui::Theme::Light);
+
+        for screen in screens {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            theme::show_in(&ctx, theme::ThemeChoice::Dark);
+            let output = ctx.run(egui::RawInput::default(), screen);
+            let mut painted = Vec::new();
+            for clipped in &output.shapes {
+                colours_painted(&clipped.shape, &mut painted);
+            }
+            assert!(!painted.is_empty());
+            for colour in telltale_colours(light) {
+                assert!(!painted.contains(&colour), "{colour:?} is a light colour");
+            }
+        }
     }
 }
