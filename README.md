@@ -49,7 +49,8 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 
 - **Fast scan.** A two hour 480p video is scanned in about two seconds, because black frames show up in the packet sizes before anything is decoded.
 - **Hard cuts.** An optional slower scan finds scene changes that have no black screen.
-- **Review before writing.** Merge scenes by dragging, add a split by time, move a part back out of a merged scene, undo, or reset.
+- **Review before writing.** Merge scenes by dragging, add a split by time, move a split to the next point where the video can be cut, move a part back out of a merged scene, undo, or reset.
+- **Review without the mouse.** Every step of a review has a key, and the window lists them.
 - **Built-in player.** Click a preview picture to play from there, step frame by frame with the mouse wheel, and split the scene at the current position.
 - **Verified before the original is removed.** After a split, the app checks every packet of the scene files against the original. Only then does it move the original to the Recycle Bin or Trash.
 - **Scan ahead.** Scan a whole folder from the command line, and review the results in the window later.
@@ -94,7 +95,8 @@ You can also run it through Cargo: `cargo run --release -- <arguments>`.
    - "Undo merge" takes the selected merged scenes apart again. Inside a merged scene, "Separate here" restores a single split, and "Move out to its own scene" takes one part out of it.
    - A merged scene with more than 6 parts shows its first two and last two. "Show all N parts" shows the rest, and "Show fewer parts" hides them again. The app remembers this for each scene while the review is open.
    - "Add a split at" takes a time such as `1:03:12`. The split lands on the nearest point where the video can be cut (a keyframe).
-   - Undo takes back the last change. "Reset scenes" returns to the scenes as found.
+   - "Move split earlier" and "Move split later", at the two ends of the row between two cards, move the split between those scenes to the next point where the video can be cut. The line under the toolbar says the old and the new time. A split does not move onto or past the split beside it, into the parts of a merged scene, or to the ends of the video. The app says which of these stopped it.
+   - Undo takes back the last change, a moved split included. "Reset scenes" returns to the scenes as found, and puts moved splits back.
 5. If the video has scene changes with no black screen, press "Scenes missed?" under the toolbar. Choose how much to detect (only obvious changes, most changes, or even subtle changes) and the shortest scene to allow, then press "Look for sudden picture changes". This scan looks at every picture and is much slower.
 6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
 7. When the split is done, the app shows whether the check passed and what happened to the original. "Open folder" shows the scene files.
@@ -115,15 +117,32 @@ Scene files are named `<video name>_scene_001`, `_scene_002` and so on, with the
 
 ### Review keys
 
+A review can be done without the mouse. The keys work on one scene at a time, which has a dark frame around its card. Click a card or press an arrow key to put the frame on a scene. The list scrolls to keep that scene in view.
+
 On macOS, use Cmd where this page says Ctrl.
 
 | Key | Action |
 | --- | --- |
+| Up, Down | Go to the scene above or below, and select it |
+| Home, End | Go to the first or the last scene |
+| Shift+Up, Shift+Down (also with Home and End) | Select more scenes, or fewer |
+| Enter or Space | Play the scene from its start |
+| Left, Right | Choose a picture of the scene, which gets a frame too. Enter or Space then plays from that picture |
+| J | Join the scene with the one below it |
 | M | Merge the selected scenes |
+| U | Take a merged scene apart again (the selected scenes or, with none selected, the scene with the frame) |
+| Alt+Left, Alt+Right | Move the split at the start of the scene to the point before or after it where the video can be cut |
+| Ctrl+Enter | Split into files. The same questions are asked as after the button |
 | Ctrl+O | Add videos |
 | Ctrl+A | Select every scene |
 | Ctrl+Z | Undo the last change |
 | Esc | Clear the selection (when the player is open, it closes the player first) |
+| F1 | Show or hide the list of keys |
+| Tab, Shift+Tab | Go through the buttons and boxes. Space or Enter presses the one that is marked, and Esc gives the keys back to the scenes |
+
+"Keys" on the line under the toolbar, "Show keys" on the tips card, and F1 show this list in the window, above the scenes.
+
+While the player is open, Space and the plain Left and Right keys are the player's. Enter still plays the scene with the frame, and the other review keys work as before. While you type in a box, the keys are text.
 
 ### The player
 
@@ -132,7 +151,7 @@ Click a preview picture to play the video from that moment. A line on the timeli
 | Key or control | Action |
 | --- | --- |
 | A or Left arrow | Go back 10 seconds |
-| D or Right arrow | Go forward 10 seconds |
+| D or Right arrow | Go forward 10 seconds (with Alt held, the arrow keys move a split in the review instead) |
 | Space | Pause or play |
 | S | Split the scene at the current position |
 | Mouse wheel over the picture, or the "-1 frame" and "+1 frame" buttons | Pause and step one frame (wheel down is forward) |

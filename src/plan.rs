@@ -67,7 +67,25 @@ enum CutSource {
     /// Suggested by the scan, whether for a black screen or for a sudden
     /// change of picture. The plan is not told which.
     Detected,
+    /// Suggested by the scan at `detected_at`, and moved by the person
+    /// since. The time is kept so that a reset can put the cut back.
+    DetectedThenMoved {
+        detected_at: f64,
+    },
     AddedByUser,
+}
+
+impl CutSource {
+    /// Where a cut of this source comes from once it has been moved from
+    /// `from` to `to`. A detected cut moved back to where the scan saw it is
+    /// a detected cut again.
+    fn after_a_move(self, from: f64, to: f64) -> Self {
+        match self {
+            Self::Detected => Self::DetectedThenMoved { detected_at: from },
+            Self::DetectedThenMoved { detected_at } if detected_at == to => Self::Detected,
+            Self::DetectedThenMoved { .. } | Self::AddedByUser => self,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,6 +125,64 @@ impl fmt::Display for AddCutError {
                 formatter,
                 "There is already a split point at {}.",
                 crate::timecode::format_timestamp(*at)
+            ),
+        }
+    }
+}
+
+/// Which way a split is moved along the video.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NudgeDirection {
+    Earlier,
+    Later,
+}
+
+/// A split that was moved to the next point where the video can be cut.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MovedCut {
+    pub from: f64,
+    pub to: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NudgeCutError {
+    /// The first scene starts where the video starts, not at a split, and
+    /// a scene past the last one does not exist.
+    NoSplitBeforeScene,
+    /// The video has no keyframe further that way to cut on.
+    NoCutPoint(NudgeDirection),
+    /// The next keyframe that way is at or beyond the neighbouring split.
+    SplitInTheWay { at: f64 },
+    /// The next keyframe that way is at or beyond a cut the person merged
+    /// away, where two parts of a merged scene meet.
+    MergedPartsInTheWay { at: f64 },
+}
+
+impl fmt::Display for NudgeCutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::timecode::format_timestamp;
+        match self {
+            Self::NoSplitBeforeScene => write!(
+                formatter,
+                "This scene starts where the video starts, so there is no split to move."
+            ),
+            Self::NoCutPoint(NudgeDirection::Earlier) => write!(
+                formatter,
+                "There is no earlier point where the video can be cut."
+            ),
+            Self::NoCutPoint(NudgeDirection::Later) => write!(
+                formatter,
+                "There is no later point where the video can be cut."
+            ),
+            Self::SplitInTheWay { at } => write!(
+                formatter,
+                "The split cannot move further. The split at {} is in the way.",
+                format_timestamp(*at)
+            ),
+            Self::MergedPartsInTheWay { at } => write!(
+                formatter,
+                "The split cannot move further. Two merged parts meet at {}.",
+                format_timestamp(*at)
             ),
         }
     }
@@ -215,19 +291,23 @@ impl SplitPlan {
 
     /// Joins the given run of current scenes into one scene.
     pub fn merge_scenes(&mut self, scenes: RangeInclusive<SceneIndex>) {
-        // The nth accepted cut is the one between scene n and scene n + 1.
-        let accepted_cut_positions: Vec<usize> = self
-            .cuts
-            .iter()
-            .enumerate()
-            .filter(|(_, cut)| cut.choice == CutChoice::Split)
-            .map(|(position, _)| position)
-            .collect();
+        let accepted_cut_positions = self.accepted_cut_positions();
         for boundary in scenes.start().0..scenes.end().0 {
             if let Some(&cut_position) = accepted_cut_positions.get(boundary) {
                 self.cuts[cut_position].choice = CutChoice::Merge;
             }
         }
+    }
+
+    /// Where in `cuts` each cut that splits sits. The nth of them is the
+    /// one between scene n and scene n + 1.
+    fn accepted_cut_positions(&self) -> Vec<usize> {
+        self.cuts
+            .iter()
+            .enumerate()
+            .filter(|(_, cut)| cut.choice == CutChoice::Split)
+            .map(|(position, _)| position)
+            .collect()
     }
 
     /// Takes one segment out of a merged scene and makes it a scene of its
@@ -246,10 +326,16 @@ impl SplitPlan {
     }
 
     /// Goes back to the scan's own suggestion: every detected cut splits
-    /// again, and the cuts the person added are gone.
+    /// again where the scan saw it, and the cuts the person added are gone.
     pub fn reset_to_detected(&mut self) {
-        self.cuts.retain(|cut| cut.source == CutSource::Detected);
+        self.cuts.retain(|cut| cut.source != CutSource::AddedByUser);
         for cut in &mut self.cuts {
+            // A moved cut never passes another cut, and detected cuts are
+            // never removed, so putting the times back keeps the order.
+            if let CutSource::DetectedThenMoved { detected_at } = cut.source {
+                cut.time = detected_at;
+                cut.source = CutSource::Detected;
+            }
             cut.choice = CutChoice::Split;
         }
     }
@@ -348,6 +434,82 @@ impl SplitPlan {
             },
         );
         Ok(time)
+    }
+
+    /// Moves the split at which `scene` starts to the next keyframe in the
+    /// given direction, and returns where it was and where it is now.
+    ///
+    /// The split stays between the cuts on either side of it, merged ones
+    /// included. Past a merged cut it would take a part of one merged scene
+    /// into another, which nobody asked for.
+    pub fn nudge_cut_before(
+        &mut self,
+        scene: SceneIndex,
+        direction: NudgeDirection,
+    ) -> Result<MovedCut, NudgeCutError> {
+        let position = self
+            .accepted_cut_position_before(scene)
+            .ok_or(NudgeCutError::NoSplitBeforeScene)?;
+        let from = self.cuts[position].time;
+        let to = self
+            .cut_point_beside(from, direction)
+            .ok_or(NudgeCutError::NoCutPoint(direction))?;
+        self.refuse_a_move_onto_or_past_the_neighbour(position, to, direction)?;
+
+        let cut = &mut self.cuts[position];
+        cut.source = cut.source.after_a_move(from, to);
+        cut.time = to;
+        Ok(MovedCut { from, to })
+    }
+
+    /// `None` for the first scene, which starts where the video starts, and
+    /// for a scene the plan does not have.
+    fn accepted_cut_position_before(&self, scene: SceneIndex) -> Option<usize> {
+        let boundary = scene.0.checked_sub(1)?;
+        self.accepted_cut_positions().get(boundary).copied()
+    }
+
+    /// The keyframe next to `time` on the given side that a cut can be on.
+    fn cut_point_beside(&self, time: f64, direction: NudgeDirection) -> Option<f64> {
+        let keyframes = &self.keyframe_times;
+        let beside = match direction {
+            NudgeDirection::Earlier => keyframes
+                .partition_point(|&keyframe| keyframe < time)
+                .checked_sub(1)
+                .map(|before| keyframes[before]),
+            NudgeDirection::Later => keyframes
+                .get(keyframes.partition_point(|&keyframe| keyframe <= time))
+                .copied(),
+        };
+        beside.filter(|&keyframe| self.whole_video.has_strictly_inside(keyframe))
+    }
+
+    fn refuse_a_move_onto_or_past_the_neighbour(
+        &self,
+        position: usize,
+        to: f64,
+        direction: NudgeDirection,
+    ) -> Result<(), NudgeCutError> {
+        let neighbour = match direction {
+            NudgeDirection::Earlier => position.checked_sub(1).map(|before| self.cuts[before]),
+            NudgeDirection::Later => self.cuts.get(position + 1).copied(),
+        };
+        // With no cut on that side the end of the video is the limit, and
+        // `cut_point_beside` has kept the split inside the video already.
+        let Some(neighbour) = neighbour else {
+            return Ok(());
+        };
+        let reaches_the_neighbour = match direction {
+            NudgeDirection::Earlier => to <= neighbour.time,
+            NudgeDirection::Later => to >= neighbour.time,
+        };
+        if !reaches_the_neighbour {
+            return Ok(());
+        }
+        Err(match neighbour.choice {
+            CutChoice::Split => NudgeCutError::SplitInTheWay { at: neighbour.time },
+            CutChoice::Merge => NudgeCutError::MergedPartsInTheWay { at: neighbour.time },
+        })
     }
 }
 
@@ -822,6 +984,211 @@ mod tests {
         );
     }
 
+    const EARLIER: NudgeDirection = NudgeDirection::Earlier;
+    const LATER: NudgeDirection = NudgeDirection::Later;
+
+    fn second_scene() -> SceneIndex {
+        SceneIndex::new(1)
+    }
+
+    #[test]
+    fn a_split_moves_to_the_next_point_where_the_video_can_be_cut() {
+        let mut plan = plan_with_cuts(&[4.0]);
+
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), LATER),
+            Ok(MovedCut { from: 4.0, to: 6.0 })
+        );
+        assert_eq!(plan.accepted_cuts().as_slice(), [6.0]);
+
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), EARLIER),
+            Ok(MovedCut { from: 6.0, to: 4.0 })
+        );
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), EARLIER),
+            Ok(MovedCut { from: 4.0, to: 2.0 })
+        );
+        assert_eq!(plan.scenes(), vec![span(0.0, 2.0), span(2.0, 10.0)]);
+    }
+
+    #[test]
+    fn a_split_between_two_keyframes_moves_to_the_one_on_the_side_asked_for() {
+        let mut plan = plan_with_cuts(&[5.0]);
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), EARLIER),
+            Ok(MovedCut { from: 5.0, to: 4.0 })
+        );
+
+        let mut plan = plan_with_cuts(&[5.0]);
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), LATER),
+            Ok(MovedCut { from: 5.0, to: 6.0 })
+        );
+    }
+
+    #[test]
+    fn a_split_does_not_move_onto_or_past_the_split_beside_it() {
+        let mut plan = plan_with_cuts(&[4.0, 6.0]);
+        let untouched = plan.snapshot();
+
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), LATER),
+            Err(NudgeCutError::SplitInTheWay { at: 6.0 })
+        );
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(2), EARLIER),
+            Err(NudgeCutError::SplitInTheWay { at: 4.0 })
+        );
+        assert!(plan.is_at(&untouched));
+    }
+
+    #[test]
+    fn a_split_does_not_move_past_a_split_that_sits_between_two_keyframes() {
+        let mut plan = plan_with_cuts(&[4.0, 5.0]);
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), LATER),
+            Err(NudgeCutError::SplitInTheWay { at: 5.0 })
+        );
+    }
+
+    #[test]
+    fn a_split_does_not_move_into_the_parts_of_a_merged_scene() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0]);
+        // The scenes are now 0-2, 2-4 and 4-10, the last made of two parts.
+        plan.merge_scenes(scenes(2, 3));
+
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(2), LATER),
+            Err(NudgeCutError::MergedPartsInTheWay { at: 6.0 })
+        );
+        assert_eq!(plan.accepted_cuts().as_slice(), [2.0, 4.0]);
+    }
+
+    #[test]
+    fn a_split_does_not_move_to_the_ends_of_the_video() {
+        let mut plan = plan_with_cuts(&[2.0]);
+        // The keyframe before 2 is the first frame of the video.
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), EARLIER),
+            Err(NudgeCutError::NoCutPoint(EARLIER))
+        );
+
+        let mut plan = plan_with_cuts(&[8.0]);
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), LATER),
+            Err(NudgeCutError::NoCutPoint(LATER))
+        );
+        assert_eq!(plan.accepted_cuts().as_slice(), [8.0]);
+    }
+
+    #[test]
+    fn the_first_scene_and_a_scene_that_does_not_exist_have_no_split_to_move() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(0), LATER),
+            Err(NudgeCutError::NoSplitBeforeScene)
+        );
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(2), LATER),
+            Err(NudgeCutError::NoSplitBeforeScene)
+        );
+    }
+
+    #[test]
+    fn the_split_that_is_moved_is_the_one_the_scene_starts_at_now() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 8.0]);
+        // The scenes are now 0-4, 4-8 and 8-10, so the third starts at 8.
+        plan.merge_scenes(scenes(0, 1));
+
+        assert_eq!(
+            plan.nudge_cut_before(SceneIndex::new(2), EARLIER),
+            Ok(MovedCut { from: 8.0, to: 6.0 })
+        );
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 6.0]);
+    }
+
+    #[test]
+    fn a_reset_puts_a_moved_split_back_where_the_scan_saw_it() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        assert!(!plan.is_as_detected());
+
+        plan.reset_to_detected();
+        assert!(plan.is_as_detected());
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0]);
+    }
+
+    #[test]
+    fn a_reset_puts_a_split_moved_twice_back_where_the_scan_saw_it() {
+        let mut plan = plan_with_cuts(&[2.0]);
+        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        // A split added where the moved one was is the person's own.
+        plan.add_cut_near(2.25).unwrap();
+
+        plan.reset_to_detected();
+        assert!(plan.is_as_detected());
+        assert_eq!(plan.accepted_cuts().as_slice(), [2.0]);
+    }
+
+    #[test]
+    fn a_split_moved_back_to_where_the_scan_saw_it_is_as_detected_again() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        plan.nudge_cut_before(second_scene(), EARLIER).unwrap();
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn a_split_the_person_added_can_be_moved_and_a_reset_still_removes_it() {
+        let mut plan = plan_with_cuts(&[]);
+        plan.add_cut_near(4.0).unwrap();
+
+        assert_eq!(
+            plan.nudge_cut_before(second_scene(), LATER),
+            Ok(MovedCut { from: 4.0, to: 6.0 })
+        );
+        plan.reset_to_detected();
+        assert!(plan.accepted_cuts().is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_taken_before_a_move_puts_the_split_back() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        let before_the_move = plan.snapshot();
+
+        plan.nudge_cut_before(second_scene(), LATER).unwrap();
+        assert!(!plan.is_at(&before_the_move));
+        plan.restore(before_the_move);
+        assert!(plan.is_as_detected());
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0]);
+    }
+
+    #[test]
+    fn every_reason_a_split_cannot_move_is_explained() {
+        assert_eq!(
+            NudgeCutError::NoSplitBeforeScene.to_string(),
+            "This scene starts where the video starts, so there is no split to move."
+        );
+        assert_eq!(
+            NudgeCutError::NoCutPoint(EARLIER).to_string(),
+            "There is no earlier point where the video can be cut."
+        );
+        assert_eq!(
+            NudgeCutError::NoCutPoint(LATER).to_string(),
+            "There is no later point where the video can be cut."
+        );
+        assert_eq!(
+            NudgeCutError::SplitInTheWay { at: 6.0 }.to_string(),
+            "The split cannot move further. The split at 00:00:06.000 is in the way."
+        );
+        assert_eq!(
+            NudgeCutError::MergedPartsInTheWay { at: 6.0 }.to_string(),
+            "The split cannot move further. Two merged parts meet at 00:00:06.000."
+        );
+    }
+
     /// Runs edits of every kind on one plan, and calls `check` on the plan
     /// before the first edit and after each one.
     fn check_after_every_edit(check: impl Fn(&SplitPlan)) {
@@ -830,6 +1197,10 @@ mod tests {
         check(&plan);
 
         plan.add_cut_near(5.75).unwrap();
+        check(&plan);
+        // The added cut at 6 moves to 4.
+        plan.nudge_cut_before(SceneIndex::new(2), NudgeDirection::Earlier)
+            .unwrap();
         check(&plan);
         plan.merge_scenes(scenes(0, 2));
         check(&plan);

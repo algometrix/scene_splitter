@@ -18,9 +18,10 @@ use eframe::egui;
 
 use crate::detect::ScanKind;
 use crate::export::{ExportOptions, TRASH_NAME};
+use crate::focus::{self, PicturePosition, PictureStep, SceneStep};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::keyboard::{self, KeyboardOwner};
-use crate::plan::{CutIndex, SceneIndex, SceneLayout, SegmentIndex, SplitPlan};
+use crate::plan::{CutIndex, NudgeDirection, SceneIndex, SceneLayout, SegmentIndex, SplitPlan};
 use crate::review_session::{counted, ExportObstacle, ReviewRequest, ReviewSession};
 use crate::scan::UndecodedFrames;
 use crate::selection::ClickKind;
@@ -89,6 +90,59 @@ const TIPS: [(&str, &str); 3] = [
         "Ctrl+Z takes back the last change. Reset scenes goes back to the scenes as found.",
     ),
 ];
+/// Every key of the review screen, and what it does. "The scene" is the
+/// one with the dark frame, which `KEYS_INTRODUCTION` says.
+const KEYS: [(&str, &str); 13] = [
+    (
+        "Up, Down",
+        "Go to the scene above or below. Home and End go to the first and the last.",
+    ),
+    ("Shift+Up or Down", "Select more scenes, or fewer."),
+    ("Enter, Space", "Play the scene."),
+    ("Left, Right", "Choose a picture of the scene to play from."),
+    ("J", "Join the scene with the one below it."),
+    ("M", "Merge the selected scenes."),
+    ("U", "Take a merged scene apart again."),
+    (
+        "Alt+Left or Right",
+        "Move the split at the start of the scene earlier or later.",
+    ),
+    ("Ctrl+Z", "Take back the last change."),
+    ("Ctrl+A, Esc", "Select every scene, or none."),
+    ("Ctrl+Enter", "Split into files."),
+    (
+        "Tab",
+        "Go through the buttons and boxes. Space presses the one that is marked.",
+    ),
+    ("F1", "Show or hide this list."),
+];
+const KEYS_INTRODUCTION: &str = "The keys work on the scene with the dark frame.      While the player is open, Space pauses it and Left and Right skip in it.";
+const KEYS_HEADING: &str = "Keys";
+const SHOW_KEYS_LABEL: &str = "Show keys";
+const HIDE_KEYS_LABEL: &str = "Hide keys";
+const KEYS_LINK_HINT: &str = "Lists what every key does on this screen (F1).";
+const KEY_NAME_WIDTH: f32 = 130.0;
+
+const SPLIT_HINT: &str = "Starts the split (Ctrl+Enter).";
+const JOIN_HINT: &str = "Makes these two scenes one. You can also drag one onto the other,      or press J on the upper one.";
+const MOVE_SPLIT_EARLIER_LABEL: &str = "Move split earlier";
+const MOVE_SPLIT_LATER_LABEL: &str = "Move split later";
+const MOVE_SPLIT_EARLIER_HINT: &str =
+    "Moves the split between these two scenes to the point before it where the video can be cut      (Alt+Left on the lower scene).";
+const MOVE_SPLIT_LATER_HINT: &str =
+    "Moves the split between these two scenes to the point after it where the video can be cut      (Alt+Right on the lower scene).";
+
+/// The frame around the scene, and the picture, the keys act on. It is
+/// thicker and darker than any other outline on the screen, so it does not
+/// rest on colour alone.
+const FOCUS_RING_WIDTH: f32 = 3.0;
+const FOCUS_RING_COLOR: egui::Color32 = theme::TEXT;
+/// A light line inside the dark one, which keeps the frame visible around a
+/// dark picture.
+const PICTURE_FOCUS_INNER_WIDTH: f32 = 2.0;
+/// Room kept around a focused picture that is scrolled into view.
+const FOCUSED_PICTURE_MARGIN: f32 = 8.0;
+
 const TIP_TOPIC_WIDTH: f32 = 56.0;
 const TIP_COLUMN_GAP: f32 = 24.0;
 const MIN_TIP_WIDTH: f32 = 120.0;
@@ -253,6 +307,39 @@ struct SceneListInput {
     play_from: Option<f64>,
     /// The scene to join with the one after it.
     join_with_next: Option<SceneIndex>,
+    split_to_move: Option<SplitToMove>,
+}
+
+/// A split the person wants at the next point, earlier or later, where the
+/// video can be cut.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SplitToMove {
+    /// The scene that starts at the split.
+    scene_after: SceneIndex,
+    direction: NudgeDirection,
+}
+
+/// Whether the list of keys is on screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeysList {
+    Hidden,
+    Shown,
+}
+
+impl KeysList {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Hidden => Self::Shown,
+            Self::Shown => Self::Hidden,
+        }
+    }
+}
+
+/// Whether a preview is the picture the keys would play from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PictureMark {
+    Plain,
+    Focused,
 }
 
 impl SceneListInput {
@@ -295,9 +382,19 @@ pub struct ReviewScreen {
     /// How tall each scene's card was when it was last drawn, for leaving
     /// the right room for it while it is out of sight.
     card_heights: HashMap<CardShape, f32>,
-    /// How tall the "Join scenes" button between two cards is, once one was
-    /// drawn. They are all alike.
+    /// How tall the row between two cards is, with its "Join scenes" button,
+    /// once one was drawn. They are all alike.
     join_button_height: Option<f32>,
+    keys_list: KeysList,
+    /// Set when the list of keys was just asked for, to bring it into view.
+    /// It scrolls with the scenes and may be far above them.
+    scroll_to_keys_list: bool,
+    /// Whether a key that works on the focused scene was pressed in the
+    /// frame before this one. Its request has been applied by now.
+    focus_keys_used_last_frame: bool,
+    /// Whether this frame scrolls the focused scene into view, which it
+    /// does after such a key and not after a click.
+    bring_focus_into_view: bool,
 }
 
 impl Default for ReviewScreen {
@@ -316,6 +413,10 @@ impl Default for ReviewScreen {
             expanded_scenes: HashSet::new(),
             card_heights: HashMap::new(),
             join_button_height: None,
+            keys_list: KeysList::Hidden,
+            scroll_to_keys_list: false,
+            focus_keys_used_last_frame: false,
+            bring_focus_into_view: false,
         }
     }
 }
@@ -343,6 +444,12 @@ impl ReviewScreen {
         self.decode_previews_for_the_sharpness_of_the_screen(ctx);
         self.receive_loaded_previews(ctx);
         let mut requests = shortcut_requests(ctx, keyboard);
+        let asked_with_focus_keys = focus_key_requests(ctx, keyboard, session);
+        self.follow_the_focus_after_its_keys(ctx, &asked_with_focus_keys);
+        requests.extend(asked_with_focus_keys);
+        if keys_list_key_pressed(ctx, keyboard) {
+            self.toggle_keys_list();
+        }
 
         let asked_in_header = egui::TopBottomPanel::top("review_header")
             .frame(theme::header_panel())
@@ -360,7 +467,7 @@ impl ReviewScreen {
                     // Dragging moves scenes, the wheel and scroll bar scroll.
                     .drag_to_scroll(false)
                     .show(ui, |ui| {
-                        let asked_in_overview = show_overview(ui, session, settings);
+                        let asked_in_overview = self.show_overview(ui, session, settings);
                         (asked_in_overview, self.show_scenes(ui, session))
                     })
                     .inner
@@ -369,6 +476,53 @@ impl ReviewScreen {
         requests.extend(asked_in_overview);
         requests.extend(self.requests_from_scene_list(ctx, input));
         self.show_drag_hint(ctx);
+        requests
+    }
+
+    /// A key's request is applied once this frame is over, so the scene it
+    /// leaves the focus on is only known in the next frame. That frame
+    /// scrolls it into view.
+    fn follow_the_focus_after_its_keys(&mut self, ctx: &egui::Context, asked: &[ReviewRequest]) {
+        self.bring_focus_into_view = self.focus_keys_used_last_frame;
+        self.focus_keys_used_last_frame = !asked.is_empty();
+        if self.focus_keys_used_last_frame {
+            ctx.request_repaint();
+        }
+    }
+
+    fn toggle_keys_list(&mut self) {
+        self.keys_list = self.keys_list.toggled();
+        self.scroll_to_keys_list = self.keys_list == KeysList::Shown;
+    }
+
+    /// The part that scrolls away above the scenes: the key numbers, what
+    /// deserves attention, the tips and the list of keys.
+    fn show_overview(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &ReviewSession,
+        settings: &Settings,
+    ) -> Vec<ReviewRequest> {
+        let mut requests = show_notes(ui, session, settings);
+        if settings.show_tips {
+            match show_tips_card(ui, self.keys_list) {
+                TipsCard::HideAsked => {
+                    requests.push(ReviewRequest::ChangeSettings(SettingsChange::HideTips));
+                }
+                TipsCard::KeysListToggled => self.toggle_keys_list(),
+                TipsCard::Kept => {}
+            }
+        }
+        if self.keys_list == KeysList::Shown {
+            let keys_card = show_keys_card(ui);
+            if std::mem::take(&mut self.scroll_to_keys_list) {
+                ui.scroll_to_rect(keys_card.area, Some(egui::Align::TOP));
+            }
+            if keys_card.hide_asked {
+                self.toggle_keys_list();
+            }
+        }
+        ui.add_space(SPACE_BETWEEN_SCENES);
         requests
     }
 
@@ -431,6 +585,13 @@ impl ReviewScreen {
                 .on_hover_text("For videos that change scene without a black screen.");
             if missed.clicked() {
                 self.missed_scenes_open = !self.missed_scenes_open;
+            }
+            let keys_label = match self.keys_list {
+                KeysList::Hidden => KEYS_HEADING,
+                KeysList::Shown => HIDE_KEYS_LABEL,
+            };
+            if ui.link(keys_label).on_hover_text(KEYS_LINK_HINT).clicked() {
+                self.toggle_keys_list();
             }
         });
         if self.missed_scenes_open {
@@ -517,6 +678,7 @@ impl ReviewScreen {
             let room_out_of_sight = heights_last_frame
                 .get(&shape)
                 .and_then(|&height| leave_room_if_out_of_sight(ui, height));
+            let was_out_of_sight = room_out_of_sight.is_some();
             let card = match room_out_of_sight {
                 Some(room) => room,
                 None => {
@@ -534,31 +696,52 @@ impl ReviewScreen {
             if self.scene_to_scroll_to == Some(scene) {
                 ui.scroll_to_rect(card, Some(egui::Align::TOP));
             }
+            let focused_here = session.focus().filter(|focus| focus.scene() == scene);
+            if let Some(focus) = focused_here.filter(|_| self.bring_focus_into_view) {
+                // A chosen picture brings itself into view where it is
+                // drawn, which shows more of a tall card than its top.
+                if focus.picture().is_none() || was_out_of_sight {
+                    ui.scroll_to_rect(card.expand(FOCUS_RING_WIDTH), None);
+                }
+            }
             self.scene_cards.push(card);
 
             let is_last_scene = scene.next().position() == layouts.len();
             if is_last_scene {
                 ui.add_space(SPACE_BETWEEN_SCENES);
-            } else if self.show_join_button_if_in_sight(ui, scene) {
-                input.join_with_next = Some(scene);
+                continue;
+            }
+            match self.show_join_row_if_in_sight(ui, scene) {
+                Some(BetweenScenes::Join) => input.join_with_next = Some(scene),
+                Some(BetweenScenes::MoveSplit(direction)) => {
+                    input.split_to_move = Some(SplitToMove {
+                        scene_after: scene.next(),
+                        direction,
+                    });
+                }
+                None => {}
             }
         }
         self.scene_to_scroll_to = None;
         input
     }
 
-    /// Draws the button that joins `scene` with the next one, or only leaves
-    /// room for it while it is out of sight. Returns true when it was clicked.
-    fn show_join_button_if_in_sight(&mut self, ui: &mut egui::Ui, scene: SceneIndex) -> bool {
+    /// Draws the row between `scene` and the next one, or only leaves room
+    /// for it while it is out of sight. Returns what was asked for on it.
+    fn show_join_row_if_in_sight(
+        &mut self,
+        ui: &mut egui::Ui,
+        scene: SceneIndex,
+    ) -> Option<BetweenScenes> {
         let room_out_of_sight = self
             .join_button_height
             .and_then(|height| leave_room_if_out_of_sight(ui, height));
         if room_out_of_sight.is_some() {
-            return false;
+            return None;
         }
-        let button = show_join_button(ui, scene);
-        self.join_button_height = Some(button.height);
-        button.clicked
+        let row = show_join_row(ui, scene);
+        self.join_button_height = Some(row.height);
+        row.asked
     }
 
     fn card_shape(&self, layout: &SceneLayout, width: f32) -> CardShape {
@@ -662,6 +845,8 @@ impl ReviewScreen {
 
         let parts_view = self.parts_view(layout);
         let mut wanted_parts_view = None;
+        let focus_here = session.focus().filter(|focus| focus.scene() == scene);
+        let focused_picture = focus_here.and_then(|focus| focus.picture());
         let card = egui::Frame::none()
             .fill(fill)
             .rounding(theme::CARD_ROUNDING)
@@ -679,6 +864,11 @@ impl ReviewScreen {
                 let preview_size = preview_size_for(room_for_previews, ui.spacing().item_spacing.x);
                 let part_count = layout.segments.len();
                 let rows = part_rows(part_count, parts_view);
+                // A picture chosen with the keys in a part that is not
+                // shown would be a focus nobody can see.
+                if focused_picture.is_some_and(|picture| !shows_part_of(&rows, picture)) {
+                    wanted_parts_view = Some(PartsView::Expanded);
+                }
                 for (row_position, row) in rows.iter().enumerate() {
                     match *row {
                         PartRow::Part(position_in_scene) => {
@@ -687,7 +877,14 @@ impl ReviewScreen {
                                 layout,
                                 position_in_scene,
                             };
-                            self.show_part(ui, session.video(), part, preview_size, input);
+                            self.show_part(
+                                ui,
+                                session.video(),
+                                part,
+                                preview_size,
+                                focused_picture,
+                                input,
+                            );
                             // The button that separates two parts is only
                             // offered between two parts that are both shown.
                             let next_part = PartRow::Part(position_in_scene + 1);
@@ -728,6 +925,9 @@ impl ReviewScreen {
         };
         ui.painter()
             .rect_filled(color_bar, left_corners_only, color);
+        if focus_here.is_some() {
+            paint_focus_ring(ui.painter(), card, theme::CARD_ROUNDING);
+        }
         card
     }
 
@@ -739,6 +939,7 @@ impl ReviewScreen {
         video: &Arc<Path>,
         part: ScenePart,
         preview_size: egui::Vec2,
+        focused_picture: Option<PicturePosition>,
         input: &mut SceneListInput,
     ) {
         let ScenePart {
@@ -750,8 +951,15 @@ impl ReviewScreen {
         // Wrapped, so a narrow card shows two rows of pictures instead of
         // cutting the last ones off.
         ui.horizontal_wrapped(|ui| {
-            for time in thumbnails::preview_times(segment) {
-                if self.show_preview(ui, video, time, preview_size) {
+            let preview_times = thumbnails::preview_times(segment);
+            for (place_in_part, time) in preview_times.into_iter().enumerate() {
+                let picture = focus::picture_position(position_in_scene, place_in_part);
+                let mark = if focused_picture == Some(picture) {
+                    PictureMark::Focused
+                } else {
+                    PictureMark::Plain
+                };
+                if self.show_preview(ui, video, time, preview_size, mark) {
                     input.note_preview_click(scene, time, ui);
                 }
             }
@@ -832,6 +1040,12 @@ impl ReviewScreen {
         if let Some(scene) = input.join_with_next {
             return vec![ReviewRequest::MergeScenes(scene..=scene.next())];
         }
+        if let Some(split) = input.split_to_move {
+            return vec![ReviewRequest::NudgeSplit {
+                scene: split.scene_after,
+                direction: split.direction,
+            }];
+        }
         let mut requests = Vec::new();
         if let Some(scene) = input.clicked_scene {
             let modifiers = ctx.input(|input| input.modifiers);
@@ -890,6 +1104,7 @@ impl ReviewScreen {
         video: &Arc<Path>,
         time: f64,
         size: egui::Vec2,
+        mark: PictureMark,
     ) -> bool {
         let key = preview_key(time, self.preview_pixels);
         // Only previews that can be seen are fetched, so opening a video of
@@ -915,6 +1130,12 @@ impl ReviewScreen {
             Some(Preview::Loading) | None => (show_placeholder(ui, size, "Loading"), None),
         };
         let clicked = response.clicked();
+        if mark == PictureMark::Focused {
+            paint_picture_focus(ui.painter(), response.rect);
+            if self.bring_focus_into_view {
+                ui.scroll_to_rect(response.rect.expand(FOCUSED_PICTURE_MARGIN), None);
+            }
+        }
         if self.dragged_scene.is_none() {
             response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -1154,6 +1375,135 @@ fn preview_hover_text(time: f64, why_no_preview: Option<&str>) -> String {
     }
 }
 
+/// Whether the part a picture belongs to is among the rows that are drawn.
+fn shows_part_of(rows: &[PartRow], picture: PicturePosition) -> bool {
+    rows.contains(&PartRow::Part(focus::part_of(picture)))
+}
+
+/// Frames what the keys act on, just outside its own edge.
+fn paint_focus_ring(painter: &egui::Painter, around: egui::Rect, rounding: f32) {
+    let half_width = FOCUS_RING_WIDTH / 2.0;
+    painter.rect_stroke(
+        around.expand(half_width),
+        rounding + half_width,
+        egui::Stroke::new(FOCUS_RING_WIDTH, FOCUS_RING_COLOR),
+    );
+}
+
+fn paint_picture_focus(painter: &egui::Painter, picture: egui::Rect) {
+    let half_width = PICTURE_FOCUS_INNER_WIDTH / 2.0;
+    painter.rect_stroke(
+        picture.shrink(half_width),
+        PREVIEW_ROUNDING,
+        egui::Stroke::new(PICTURE_FOCUS_INNER_WIDTH, egui::Color32::WHITE),
+    );
+    paint_focus_ring(painter, picture, PREVIEW_ROUNDING);
+}
+
+/// Whether the key that shows or hides the list of keys was pressed.
+fn keys_list_key_pressed(ctx: &egui::Context, keyboard: KeyboardOwner) -> bool {
+    keyboard.lets_screens_use_keys(ctx) && ctx.input(|input| input.key_pressed(egui::Key::F1))
+}
+
+/// What the keys that work on the focused scene ask for: moving the focus,
+/// playing, joining, taking apart, moving a split, and starting the split.
+fn focus_key_requests(
+    ctx: &egui::Context,
+    keyboard: KeyboardOwner,
+    session: &ReviewSession,
+) -> Vec<ReviewRequest> {
+    if !keyboard.lets_screens_use_keys(ctx) {
+        return Vec::new();
+    }
+    let a_control_has_the_keys = keyboard::a_control_has_the_keys(ctx);
+    ctx.input(|input| {
+        let mut requests: Vec<ReviewRequest> = letter_key_request(input).into_iter().collect();
+        // Enter and Space press a control that was reached with Tab, and
+        // the arrow keys move on from it. They are not also read here.
+        if a_control_has_the_keys {
+            return requests;
+        }
+        requests.extend(scene_step_request(input));
+        requests.extend(left_or_right_request(input, session));
+        requests.extend(enter_or_space_request(input, session));
+        requests
+    })
+}
+
+fn letter_key_request(input: &egui::InputState) -> Option<ReviewRequest> {
+    // With Ctrl or Alt held a letter is some other shortcut.
+    if input.modifiers.command || input.modifiers.alt {
+        return None;
+    }
+    if input.key_pressed(egui::Key::J) {
+        return Some(ReviewRequest::JoinFocusedWithNext);
+    }
+    input
+        .key_pressed(egui::Key::U)
+        .then_some(ReviewRequest::TakeSelectedApart)
+}
+
+/// Up, Down, Home and End move the focus. With Shift held the selection
+/// reaches from where it began to the scene the focus lands on.
+fn scene_step_request(input: &egui::InputState) -> Option<ReviewRequest> {
+    if input.modifiers.command || input.modifiers.alt {
+        return None;
+    }
+    let step = [
+        (egui::Key::ArrowUp, SceneStep::Previous),
+        (egui::Key::ArrowDown, SceneStep::Next),
+        (egui::Key::Home, SceneStep::First),
+        (egui::Key::End, SceneStep::Last),
+    ]
+    .into_iter()
+    .find(|(key, _)| input.key_pressed(*key))
+    .map(|(_, step)| step)?;
+    let kind = if input.modifiers.shift {
+        ClickKind::ExtendRange
+    } else {
+        ClickKind::Single
+    };
+    Some(ReviewRequest::StepFocus { step, kind })
+}
+
+/// Left and Right choose a picture of the focused scene. With Alt held they
+/// move the split that scene starts at.
+fn left_or_right_request(
+    input: &egui::InputState,
+    session: &ReviewSession,
+) -> Option<ReviewRequest> {
+    let (picture_step, direction) = if input.key_pressed(egui::Key::ArrowLeft) {
+        (PictureStep::Previous, NudgeDirection::Earlier)
+    } else if input.key_pressed(egui::Key::ArrowRight) {
+        (PictureStep::Next, NudgeDirection::Later)
+    } else {
+        return None;
+    };
+    if input.modifiers.is_none() {
+        return Some(ReviewRequest::StepPicture(picture_step));
+    }
+    if input.modifiers != egui::Modifiers::ALT {
+        return None;
+    }
+    let scene = session.focus()?.scene();
+    Some(ReviewRequest::NudgeSplit { scene, direction })
+}
+
+/// Enter and Space play the focused scene. Ctrl+Enter starts the split,
+/// which goes through the same questions as the button.
+fn enter_or_space_request(
+    input: &egui::InputState,
+    session: &ReviewSession,
+) -> Option<ReviewRequest> {
+    let enter = input.key_pressed(egui::Key::Enter);
+    if enter && input.modifiers.command {
+        // One scene is the untouched video, and the button is off as well.
+        return (session.scene_count() > 1).then_some(ReviewRequest::Split);
+    }
+    let play = enter || input.key_pressed(egui::Key::Space);
+    (play && input.modifiers.is_none()).then_some(ReviewRequest::PlayFocused)
+}
+
 /// What the keys pressed in this frame ask for.
 fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<ReviewRequest> {
     // Behind a dialog the keys are the dialog's, and keys typed into a text
@@ -1196,6 +1546,7 @@ fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Opt
             // One scene is the untouched video, there is nothing to write.
             let export_button = ui
                 .add_enabled(scene_count > 1, theme::primary_button(label))
+                .on_hover_text(SPLIT_HINT)
                 .on_disabled_hover_text("There is only one scene, so there is nothing to split.");
             if export_button.clicked() {
                 request = Some(ReviewRequest::Split);
@@ -1307,7 +1658,7 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
             session.has_merged_scene_selected(),
             egui::Button::new("Undo merge"),
         )
-        .on_hover_text("Takes the selected merged scenes apart again.")
+        .on_hover_text("Takes the selected merged scenes apart again (U).")
         .on_disabled_hover_text("Select a merged scene to take it apart again.");
     if undo_merge_button.clicked() {
         request = Some(ReviewRequest::TakeSelectedApart);
@@ -1395,9 +1746,9 @@ fn show_rescan_consent(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
     request
 }
 
-/// The part that scrolls away above the scenes: the key numbers, what
-/// deserves attention, and the tips.
-fn show_overview(
+/// The key numbers and what deserves attention, at the top of the part that
+/// scrolls away above the scenes.
+fn show_notes(
     ui: &mut egui::Ui,
     session: &ReviewSession,
     settings: &Settings,
@@ -1421,10 +1772,6 @@ fn show_overview(
             show_note(ui, &warning, theme::ROSE_TILE);
         }
     }
-    if settings.show_tips && show_tips_card(ui) == TipsCard::HideAsked {
-        requests.push(ReviewRequest::ChangeSettings(SettingsChange::HideTips));
-    }
-    ui.add_space(SPACE_BETWEEN_SCENES);
     requests
 }
 
@@ -1500,16 +1847,18 @@ fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
     }
 }
 
-/// Whether the person asked for the tips to go away.
+/// What the person asked for on the tips card.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TipsCard {
     HideAsked,
+    /// Show the list of keys, or hide it again.
+    KeysListToggled,
     Kept,
 }
 
 /// How to use the review screen, for someone seeing it for the first time.
 /// It scrolls away with the scenes, can be hidden, and the choice is kept.
-fn show_tips_card(ui: &mut egui::Ui) -> TipsCard {
+fn show_tips_card(ui: &mut egui::Ui, keys_list: KeysList) -> TipsCard {
     let mut tips_card = TipsCard::Kept;
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -1518,6 +1867,17 @@ fn show_tips_card(ui: &mut egui::Ui) -> TipsCard {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Hide tips").clicked() {
                     tips_card = TipsCard::HideAsked;
+                }
+                let keys_label = match keys_list {
+                    KeysList::Hidden => SHOW_KEYS_LABEL,
+                    KeysList::Shown => HIDE_KEYS_LABEL,
+                };
+                if ui
+                    .button(keys_label)
+                    .on_hover_text(KEYS_LINK_HINT)
+                    .clicked()
+                {
+                    tips_card = TipsCard::KeysListToggled;
                 }
             });
         });
@@ -1539,6 +1899,48 @@ fn show_tips_card(ui: &mut egui::Ui) -> TipsCard {
             });
     });
     tips_card
+}
+
+/// What drawing the list of keys gave.
+struct KeysCard {
+    hide_asked: bool,
+    /// Where the card was drawn, for scrolling it into view.
+    area: egui::Rect,
+}
+
+/// Every key of the review screen with what it does, for a person who
+/// reviews without the mouse.
+fn show_keys_card(ui: &mut egui::Ui) -> KeysCard {
+    let mut hide_asked = false;
+    let card = theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::semibold(KEYS_HEADING, 14.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                hide_asked = ui.button(HIDE_KEYS_LABEL).clicked();
+            });
+        });
+        ui.add(egui::Label::new(theme::muted(KEYS_INTRODUCTION)).wrap());
+        let room_for_an_action =
+            (ui.available_width() - KEY_NAME_WIDTH - TIP_COLUMN_GAP).max(MIN_TIP_WIDTH);
+        egui::Grid::new("keys")
+            .num_columns(2)
+            // Rows of text need not be as tall as rows of buttons.
+            .min_row_height(0.0)
+            .min_col_width(KEY_NAME_WIDTH)
+            .max_col_width(room_for_an_action)
+            .show(ui, |ui| {
+                for (key, action) in KEYS {
+                    ui.label(theme::semibold(key, 13.0).color(theme::PRIMARY));
+                    ui.add(egui::Label::new(action).wrap());
+                    ui.end_row();
+                }
+            });
+    });
+    KeysCard {
+        hide_asked,
+        area: card.response.rect,
+    }
 }
 
 /// Whether the person pressed the button that scans a one-scene video again,
@@ -1583,31 +1985,60 @@ fn show_note(ui: &mut egui::Ui, text: &str, tint: egui::Color32) {
         });
 }
 
-/// What drawing the button between two scene cards gave.
-struct JoinButton {
-    clicked: bool,
-    /// How much room the button took, for leaving the same room where a
-    /// button is out of sight.
+/// What the person asked for on the row between two scene cards.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BetweenScenes {
+    Join,
+    MoveSplit(NudgeDirection),
+}
+
+/// What drawing the row between two scene cards gave.
+struct JoinRow {
+    asked: Option<BetweenScenes>,
+    /// How much room the row took, for leaving the same room where a row is
+    /// out of sight.
     height: f32,
 }
 
-/// The small button between two scene cards.
-fn show_join_button(ui: &mut egui::Ui, scene: SceneIndex) -> JoinButton {
-    let label = format!(
+/// The row between two scene cards, which is where the split between them
+/// is: a small button to join the two, and one at each end to move the
+/// split, earlier at the left and later at the right.
+fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex) -> JoinRow {
+    let join_label = format!(
         "Join scenes {} and {}",
         scene.number(),
         scene.next().number()
     );
-    let row = ui.vertical_centered(|ui| {
-        ui.add(egui::Button::new(theme::caption(label)).frame(false))
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Makes these two scenes one. You can also drag one onto the other.")
-            .clicked()
+    let mut asked = None;
+    let row = ui.horizontal(|ui| {
+        if show_quiet_button(ui, MOVE_SPLIT_EARLIER_LABEL, MOVE_SPLIT_EARLIER_HINT) {
+            asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Earlier));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if show_quiet_button(ui, MOVE_SPLIT_LATER_LABEL, MOVE_SPLIT_LATER_HINT) {
+                asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Later));
+            }
+            // In the middle of the room the two other buttons leave.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                if show_quiet_button(ui, &join_label, JOIN_HINT) {
+                    asked = Some(BetweenScenes::Join);
+                }
+            });
+        });
     });
-    JoinButton {
-        clicked: row.inner,
+    JoinRow {
+        asked,
         height: row.response.rect.height(),
     }
+}
+
+/// A small button without a frame, for the row between two cards, where
+/// framed buttons would read as part of a card. Returns true when clicked.
+fn show_quiet_button(ui: &mut egui::Ui, label: &str, hint: &str) -> bool {
+    ui.add(egui::Button::new(theme::caption(label)).frame(false))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hint)
+        .clicked()
 }
 
 /// The button after one part of a merged scene that splits the scene in two
@@ -1846,6 +2277,8 @@ mod tests {
         window: egui::Vec2,
         time: f64,
         last_follow_up: Option<FollowUp>,
+        /// What the last frame painted.
+        shapes: Vec<egui::epaint::ClippedShape>,
     }
 
     impl Screen {
@@ -1866,6 +2299,7 @@ mod tests {
                 window,
                 time: 0.0,
                 last_follow_up: None,
+                shapes: Vec::new(),
             };
             // Cards take input from their second frame on.
             screen.frame(Vec::new(), egui::Modifiers::NONE);
@@ -1889,12 +2323,14 @@ mod tests {
                 settings,
                 keyboard,
                 last_follow_up,
+                shapes,
                 ..
             } = self;
             let mut requests = Vec::new();
-            let _ = ctx.run(input, |ctx| {
+            let output = ctx.run(input, |ctx| {
                 requests = view.show(ctx, session, settings, None, *keyboard);
             });
+            *shapes = output.shapes;
             // No scene files of an earlier split are in the way.
             let follow_up = session.apply_frame(requests, &test_sessions::nothing_in_the_way);
             // Settings are the app's to keep, and this stands in for it.
@@ -1978,6 +2414,49 @@ mod tests {
             self.press(egui::Key::Z, egui::Modifiers::COMMAND);
         }
 
+        fn press_plain(&mut self, key: egui::Key) {
+            self.press(key, egui::Modifiers::NONE);
+        }
+
+        /// The position of the scene the keys act on, counted from zero.
+        fn focused_scene(&self) -> Option<usize> {
+            self.session.focus().map(|focus| focus.scene().position())
+        }
+
+        /// How many focus frames the last frame painted.
+        fn focus_rings(&self) -> usize {
+            self.shapes
+                .iter()
+                .map(|clipped| focus_rings_in(&clipped.shape))
+                .sum()
+        }
+
+        /// How far to the right the last frame wrote anything.
+        fn right_edge_of_all_text(&self) -> f32 {
+            self.shapes
+                .iter()
+                .map(|clipped| right_edge_of_text_in(&clipped.shape))
+                .fold(f32::NEG_INFINITY, f32::max)
+        }
+
+        /// A spot on the row between a scene's card and the next card, this
+        /// far from the left edge of the cards.
+        fn between_scene_and_next(&self, scene: usize, from_left: f32) -> egui::Pos2 {
+            let above = self.view.scene_cards[scene];
+            let below = self.view.scene_cards[scene + 1];
+            egui::pos2(
+                above.left() + from_left,
+                (above.bottom() + below.top()) / 2.0,
+            )
+        }
+
+        fn split_feedback(&self) -> String {
+            self.session
+                .new_split_feedback()
+                .map(|feedback| feedback.in_words())
+                .unwrap_or_default()
+        }
+
         fn scene_ends(&self) -> Vec<f64> {
             self.session
                 .scenes()
@@ -1994,6 +2473,334 @@ mod tests {
                 .map(SceneIndex::position)
                 .collect()
         }
+    }
+
+    fn focus_rings_in(shape: &egui::Shape) -> usize {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().map(focus_rings_in).sum(),
+            egui::Shape::Rect(rect) => {
+                let is_focus_ring =
+                    rect.stroke.width == FOCUS_RING_WIDTH && rect.stroke.color == FOCUS_RING_COLOR;
+                usize::from(is_focus_ring)
+            }
+            _ => 0,
+        }
+    }
+
+    fn right_edge_of_text_in(shape: &egui::Shape) -> f32 {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .map(right_edge_of_text_in)
+                .fold(f32::NEG_INFINITY, f32::max),
+            egui::Shape::Text(text) => text.visual_bounding_rect().right(),
+            _ => f32::NEG_INFINITY,
+        }
+    }
+
+    #[test]
+    fn the_list_of_keys_and_the_word_on_a_moved_split_fit_the_smallest_window() {
+        // As wide as what is left of a window 900 points wide beside the
+        // queue.
+        const NARROW_WINDOW: egui::Vec2 = egui::vec2(600.0, 3000.0);
+        let mut screen = Screen::showing(test_sessions::five_scenes(), NARROW_WINDOW);
+        assert!(screen.right_edge_of_all_text() <= NARROW_WINDOW.x);
+
+        screen.press_plain(egui::Key::F1);
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        screen.press(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert!(screen.split_feedback().contains("is in the way"));
+        assert_eq!(screen.view.keys_list, KeysList::Shown);
+        assert!(screen.right_edge_of_all_text() <= NARROW_WINDOW.x);
+    }
+
+    #[test]
+    fn the_arrow_keys_move_a_framed_focus_through_the_scenes() {
+        let mut screen = Screen::with_five_scenes();
+        assert_eq!(screen.focus_rings(), 0);
+
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+        assert_eq!(screen.focused_scene(), Some(1));
+        assert_eq!(screen.selected_scenes(), vec![1]);
+        assert_eq!(screen.focus_rings(), 1);
+
+        screen.press_plain(egui::Key::End);
+        assert_eq!(screen.focused_scene(), Some(4));
+        screen.press_plain(egui::Key::Home);
+        screen.press_plain(egui::Key::ArrowUp);
+        assert_eq!(screen.focused_scene(), Some(0));
+        assert_eq!(screen.focus_rings(), 1);
+        // The arrow keys moved through the scenes, and gave no button the
+        // keys on the way.
+        assert!(!keyboard::a_control_has_the_keys(&screen.ctx));
+    }
+
+    #[test]
+    fn a_click_moves_the_focus_and_the_keys_go_on_from_there() {
+        let mut screen = Screen::with_five_scenes();
+        screen.click_scene(2, egui::Modifiers::NONE);
+        assert_eq!(screen.focused_scene(), Some(2));
+
+        screen.press_plain(egui::Key::ArrowDown);
+        assert_eq!(screen.focused_scene(), Some(3));
+    }
+
+    #[test]
+    fn shift_with_the_arrow_keys_selects_a_run_of_scenes_for_m_to_merge() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press(egui::Key::ArrowDown, egui::Modifiers::SHIFT);
+        screen.press(egui::Key::ArrowDown, egui::Modifiers::SHIFT);
+        assert_eq!(screen.selected_scenes(), vec![0, 1, 2]);
+
+        screen.press_plain(egui::Key::M);
+        assert_eq!(screen.scene_ends(), vec![60.0, 80.0, 100.0]);
+        assert_eq!(screen.focused_scene(), Some(0));
+    }
+
+    #[test]
+    fn a_scene_focused_with_the_keys_is_scrolled_into_view() {
+        let mut screen = screen_with_many_scenes(SMALL_WINDOW);
+        let last = MANY_SCENES - 1;
+        assert!(!card_is_laid_out(&screen, last));
+
+        screen.press_plain(egui::Key::End);
+        // The list scrolls over the next frames.
+        for _ in 0..40 {
+            screen.frame(Vec::new(), egui::Modifiers::NONE);
+        }
+        assert_eq!(screen.focused_scene(), Some(last));
+        assert!(card_is_laid_out(&screen, last));
+        let card = screen.view.scene_cards[last];
+        assert!(screen.view.list_area.contains_rect(card));
+        assert_eq!(screen.focus_rings(), 1);
+    }
+
+    #[test]
+    fn enter_and_space_play_the_focused_scene_from_its_start() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::Enter);
+        assert_eq!(screen.last_follow_up, Some(FollowUp::PlayFrom(20.0)));
+
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::Space);
+        assert_eq!(screen.last_follow_up, Some(FollowUp::PlayFrom(40.0)));
+    }
+
+    #[test]
+    fn left_and_right_choose_a_framed_picture_to_play_from() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowRight);
+        screen.press_plain(egui::Key::ArrowRight);
+        // The card and the chosen picture each have a frame.
+        assert_eq!(screen.focus_rings(), 2);
+
+        screen.press_plain(egui::Key::Enter);
+        // The second of four pictures of a scene from 0 to 20 seconds.
+        assert_eq!(screen.last_follow_up, Some(FollowUp::PlayFrom(7.5)));
+
+        screen.press_plain(egui::Key::ArrowLeft);
+        screen.press_plain(egui::Key::ArrowLeft);
+        assert_eq!(screen.focus_rings(), 1);
+    }
+
+    #[test]
+    fn a_picture_chosen_in_a_part_that_is_not_shown_shows_every_part() {
+        let mut screen = screen_with_one_scene_of_ten_parts();
+        let layout = screen.session.plan().scene_layouts()[0].clone();
+        screen.press_plain(egui::Key::ArrowDown);
+        // The first two parts are shown, with four pictures each.
+        for _ in 0..8 {
+            screen.press_plain(egui::Key::ArrowRight);
+        }
+        assert_eq!(screen.view.parts_view(&layout), PartsView::Collapsed);
+
+        screen.press_plain(egui::Key::ArrowRight);
+        assert_eq!(screen.view.parts_view(&layout), PartsView::Expanded);
+        // The frame after the one that asked for every part draws them.
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        assert_eq!(screen.focus_rings(), 2);
+    }
+
+    #[test]
+    fn j_joins_the_focused_scene_with_the_next_and_u_takes_it_apart() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::J);
+        assert_eq!(screen.scene_ends(), vec![20.0, 60.0, 80.0, 100.0]);
+        assert_eq!(screen.focused_scene(), Some(1));
+
+        screen.press_plain(egui::Key::U);
+        assert_eq!(screen.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+        assert_eq!(screen.focused_scene(), Some(1));
+    }
+
+    #[test]
+    fn alt_with_left_or_right_moves_the_split_the_focused_scene_starts_at() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowDown);
+
+        screen.press(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert_eq!(screen.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
+        assert_eq!(
+            screen.split_feedback(),
+            "Moved the split from 00:00:20.000 to 00:00:30.000."
+        );
+        assert_eq!(screen.focused_scene(), Some(1));
+        // No picture was chosen by the same press.
+        assert_eq!(screen.focus_rings(), 1);
+
+        // The next point where the video can be cut is the split at 40.
+        screen.press(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert_eq!(screen.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
+        assert_eq!(
+            screen.split_feedback(),
+            "The split cannot move further. The split at 00:00:40.000 is in the way."
+        );
+
+        screen.press(egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        screen.press(egui::Key::ArrowLeft, egui::Modifiers::ALT);
+        assert_eq!(screen.scene_ends(), vec![10.0, 40.0, 60.0, 80.0, 100.0]);
+
+        screen.press_ctrl_z();
+        assert_eq!(screen.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn the_buttons_at_the_ends_of_the_row_between_two_cards_move_their_split() {
+        const INTO_THE_BUTTON: f32 = 30.0;
+        let mut screen = Screen::with_five_scenes();
+        let earlier = screen.between_scene_and_next(1, INTO_THE_BUTTON);
+        screen.click_at(earlier, egui::Modifiers::NONE);
+        assert_eq!(screen.scene_ends(), vec![20.0, 30.0, 60.0, 80.0, 100.0]);
+        assert_eq!(
+            screen.split_feedback(),
+            "Moved the split from 00:00:40.000 to 00:00:30.000."
+        );
+
+        let card_width = screen.view.scene_cards[1].width();
+        let later = screen.between_scene_and_next(1, card_width - INTO_THE_BUTTON);
+        screen.click_at(later, egui::Modifiers::NONE);
+        assert_eq!(screen.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+        // The keys now work on the scene that starts at the moved split.
+        assert_eq!(screen.focused_scene(), Some(2));
+
+        screen.press_ctrl_z();
+        screen.press_ctrl_z();
+        assert!(!screen.session.is_edited());
+    }
+
+    #[test]
+    fn the_row_between_two_cards_fits_the_smallest_window() {
+        // As wide as what is left of a window 900 points wide beside the
+        // queue, and tall enough to have the first cards in view.
+        const NARROW_WINDOW: egui::Vec2 = egui::vec2(600.0, 3000.0);
+        const INTO_THE_BUTTON: f32 = 30.0;
+        let mut screen = Screen::showing(test_sessions::five_scenes(), NARROW_WINDOW);
+        let card = screen.view.scene_cards[0];
+        assert!(card.right() <= NARROW_WINDOW.x);
+
+        // All three buttons are there, each where it is expected.
+        let middle = screen.between_scene_and_next(0, card.width() / 2.0);
+        screen.click_at(middle, egui::Modifiers::NONE);
+        assert_eq!(screen.scene_ends(), vec![40.0, 60.0, 80.0, 100.0]);
+        screen.press_ctrl_z();
+
+        let later = screen.between_scene_and_next(0, card.width() - INTO_THE_BUTTON);
+        screen.click_at(later, egui::Modifiers::NONE);
+        assert_eq!(screen.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
+        let earlier = screen.between_scene_and_next(0, INTO_THE_BUTTON);
+        screen.click_at(earlier, egui::Modifiers::NONE);
+        assert_eq!(screen.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn ctrl_enter_asks_for_the_split_like_the_button_does() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press(egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert_eq!(screen.last_follow_up, Some(FollowUp::Export));
+    }
+
+    #[test]
+    fn ctrl_enter_does_nothing_while_there_is_only_one_scene() {
+        let mut screen = Screen::showing(test_sessions::scenes_of_twenty_seconds(1), SCREEN);
+        screen.press(egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert_eq!(screen.last_follow_up, None);
+    }
+
+    #[test]
+    fn behind_a_dialog_the_keys_neither_move_the_focus_nor_act_on_it() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.keyboard = KeyboardOwner::Dialog;
+
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::End);
+        assert_eq!(screen.focused_scene(), Some(0));
+        screen.press_plain(egui::Key::J);
+        screen.press(egui::Key::ArrowRight, egui::Modifiers::ALT);
+        assert!(!screen.session.is_edited());
+        screen.press_plain(egui::Key::Enter);
+        screen.press_plain(egui::Key::Space);
+        screen.press(egui::Key::Enter, egui::Modifiers::COMMAND);
+        assert_eq!(screen.last_follow_up, None);
+        screen.press_plain(egui::Key::F1);
+        assert_eq!(screen.view.keys_list, KeysList::Hidden);
+    }
+
+    #[test]
+    fn a_button_reached_with_tab_keeps_enter_space_and_the_arrow_keys() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::Tab);
+        assert!(keyboard::a_control_has_the_keys(&screen.ctx));
+
+        // The arrow keys now move on from that button, and Enter and Space
+        // would press it.
+        let focus_before = screen.session.focus();
+        screen.press_plain(egui::Key::End);
+        screen.press_plain(egui::Key::ArrowDown);
+        screen.press_plain(egui::Key::ArrowRight);
+        assert_eq!(screen.session.focus(), focus_before);
+
+        // Escape gives the keys back to the scene list.
+        screen.press_plain(egui::Key::Escape);
+        assert!(!keyboard::a_control_has_the_keys(&screen.ctx));
+        screen.press_plain(egui::Key::End);
+        assert_eq!(screen.focused_scene(), Some(4));
+    }
+
+    #[test]
+    fn f1_shows_the_list_of_keys_and_hides_it_again() {
+        let mut screen = Screen::with_five_scenes();
+        let first_card_top = screen.view.scene_cards[0].top();
+
+        screen.press_plain(egui::Key::F1);
+        assert_eq!(screen.view.keys_list, KeysList::Shown);
+        // The list is drawn above the scenes, which move down for it.
+        assert!(screen.view.scene_cards[0].top() > first_card_top);
+
+        screen.press_plain(egui::Key::F1);
+        assert_eq!(screen.view.keys_list, KeysList::Hidden);
+        assert_eq!(screen.view.scene_cards[0].top(), first_card_top);
+    }
+
+    #[test]
+    fn every_key_in_the_list_is_named_and_explained() {
+        for (key, action) in KEYS {
+            assert!(!key.is_empty());
+            assert!(action.ends_with('.'), "{action}");
+        }
+        let names: HashSet<&str> = KEYS.iter().map(|(key, _)| *key).collect();
+        assert_eq!(names.len(), KEYS.len());
     }
 
     #[test]
