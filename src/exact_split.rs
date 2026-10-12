@@ -712,8 +712,7 @@ fn encode_arguments(
     }
     arguments = arguments
         // Every picture keeps the exact time the original gives it.
-        .with(&picture_times.arguments())
-        .with(&["-enc_time_base", "-1"]);
+        .with(&picture_times.arguments());
     if reorder_ticks != 0 {
         arguments = arguments.option("-bsf:v", format!("setts=dts=PTS-{reorder_ticks}"));
     }

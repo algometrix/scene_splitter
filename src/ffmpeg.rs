@@ -95,20 +95,22 @@ impl TimeLimit {
     }
 }
 
-/// The option that makes ffmpeg pass every picture on with the time its file
-/// gives it, without dropping or repeating pictures to even the times out.
+/// The options that make ffmpeg pass every picture on with the time its file
+/// gives it, without dropping or repeating pictures to even the times out,
+/// and without rounding the times to whole pictures.
 ///
-/// ffmpeg 5.1 renamed the option and ffmpeg 8 removed the old name, while
-/// ffmpeg 4, which many systems still have, only knows the old one.
+/// ffmpeg renamed both over versions 5.1 and 6.1, and ffmpeg 8 no longer
+/// takes the old spellings, while ffmpeg 4, which many systems still have,
+/// only knows the old ones.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PictureTimesOption {
     Vsync,
     FpsMode,
 }
 
-/// The first ffmpeg that is asked by the new name. Versions from 5.1 to 7
-/// take both names.
-const FIRST_VERSION_ASKED_BY_THE_NEW_NAME: u32 = 6;
+/// The first ffmpeg that is asked by the new names. Version 7 takes both
+/// spellings, and every version before it takes the old ones.
+const FIRST_VERSION_ASKED_BY_THE_NEW_NAME: u32 = 7;
 const VERSION_BANNER_START: &str = "ffmpeg version ";
 
 impl PictureTimesOption {
@@ -127,10 +129,10 @@ impl PictureTimesOption {
         }
     }
 
-    pub fn arguments(self) -> [&'static str; 2] {
+    pub fn arguments(self) -> [&'static str; 4] {
         match self {
-            Self::Vsync => ["-vsync", "passthrough"],
-            Self::FpsMode => ["-fps_mode", "passthrough"],
+            Self::Vsync => ["-vsync", "passthrough", "-enc_time_base", "-1"],
+            Self::FpsMode => ["-fps_mode", "passthrough", "-enc_time_base", "demux"],
         }
     }
 }
@@ -1035,15 +1037,16 @@ mod tests {
         assert_eq!(option("ffmpeg version 4.4.1-full_build Copyright"), old);
         assert_eq!(option("ffmpeg version 5.1.2 Copyright"), old);
         assert_eq!(option("ffmpeg version n5.1.2"), old);
-        assert_eq!(option("ffmpeg version 6.0 Copyright"), new);
+        assert_eq!(option("ffmpeg version 6.1.1-3ubuntu5 Copyright"), old);
+        assert_eq!(option("ffmpeg version 7.0 Copyright"), new);
         assert_eq!(option("ffmpeg version 8.0 Copyright"), new);
         assert_eq!(option("ffmpeg version n7.1-10-g0123abc"), new);
         // Development builds carry no number.
         assert_eq!(option("ffmpeg version N-118193-g5f38c82536"), new);
         assert_eq!(option("ffmpeg version git-2026-01-01"), new);
         assert_eq!(option("something else"), new);
-        assert_eq!(old.arguments(), ["-vsync", "passthrough"]);
-        assert_eq!(new.arguments(), ["-fps_mode", "passthrough"]);
+        assert_eq!(old.arguments()[..2], ["-vsync", "passthrough"]);
+        assert_eq!(new.arguments()[..2], ["-fps_mode", "passthrough"]);
     }
 
     #[test]

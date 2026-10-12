@@ -300,7 +300,6 @@ fn read_back(video: &Path, decode_errors: DecodeErrors) -> Result<ReadBack, Ffmp
         // it. Without these ffmpeg drops or repeats pictures to even out
         // their times, and rounds the times to whole pictures.
         .args(tools::picture_times_option().arguments())
-        .args(["-enc_time_base", "-1"])
         .args(["-f", "framecrc", "-"])
         .stream_lines(STEADY_OUTPUT_LIMIT, |line| {
             listing
