@@ -457,7 +457,13 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     // The command line has no review, so it has no way to drop a scene.
     let scenes = ScenesToWrite::every_scene(cuts);
     if let Some(list_file) = &arguments.save_list {
-        save_scene_list(video, &detection, &scenes, arguments, settings, list_file)?;
+        let listed = ScenesToList {
+            video,
+            detection: &detection,
+            scenes: &scenes,
+            chapter_splits: &chapter_splits,
+        };
+        save_scene_list(&listed, arguments, settings, list_file)?;
         println!("Saved the scene list to {}.", list_file.display());
     }
 
@@ -504,16 +510,30 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     Ok(())
 }
 
+/// What a scene list is made from: the video, its scan, the scenes a split
+/// would write, and the titles its chapter marks give to scenes.
+#[derive(Clone, Copy)]
+struct ScenesToList<'run> {
+    video: &'run Path,
+    detection: &'run Detection,
+    scenes: &'run ScenesToWrite,
+    chapter_splits: &'run ChapterSplits,
+}
+
 /// Writes the scenes with their times and the names their files get to
 /// `list_file`, in the format asked for or the one its name stands for.
 fn save_scene_list(
-    video: &Path,
-    detection: &Detection,
-    scenes: &ScenesToWrite,
+    listed: &ScenesToList,
     arguments: &Arguments,
     settings: &Settings,
     list_file: &Path,
 ) -> Result<()> {
+    let ScenesToList {
+        video,
+        detection,
+        scenes,
+        chapter_splits,
+    } = *listed;
     let format = arguments
         .list_format
         .or_else(|| SceneListFormat::for_file(list_file))
@@ -531,7 +551,12 @@ fn save_scene_list(
             video.display()
         )
     })?;
-    let list = SceneList::of_split(video, scenes, frame_rate, settings.export.scene_name)?;
+    let list = SceneList::of_split(video, scenes, frame_rate, settings.export.scene_name)?
+        .with_chapter_titles(|scene| {
+            chapter_splits
+                .title_of_scene_starting_at(scene.start)
+                .map(str::to_owned)
+        });
     let if_exists = if arguments.overwrite {
         ExistingListFile::Replace
     } else {

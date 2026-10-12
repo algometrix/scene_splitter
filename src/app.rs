@@ -21,6 +21,7 @@ use eframe::egui;
 use crate::batch::{SplitBatch, SplitOutcome};
 use crate::cache::{self, CacheUse, SourcedDetection};
 use crate::detect::{ScanKind, ScanProgress, ScanStage};
+use crate::exact_cut::CutPrecision;
 use crate::export::{
     self, ExistingListFile, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalPolicy,
     SplitMethod, SplitOrder, TRASH_NAME,
@@ -652,11 +653,34 @@ impl SceneSplitterApp {
         if self.batch_is_running() || self.queue.ready_jobs().is_empty() {
             return;
         }
-        if !self.settings.must_ask_before_recycling() {
+        // A ready video that drops scenes keeps its original whatever is
+        // set, and so does every video while cuts are exact. Only the
+        // others give the question something to ask about.
+        let an_original_could_be_moved = self.ready_originals().may_be_moved > 0;
+        if !(an_original_could_be_moved && self.settings.must_ask_before_recycling()) {
             return self.start_batch(ctx);
         }
         self.player = None;
         self.recycling_question_for = Some(SplitAwaitingAnswer::ReadyVideos);
+    }
+
+    /// What the splits of the ready videos, started now, could do with
+    /// their originals.
+    fn ready_originals(&self) -> ReadyOriginals {
+        let cut_precision = self.settings.export.cut_precision;
+        let mut originals = ReadyOriginals::default();
+        let ready_reviews = self
+            .queue
+            .ready_jobs()
+            .into_iter()
+            .filter_map(|job| self.queue.ready_review(job));
+        for review in ready_reviews {
+            match OriginalAlwaysKept::for_split(review.dropped_count(), cut_precision) {
+                Some(_why) => originals.always_kept += 1,
+                None => originals.may_be_moved += 1,
+            }
+        }
+        originals
     }
 
     fn answer_recycling_question(&mut self, ctx: &egui::Context, answer: RecyclingAnswer) {
@@ -696,8 +720,7 @@ impl SceneSplitterApp {
                 show_recycling_question(ctx, RecyclingSubject::OneVideo(&name))
             }
             SplitAwaitingAnswer::ReadyVideos => {
-                let ready_count = self.queue.ready_jobs().len();
-                show_recycling_question(ctx, RecyclingSubject::ReadyVideos(ready_count))
+                show_recycling_question(ctx, RecyclingSubject::ReadyVideos(self.ready_originals()))
             }
         };
         answer.map(AppRequest::AnswerRecyclingQuestion)
@@ -1222,7 +1245,10 @@ impl SceneSplitterApp {
                 }
                 None
             }
-            JobStatus::ReadyToSplit(review) => show_ready(ctx, id, &name, review.scene_count()),
+            JobStatus::ReadyToSplit(review) => {
+                let cut_precision = self.settings.export.cut_precision;
+                show_ready(ctx, id, &name, ReadySplit::of(review, cut_precision))
+            }
             JobStatus::Exporting(_) => {
                 show_busy(ctx, &format!("Writing and checking the scenes of {name}"));
                 None
@@ -1252,7 +1278,8 @@ fn write_scene_list(
         &review.scenes_to_write(),
         frame_rate,
         scene_name,
-    )?;
+    )?
+    .with_chapter_titles(|scene| review.chapter_title(scene).map(str::to_owned));
     export::save_scene_list(&list, format, path, ExistingListFile::Replace)
 }
 
@@ -1301,9 +1328,13 @@ fn status_label(status: &JobStatus) -> String {
                 counted(review.scene_count(), "scene")
             )
         }
-        JobStatus::ReadyToSplit(review) => {
-            format!("Ready to split, {}", counted(review.scene_count(), "scene"))
-        }
+        JobStatus::ReadyToSplit(review) => match review.dropped_count() {
+            0 => format!("Ready to split, {}", counted(review.scene_count(), "scene")),
+            dropped => format!(
+                "Ready to split, {}, {dropped} dropped",
+                counted(review.scene_count(), "scene")
+            ),
+        },
         JobStatus::Exporting(_) => "Writing and checking".to_owned(),
         JobStatus::Finished(report) if report.is_clean() => "Done, checked".to_owned(),
         JobStatus::Finished(_) => "Done, check the result".to_owned(),
@@ -1728,13 +1759,22 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
     paths_to_add.map(AppRequest::AddFromDialog)
 }
 
+/// How many of the ready videos have an original the settings decide about,
+/// and how many keep theirs whatever is set.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct ReadyOriginals {
+    may_be_moved: usize,
+    /// Videos with dropped scenes, or every video while cuts are exact.
+    always_kept: usize,
+}
+
 /// Whose originals the question about recycling is asked for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RecyclingSubject<'a> {
     /// The video of this name, which is about to be split.
     OneVideo(&'a str),
-    /// This many videos that are ready, about to be split one by one.
-    ReadyVideos(usize),
+    /// The videos that are ready, about to be split one by one.
+    ReadyVideos(ReadyOriginals),
 }
 
 impl RecyclingSubject<'_> {
@@ -1753,16 +1793,34 @@ impl RecyclingSubject<'_> {
     fn named(self) -> String {
         match self {
             Self::OneVideo(name) => name.to_owned(),
-            Self::ReadyVideos(1) => "the 1 video that is ready to split".to_owned(),
-            Self::ReadyVideos(ready_count) => {
-                format!("all {ready_count} videos that are ready to split")
-            }
+            Self::ReadyVideos(ReadyOriginals {
+                may_be_moved: 1,
+                always_kept: 0,
+            }) => "the 1 video that is ready to split".to_owned(),
+            Self::ReadyVideos(ReadyOriginals {
+                may_be_moved,
+                always_kept: 0,
+            }) => format!("all {may_be_moved} videos that are ready to split"),
+            // The rest keep their originals, and the person should not
+            // think the answer is about those.
+            Self::ReadyVideos(ReadyOriginals {
+                may_be_moved,
+                always_kept,
+            }) => format!(
+                "{may_be_moved} of the {} videos that are ready to split. The others have \
+                 dropped scenes, so their originals are always kept",
+                may_be_moved + always_kept
+            ),
         }
     }
 
     fn what_keeping_does(self) -> &'static str {
         match self {
-            Self::OneVideo(_) | Self::ReadyVideos(1) => {
+            Self::OneVideo(_)
+            | Self::ReadyVideos(ReadyOriginals {
+                may_be_moved: 1,
+                always_kept: 0,
+            }) => {
                 "Splits the video and leaves the original where it is, this time and from now on."
             }
             Self::ReadyVideos(_) => {
@@ -1905,21 +1963,53 @@ fn show_skipped(ctx: &egui::Context, job: JobId, name: &str) -> Option<AppReques
     request
 }
 
+/// What the split of a ready video will write, and what it means for the
+/// original, as far as it can be said before the split.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReadySplit {
+    file_count: usize,
+    dropped_scenes: usize,
+    original_always_kept: Option<OriginalAlwaysKept>,
+}
+
+impl ReadySplit {
+    /// `cut_precision` is the setting as it is now. A split uses the
+    /// settings in force when its turn comes.
+    fn of(review: &ReviewSession, cut_precision: CutPrecision) -> Self {
+        let dropped_scenes = review.dropped_count();
+        Self {
+            file_count: review.scene_count() - dropped_scenes,
+            dropped_scenes,
+            original_always_kept: OriginalAlwaysKept::for_split(dropped_scenes, cut_precision),
+        }
+    }
+
+    /// "Ready to split into 4 files. 1 scene is dropped."
+    fn in_words(self) -> String {
+        let files = format!("Ready to split into {}.", counted(self.file_count, "file"));
+        match self.dropped_scenes {
+            0 => files,
+            1 => format!("{files} 1 scene is dropped."),
+            dropped => format!("{files} {dropped} scenes are dropped."),
+        }
+    }
+}
+
 /// A video that waits to be split with the other ready videos, with the way
 /// back into its review.
 fn show_ready(
     ctx: &egui::Context,
     job: JobId,
     name: &str,
-    scene_count: usize,
+    split: ReadySplit,
 ) -> Option<AppRequest> {
     let mut request = None;
     show_centered_card(ctx, |ui| {
         ui.add(egui::Label::new(theme::semibold(name, 16.0)).truncate());
-        ui.label(format!(
-            "Ready to split into {}.",
-            counted(scene_count, "file")
-        ));
+        ui.label(split.in_words());
+        if let Some(why) = split.original_always_kept {
+            ui.label(theme::muted(why.in_plain_words()));
+        }
         ui.label(theme::muted(READY_EXPLANATION));
         let edit_again = ui
             .button(EDIT_AGAIN_LABEL)
@@ -2449,17 +2539,136 @@ mod tests {
     #[test]
     fn the_recycling_question_names_one_video_or_counts_the_ready_ones() {
         assert_eq!(RecyclingSubject::OneVideo("film.mp4").named(), "film.mp4");
+        let ready = |may_be_moved, always_kept| {
+            RecyclingSubject::ReadyVideos(ReadyOriginals {
+                may_be_moved,
+                always_kept,
+            })
+        };
+        assert_eq!(ready(1, 0).named(), "the 1 video that is ready to split");
+        assert_eq!(ready(3, 0).named(), "all 3 videos that are ready to split");
         assert_eq!(
-            RecyclingSubject::ReadyVideos(1).named(),
-            "the 1 video that is ready to split"
+            ready(2, 1).named(),
+            "2 of the 3 videos that are ready to split. The others have dropped scenes, so \
+             their originals are always kept"
+        );
+        assert!(ready(3, 0).what_happens().starts_with("After each split"));
+    }
+
+    /// Two videos, both reviewed, with nobody asked about originals yet.
+    fn app_with_two_videos_in_review() -> (SceneSplitterApp, JobId, JobId) {
+        let (mut app, first) = app_with_a_video_in_review();
+        let crate::queue::Added::New(second) = app.queue.add(Path::new("no_such_video_2.mp4"))
+        else {
+            panic!("the second video is a new one");
+        };
+        app.queue.start_scan(second).unwrap();
+        app.queue
+            .begin_review(second, crate::review_session::test_sessions::five_scenes())
+            .unwrap();
+        (app, first, second)
+    }
+
+    fn drop_the_second_scene(app: &mut SceneSplitterApp, ctx: &egui::Context, job: JobId) {
+        let second_scene = crate::plan::SceneIndex::new(1);
+        app.apply_to_review(ctx, job, vec![ReviewRequest::DropScene(second_scene)]);
+    }
+
+    #[test]
+    fn a_run_whose_videos_all_keep_their_originals_asks_nothing() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        drop_the_second_scene(&mut app, &ctx, job);
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        assert!(app.settings.must_ask_before_recycling());
+        assert_eq!(
+            app.ready_originals(),
+            ReadyOriginals {
+                may_be_moved: 0,
+                always_kept: 1
+            }
+        );
+
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        assert_eq!(app.recycling_question_for, None);
+        // The question is left for the first split that could move one.
+        assert!(app.settings.must_ask_before_recycling());
+    }
+
+    #[test]
+    fn a_run_asks_about_the_originals_that_could_be_moved_and_counts_only_those() {
+        let ctx = egui::Context::default();
+        let (mut app, first, second) = app_with_two_videos_in_review();
+        drop_the_second_scene(&mut app, &ctx, first);
+        app.apply_to_review(&ctx, first, vec![ReviewRequest::SplitLater]);
+        app.apply_to_review(&ctx, second, vec![ReviewRequest::SplitLater]);
+        assert_eq!(
+            app.ready_originals(),
+            ReadyOriginals {
+                may_be_moved: 1,
+                always_kept: 1
+            }
+        );
+
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        assert_eq!(
+            app.recycling_question_for,
+            Some(SplitAwaitingAnswer::ReadyVideos)
+        );
+    }
+
+    #[test]
+    fn with_exact_cuts_no_ready_video_has_an_original_to_ask_about() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        app.settings.export.cut_precision = CutPrecision::ExactFrame;
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        assert_eq!(
+            app.ready_originals(),
+            ReadyOriginals {
+                may_be_moved: 0,
+                always_kept: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_ready_video_says_what_its_split_writes_and_why_the_original_stays() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        drop_the_second_scene(&mut app, &ctx, job);
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        let review = app.queue.ready_review(job).unwrap();
+
+        let copied = ReadySplit::of(review, CutPrecision::NearestKeyframe);
+        assert_eq!(
+            copied.in_words(),
+            "Ready to split into 4 files. 1 scene is dropped."
         );
         assert_eq!(
-            RecyclingSubject::ReadyVideos(3).named(),
-            "all 3 videos that are ready to split"
+            copied.original_always_kept,
+            Some(OriginalAlwaysKept::ScenesDropped)
         );
-        assert!(RecyclingSubject::ReadyVideos(3)
-            .what_happens()
-            .starts_with("After each split"));
+        let exact = ReadySplit::of(review, CutPrecision::ExactFrame);
+        assert_eq!(
+            exact.original_always_kept,
+            Some(OriginalAlwaysKept::ScenesDroppedAndCutIsExact)
+        );
+        assert_eq!(
+            status_label(app.queue.job(job).unwrap().status()),
+            "Ready to split, 5 scenes, 1 dropped"
+        );
+    }
+
+    #[test]
+    fn a_ready_video_with_every_scene_kept_says_only_its_files() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        let review = app.queue.ready_review(job).unwrap();
+        let split = ReadySplit::of(review, CutPrecision::NearestKeyframe);
+        assert_eq!(split.in_words(), "Ready to split into 5 files.");
+        assert_eq!(split.original_always_kept, None);
     }
 
     #[test]

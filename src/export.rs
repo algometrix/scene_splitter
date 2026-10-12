@@ -673,7 +673,7 @@ mod tests {
         .unwrap();
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.starts_with("scene,start,end,length,file\r\n"));
+        assert!(saved.starts_with("scene,start,end,length,file,title\r\n"));
         assert_eq!(saved.lines().count(), 4);
     }
 

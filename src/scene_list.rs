@@ -4,7 +4,9 @@
 //!
 //! Every format lists the scenes that a split would write, numbered as
 //! their files are. A scene the person dropped is in none of them. Times
-//! are those of the original video.
+//! are those of the original video. A scene that begins with a chapter of
+//! the file carries that chapter's title in the table and in the chapter
+//! marks.
 
 use std::fmt;
 use std::path::Path;
@@ -13,7 +15,7 @@ use crate::fates::ScenesToWrite;
 use crate::scene_name::{NamingError, SceneNamePattern, SceneNaming};
 use crate::timecode::{format_timestamp, TimeSpan};
 
-const CSV_HEADER: &str = "scene,start,end,length,file";
+const CSV_HEADER: &str = "scene,start,end,length,file,title";
 /// What RFC 4180 asks for between the lines of a table.
 const CSV_LINE_END: &str = "\r\n";
 const CHAPTER_FILE_HEADER: &str = ";FFMETADATA1";
@@ -141,6 +143,17 @@ pub struct ListedScene {
     pub span: TimeSpan,
     /// What its file would be called.
     pub file_name: String,
+    /// The title of the chapter of the file that begins with the scene.
+    pub chapter_title: Option<String>,
+}
+
+impl ListedScene {
+    fn title_as_a_chapter(&self) -> String {
+        match &self.chapter_title {
+            Some(title) => title.clone(),
+            None => format!("Scene {}", self.number),
+        }
+    }
 }
 
 /// The scenes a split of one video would write.
@@ -205,6 +218,7 @@ impl SceneList {
                 number: position + 1,
                 span,
                 file_name,
+                chapter_title: None,
             })
             .collect();
         Self {
@@ -222,8 +236,18 @@ impl SceneList {
         }
     }
 
-    /// One row per scene: its number, start, end, length, and the name its
-    /// file would get.
+    /// Gives each scene the title of the chapter that begins with it, where
+    /// `title_of` knows one.
+    pub fn with_chapter_titles(mut self, title_of: impl Fn(TimeSpan) -> Option<String>) -> Self {
+        for scene in &mut self.scenes {
+            scene.chapter_title = title_of(scene.span);
+        }
+        self
+    }
+
+    /// One row per scene: its number, start, end, length, the name its file
+    /// would get, and the title of its chapter, which is empty for a scene
+    /// without one.
     fn as_csv(&self) -> String {
         let mut table = String::from(CSV_HEADER);
         table.push_str(CSV_LINE_END);
@@ -234,6 +258,7 @@ impl SceneList {
                 format_timestamp(scene.span.end),
                 format_timestamp(scene.span.seconds()),
                 scene.file_name.clone(),
+                scene.chapter_title.clone().unwrap_or_default(),
             ];
             let fields: Vec<String> = row.iter().map(|field| csv_field(field)).collect();
             table.push_str(&fields.join(","));
@@ -242,7 +267,8 @@ impl SceneList {
         table
     }
 
-    /// One chapter per scene, named "Scene 1" and so on.
+    /// One chapter per scene, named after the chapter of the file that
+    /// begins with it, or "Scene 1" and so on.
     fn as_chapters(&self) -> String {
         let mut chapters = format!(
             "{CHAPTER_FILE_HEADER}\ntitle={}\n",
@@ -253,7 +279,7 @@ impl SceneList {
                 "\n[CHAPTER]\n{CHAPTER_TIMEBASE}\nSTART={}\nEND={}\ntitle={}\n",
                 milliseconds(scene.span.start),
                 milliseconds(scene.span.end),
-                chapter_value(&format!("Scene {}", scene.number))
+                chapter_value(&scene.title_as_a_chapter())
             ));
         }
         chapters
@@ -367,9 +393,48 @@ mod tests {
     fn the_table_has_a_header_and_a_row_per_scene() {
         assert_eq!(
             two_scenes().in_format(SceneListFormat::Csv).unwrap(),
-            "scene,start,end,length,file\r\n\
-             1,00:00:00.000,00:01:02.480,00:01:02.480,film_scene_001.mp4\r\n\
-             2,00:01:02.480,01:02:05.040,01:01:02.560,film_scene_002.mp4\r\n"
+            "scene,start,end,length,file,title\r\n\
+             1,00:00:00.000,00:01:02.480,00:01:02.480,film_scene_001.mp4,\r\n\
+             2,00:01:02.480,01:02:05.040,01:01:02.560,film_scene_002.mp4,\r\n"
+        );
+    }
+
+    /// The two scenes, the second of which begins with a chapter.
+    fn two_scenes_with_a_chapter(title: &str) -> SceneList {
+        two_scenes().with_chapter_titles(|scene| (scene.start > 0.0).then(|| title.to_owned()))
+    }
+
+    #[test]
+    fn a_scene_that_begins_a_chapter_carries_its_title_in_the_table() {
+        let table = two_scenes_with_a_chapter("The heist, part 1")
+            .in_format(SceneListFormat::Csv)
+            .unwrap();
+        let rows: Vec<&str> = table.split(CSV_LINE_END).collect();
+        assert!(rows[1].ends_with("film_scene_001.mp4,"), "{table}");
+        assert!(
+            rows[2].ends_with("film_scene_002.mp4,\"The heist, part 1\""),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn a_chapter_mark_is_named_after_the_chapter_of_the_file_when_there_is_one() {
+        let chapters = two_scenes_with_a_chapter("Act 2; the heist")
+            .in_format(SceneListFormat::Chapters)
+            .unwrap();
+        assert!(chapters.contains("title=Scene 1\n"), "{chapters}");
+        assert!(
+            chapters.contains("title=Act 2\\; the heist\n"),
+            "{chapters}"
+        );
+        assert!(!chapters.contains("title=Scene 2"), "{chapters}");
+    }
+
+    #[test]
+    fn an_edit_list_is_the_same_with_and_without_chapter_titles() {
+        assert_eq!(
+            two_scenes_with_a_chapter("The heist").in_format(SceneListFormat::Edl),
+            two_scenes().in_format(SceneListFormat::Edl)
         );
     }
 
@@ -391,7 +456,7 @@ mod tests {
         );
         let table = list.in_format(SceneListFormat::Csv).unwrap();
         assert!(
-            table.ends_with(",00:00:01.000,\"a, b_scene_001.mp4\"\r\n"),
+            table.ends_with(",00:00:01.000,\"a, b_scene_001.mp4\",\r\n"),
             "{table}"
         );
     }
@@ -515,11 +580,13 @@ mod tests {
                     number: 1,
                     span: span(0.0, 10.0),
                     file_name: "film_scene_001.mp4".to_owned(),
+                    chapter_title: None,
                 },
                 ListedScene {
                     number: 2,
                     span: span(20.0, 30.0),
                     file_name: "film_scene_002.mp4".to_owned(),
+                    chapter_title: None,
                 },
             ]
         );
