@@ -9,7 +9,10 @@ use std::sync::Mutex;
 
 use crate::black::BlackCriteria;
 use crate::detect::{self, Detection, ScanDepth, ScanMode, ScanProgress, ScanSettings, ScanStage};
-use crate::export::{self, OriginalOutcome, OriginalPolicy, SplitOrder, Verification};
+use crate::export::{
+    self, OriginalAlwaysKept, OriginalOutcome, OriginalPolicy, SplitMethod, SplitOrder,
+    Verification,
+};
 use crate::fates::{SceneFate, ScenesToWrite};
 use crate::ffmpeg::FfmpegError;
 use crate::hardcut::{HardCutSettings, Sensitivity};
@@ -70,6 +73,11 @@ fn split_at_the_black_screen(video: &TestVideo) -> Vec<PathBuf> {
 }
 
 /// The black-screen cuts of a scan, as what a split takes.
+/// A split that copies at keyframes, with this choice about the original.
+fn copying(original_policy: OriginalPolicy) -> SplitMethod {
+    SplitMethod::CopyAtKeyframes { original_policy }
+}
+
 fn detected_cuts(detection: &Detection) -> CutTimes {
     CutTimes::inside(detection.video, detection.cuts.clone()).unwrap()
 }
@@ -253,7 +261,10 @@ fn chapter_marks_are_read_and_offered_as_splits_beside_the_black_screen() {
     // whole video.
     let every_cut = vec![chapter_splits.cuts[0], black_screen_cut];
     let cuts = CutTimes::inside(detection.video, every_cut).unwrap();
-    let order = SplitOrder::new(ScenesToWrite::every_scene(cuts), OriginalPolicy::Keep);
+    let order = SplitOrder::new(
+        ScenesToWrite::every_scene(cuts),
+        copying(OriginalPolicy::Keep),
+    );
     let report = export::export_scenes(
         &video.path,
         &order,
@@ -281,7 +292,7 @@ fn an_mp4_keeps_its_chapters_in_a_stream_the_check_refuses_to_lose() {
     // the original is not one the check lets go.
     let order = SplitOrder::new(
         ScenesToWrite::every_scene(detected_cuts(&detection)),
-        OriginalPolicy::Keep,
+        copying(OriginalPolicy::Keep),
     );
     let report = export::export_scenes(
         &video.path,
@@ -409,7 +420,7 @@ fn splitting_writes_one_file_per_scene_and_they_pass_verification() {
 
     let order = SplitOrder::new(
         ScenesToWrite::every_scene(detected_cuts(&detection)),
-        OriginalPolicy::Keep,
+        copying(OriginalPolicy::Keep),
     );
     let report = export::export_scenes(
         &video.path,
@@ -592,7 +603,7 @@ fn a_split_with_a_dropped_scene_writes_the_others_and_always_keeps_the_original(
     // The person chose to have originals moved to the Recycle Bin or Trash.
     let order = SplitOrder::new(
         without_the_black_screen(),
-        OriginalPolicy::RecycleOnceVerified,
+        copying(OriginalPolicy::RecycleOnceVerified),
     );
 
     let report = export::export_scenes(
@@ -619,7 +630,7 @@ fn a_split_with_a_dropped_scene_writes_the_others_and_always_keeps_the_original(
     );
     assert!(matches!(
         report.original,
-        OriginalOutcome::KeptBecauseScenesDropped
+        OriginalOutcome::AlwaysKept(OriginalAlwaysKept::ScenesDropped)
     ));
     assert!(video.path.is_file());
     assert!(report.is_clean());
@@ -686,7 +697,7 @@ fn scene_files_take_the_name_chosen_and_are_found_again_under_it() {
     let scene_name = SceneNamePattern::new("{number} of {count} {name} from {start}").unwrap();
     let order = SplitOrder::new(
         ScenesToWrite::every_scene(cuts_at(&[BLACK_START])),
-        OriginalPolicy::Keep,
+        copying(OriginalPolicy::Keep),
     );
 
     let report = export::export_scenes(&video.path, &order, video.folder(), scene_name).unwrap();

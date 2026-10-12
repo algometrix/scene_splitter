@@ -197,6 +197,41 @@ pub fn split_scenes<Record>(
     record_dropped_scene: impl Fn(&Path) -> Result<Record>,
 ) -> Result<Vec<SceneOutcome<Record>>> {
     let name = SceneFileName::of(input)?;
+    write_then_move_into_place(
+        input,
+        scenes,
+        out_dir,
+        pattern,
+        |unfinished| {
+            write_scenes(input, scenes.cuts(), &unfinished.folder, &name).map(|_written| ())
+        },
+        record_dropped_scene,
+    )
+}
+
+/// Where the scenes of a split are written before they get their names.
+pub struct UnfinishedScenes {
+    /// A folder of this split's own, removed when the split is over.
+    pub folder: PathBuf,
+    /// The files to write, in scene order, one for every scene of the
+    /// video, the dropped ones included.
+    pub files: Vec<PathBuf>,
+}
+
+/// The safe way to replace the scene files of `input` in `out_dir`, whatever
+/// writes them. `write_scenes` writes every scene to the place it is given,
+/// the dropped ones too. Only when it succeeds is each dropped scene shown
+/// to `record_dropped_scene`, are the kept scenes moved to their real
+/// names, and the scene files of an earlier split replaced or removed.
+pub fn write_then_move_into_place<Record>(
+    input: &Path,
+    scenes: &ScenesToWrite,
+    out_dir: &Path,
+    pattern: SceneNamePattern,
+    write_scenes: impl FnOnce(&UnfinishedScenes) -> Result<()>,
+    record_dropped_scene: impl Fn(&Path) -> Result<Record>,
+) -> Result<Vec<SceneOutcome<Record>>> {
+    let name = SceneFileName::of(input)?;
     let earlier_scene_files = scene_files_from_earlier_splits(input, out_dir, pattern)?;
     let scene_files = scene_file_paths(input, out_dir, pattern, &scenes.kept_scenes())?;
     refuse_to_write_over_the_video(input, &scene_files)?;
@@ -206,16 +241,19 @@ pub fn split_scenes<Record>(
     remove_unfinished_scenes(&unfinished_dir)?;
     std::fs::create_dir_all(&unfinished_dir)
         .with_context(|| format!("could not create {}", unfinished_dir.display()))?;
+    let unfinished = UnfinishedScenes {
+        files: name.unfinished_files_in(&unfinished_dir, scenes.fates().len()),
+        folder: unfinished_dir.clone(),
+    };
 
-    let settled =
-        write_scenes(input, scenes.cuts(), &unfinished_dir, &name).and_then(|unfinished_files| {
-            settle_scenes(
-                &unfinished_files,
-                scenes.fates(),
-                &scene_files,
-                &record_dropped_scene,
-            )
-        });
+    let settled = write_scenes(&unfinished).and_then(|()| {
+        settle_scenes(
+            &unfinished.files,
+            scenes.fates(),
+            &scene_files,
+            &record_dropped_scene,
+        )
+    });
     let tidied = remove_unfinished_scenes(&unfinished_dir);
     // Why the split failed matters more than a folder that stayed behind.
     let outcomes = settled?;

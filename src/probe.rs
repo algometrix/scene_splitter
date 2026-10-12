@@ -83,7 +83,7 @@ pub fn read_packet_index(input: &Path) -> Result<PacketIndex> {
 
 /// ffprobe reports absolute timestamps, while `ffmpeg -ss` counts from the
 /// container's start time. Subtracting it puts every time on the seek clock.
-fn read_container_start(input: &Path) -> Result<f64> {
+pub fn read_container_start(input: &Path) -> Result<f64> {
     let output = ffprobe_on(
         input,
         &["-show_entries", "format=start_time", "-of", "csv=p=0"],

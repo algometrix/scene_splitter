@@ -5,6 +5,7 @@
 use eframe::egui;
 
 use crate::detect::{ScanMode, ScanSettings};
+use crate::exact_cut::CutPrecision;
 use crate::export::OriginalPolicy;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::scene_name::{PatternError, Placeholder, SceneNamePattern};
@@ -233,6 +234,44 @@ pub fn show_scene_location_checkbox(
     checkbox
 }
 
+/// The setting for cutting on the exact picture, as the window names it.
+/// The message of a failed exact cut names it the same way.
+pub const EXACT_CUT_LABEL: &str = "Cut on the exact picture (slower)";
+const EXACT_CUT_EXPLANATION: &str =
+    "A video can only be cut at certain points without encoding. With this on, a split \
+     is made on the very picture you choose, and a few seconds around each cut are \
+     encoded again. That takes longer, and the original is always kept.";
+
+pub fn show_cut_precision_checkbox(
+    ui: &mut egui::Ui,
+    precision: &mut CutPrecision,
+) -> egui::Response {
+    let mut exact = is_exact(*precision);
+    let checkbox = ui
+        .checkbox(&mut exact, EXACT_CUT_LABEL)
+        .on_hover_text(EXACT_CUT_EXPLANATION);
+    if checkbox.changed() {
+        *precision = cut_precision_for(exact);
+    }
+    checkbox
+}
+
+fn is_exact(precision: CutPrecision) -> bool {
+    match precision {
+        CutPrecision::ExactFrame => true,
+        CutPrecision::NearestKeyframe => false,
+    }
+}
+
+/// What a ticked or unticked exact-cut checkbox means.
+fn cut_precision_for(ticked: bool) -> CutPrecision {
+    if ticked {
+        CutPrecision::ExactFrame
+    } else {
+        CutPrecision::NearestKeyframe
+    }
+}
+
 fn is_recycling(policy: OriginalPolicy) -> bool {
     match policy {
         OriginalPolicy::RecycleOnceVerified => true,
@@ -276,6 +315,9 @@ mod tests {
         }
         for location in [SceneLocation::BesideVideo, SceneLocation::NewFolder] {
             assert_eq!(scene_location_for(is_new_folder(location)), location);
+        }
+        for precision in [CutPrecision::NearestKeyframe, CutPrecision::ExactFrame] {
+            assert_eq!(cut_precision_for(is_exact(precision)), precision);
         }
     }
 
@@ -363,6 +405,18 @@ mod tests {
         draw_name_box(&ctx, &mut draft, &mut in_use);
         assert_eq!(draft, SceneNameDraft::of(SceneNamePattern::default()));
         assert_eq!(in_use, SceneNamePattern::default());
+    }
+
+    #[test]
+    fn an_unticked_box_cuts_without_encoding() {
+        assert_eq!(cut_precision_for(false), CutPrecision::default());
+        assert_eq!(cut_precision_for(true), CutPrecision::ExactFrame);
+    }
+
+    #[test]
+    fn the_exact_cut_texts_say_what_is_encoded_and_that_the_original_stays() {
+        assert!(EXACT_CUT_EXPLANATION.contains("encoded"));
+        assert!(EXACT_CUT_EXPLANATION.contains("the original is always kept"));
     }
 
     #[test]

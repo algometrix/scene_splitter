@@ -17,7 +17,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::detect::ScanKind;
-use crate::export::{ExportOptions, TRASH_NAME};
+use crate::export::{ExportOptions, OriginalAlwaysKept, TRASH_NAME};
 use crate::fates::SceneFate;
 use crate::focus::{self, PicturePosition, PictureStep, SceneStep};
 use crate::folder_settings::{self, DetectionInUse, DetectionSettings, SettingsScope};
@@ -1815,15 +1815,22 @@ fn split_button_label(file_count: usize, dropped_count: usize) -> String {
     format!("{files}, {} dropped", counted(dropped_count, "scene"))
 }
 
-/// Said in place of the choice about the original while scenes are dropped,
-/// so the person knows before the split that this one will not move it.
-fn original_kept_note(dropped_count: usize) -> String {
-    let scenes_are = if dropped_count == 1 {
-        "1 scene is".to_owned()
-    } else {
-        format!("{dropped_count} scenes are")
-    };
-    format!("The original stays where it is, because {scenes_are} dropped and would be in no file.")
+/// What the pointer learns over the sentence that stands in for the choice
+/// about the original: what the check still does, and how to get the choice
+/// back.
+fn original_always_kept_hint(why: OriginalAlwaysKept) -> String {
+    let keep_every_scene = "The check still compares every new file with its part of the original.";
+    let cut_without_encoding = format!(
+        "Turn off \"{}\" in Settings to cut without encoding.",
+        settings_controls::EXACT_CUT_LABEL
+    );
+    match why {
+        OriginalAlwaysKept::ScenesDropped => keep_every_scene.to_owned(),
+        OriginalAlwaysKept::CutIsExact => cut_without_encoding,
+        OriginalAlwaysKept::ScenesDroppedAndCutIsExact => {
+            format!("{keep_every_scene} {cut_without_encoding}")
+        }
+    }
 }
 
 /// Why the split has not started, with the way past it when there is one.
@@ -1873,23 +1880,27 @@ fn show_export_options(
 ) -> Option<ReviewRequest> {
     let mut wanted = export_options;
     ui.horizontal_wrapped(|ui| {
-        if dropped_count > 0 {
-            ui.label(original_kept_note(dropped_count)).on_hover_text(
-                "The check still compares every new file with its part of the original.",
-            );
-        } else {
-            let recycle_label = format!(
-                "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
-            );
-            settings_controls::show_original_policy_checkbox(
-                ui,
-                &mut wanted.original_policy,
-                recycle_label,
-            )
-            .on_hover_text(format!(
-                "The check compares the new files with the original. If anything is missing \
-                 or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
-            ));
+        // The original is kept whatever was chosen for it, so the choice
+        // gives way to saying so, before the split.
+        match OriginalAlwaysKept::for_split(dropped_count, export_options.cut_precision) {
+            Some(why) => {
+                ui.label(theme::muted(why.in_plain_words()))
+                    .on_hover_text(original_always_kept_hint(why));
+            }
+            None => {
+                let recycle_label = format!(
+                    "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
+                );
+                settings_controls::show_original_policy_checkbox(
+                    ui,
+                    &mut wanted.original_policy,
+                    recycle_label,
+                )
+                .on_hover_text(format!(
+                    "The check compares the new files with the original. If anything is missing \
+                     or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
+                ));
+            }
         }
         settings_controls::show_scene_location_checkbox(ui, &mut wanted.scene_location);
         if let Ok(dir) = split::scene_dir(video, wanted.scene_location) {
@@ -3550,15 +3561,13 @@ mod tests {
     }
 
     #[test]
-    fn the_window_says_before_the_split_that_the_original_stays() {
-        assert_eq!(
-            original_kept_note(1),
-            "The original stays where it is, because 1 scene is dropped and would be in no file."
-        );
-        assert_eq!(
-            original_kept_note(3),
-            "The original stays where it is, because 3 scenes are dropped and would be in no file."
-        );
+    fn the_hint_on_the_kept_original_says_how_to_get_the_choice_back() {
+        let dropped = original_always_kept_hint(OriginalAlwaysKept::ScenesDropped);
+        let exact = original_always_kept_hint(OriginalAlwaysKept::CutIsExact);
+        let both = original_always_kept_hint(OriginalAlwaysKept::ScenesDroppedAndCutIsExact);
+        assert!(dropped.contains("still compares every new file"));
+        assert!(exact.contains(settings_controls::EXACT_CUT_LABEL));
+        assert_eq!(both, format!("{dropped} {exact}"));
     }
 
     #[test]

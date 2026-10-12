@@ -127,7 +127,9 @@ impl Settings {
     /// happens to the original. Only a split that would recycle it does, and
     /// only until they have answered once.
     pub fn must_ask_before_recycling(&self) -> bool {
-        self.export.original_policy == OriginalPolicy::RecycleOnceVerified
+        // Asked of the split as it will be carried out: an exact split
+        // keeps the original whatever the setting for originals says.
+        self.export.split_method().original_policy() == OriginalPolicy::RecycleOnceVerified
             && self.recycling_question == RecyclingQuestion::NotAskedYet
     }
 
@@ -282,6 +284,7 @@ pub fn settings_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::detect::ScanMode;
+    use crate::exact_cut::CutPrecision;
     use crate::hardcut::Sensitivity;
     use crate::scene_name::SceneNamePattern;
     use crate::split::SceneLocation;
@@ -430,6 +433,41 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_asked_before_an_exact_split_since_it_keeps_the_original() {
+        let mut settings = Settings::default();
+        settings.export.cut_precision = CutPrecision::ExactFrame;
+        assert_eq!(
+            settings.export.original_policy,
+            OriginalPolicy::RecycleOnceVerified
+        );
+        assert!(!settings.must_ask_before_recycling());
+    }
+
+    #[test]
+    fn a_file_from_before_exact_cuts_loads_and_cuts_on_keyframes() {
+        let file = SettingsFile::for_test("before_exact_cuts");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file.0,
+            r#"{ "export": { "scene_location": "NewFolder", "original_policy": "Keep" } }"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.export.cut_precision, CutPrecision::NearestKeyframe);
+        assert_eq!(loaded.export.original_policy, OriginalPolicy::Keep);
+    }
+
+    #[test]
+    fn the_choice_of_exact_cuts_is_saved_and_loaded() {
+        let file = SettingsFile::for_test("exact_cuts");
+        let mut settings = Settings::default();
+        settings.export.cut_precision = CutPrecision::ExactFrame;
+        settings.save_to(&file.0).unwrap();
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
+    }
+
+    #[test]
     fn restoring_the_defaults_does_not_ask_the_recycling_question_again() {
         let restored = changed_settings().restored_to_defaults();
         assert_eq!(restored.recycling_question, RecyclingQuestion::Answered);
@@ -474,6 +512,7 @@ mod tests {
             scene_location: SceneLocation::NewFolder,
             original_policy: OriginalPolicy::Keep,
             scene_name: SceneNamePattern::new("{number} {name}").unwrap(),
+            ..ExportOptions::default()
         };
         let changed = before.changed_by(SettingsChange::ExportOptions(export));
         assert_eq!(changed, Settings { export, ..before });

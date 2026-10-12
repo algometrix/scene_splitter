@@ -22,7 +22,8 @@ use crate::batch::{SplitBatch, SplitOutcome};
 use crate::cache::{self, CacheUse, SourcedDetection};
 use crate::detect::{ScanKind, ScanProgress, ScanStage};
 use crate::export::{
-    self, ExistingListFile, ExportOptions, ExportReport, OriginalPolicy, SplitOrder, TRASH_NAME,
+    self, ExistingListFile, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalPolicy,
+    SplitMethod, SplitOrder, TRASH_NAME,
 };
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
@@ -229,11 +230,13 @@ fn settings_after_recycling_answer(
 }
 
 /// Whether a split has to wait for the person to say what happens to
-/// originals. A split that drops scenes keeps the original whatever is set,
-/// so it has nothing to ask about, and leaves the question for the first
-/// split that could move one.
+/// originals. A split that drops scenes or cuts on exact pictures keeps the
+/// original whatever is set, so it has nothing to ask about, and leaves the
+/// question for the first split that could move one.
 fn split_waits_for_the_recycling_answer(settings: &Settings, dropped_scenes: usize) -> bool {
-    dropped_scenes == 0 && settings.must_ask_before_recycling()
+    let original_always_kept =
+        OriginalAlwaysKept::for_split(dropped_scenes, settings.export.cut_precision);
+    original_always_kept.is_none() && settings.must_ask_before_recycling()
 }
 
 /// The result of background work on one job.
@@ -430,6 +433,7 @@ impl SceneSplitterApp {
         self.follow_setup();
         self.apply_job_updates();
         self.advance_batch(ctx);
+        self.tell_the_review_where_new_splits_land();
         self.apply(ctx, requests_from_keys_and_drops(ctx));
         self.start_next_scan(ctx);
         self.close_player_unless_its_video_is_in_review();
@@ -481,6 +485,21 @@ impl SceneSplitterApp {
         self.forget_export_obstacles_if_scenes_go_elsewhere(export_options_before);
         self.text_box_had_the_keyboard = ctx.wants_keyboard_input();
         self.save_settings_once_changed(ctx);
+    }
+
+    /// A split the person adds lands on the nearest keyframe or on the very
+    /// picture, as the setting says. Told to the review on show before
+    /// anything is drawn or asked of it, so a change of the setting holds
+    /// from the next frame on.
+    fn tell_the_review_where_new_splits_land(&mut self) {
+        let precision = self.settings.export.cut_precision;
+        let review_on_show = self
+            .queue
+            .current()
+            .and_then(|job| self.queue.review_mut(job));
+        if let Some(review) = review_on_show {
+            review.place_new_splits(precision);
+        }
     }
 
     /// A dialog in front of everything has the keyboard to itself.
@@ -1057,14 +1076,12 @@ impl SceneSplitterApp {
     /// Writes and checks the scenes of one video in the background, and
     /// deals with its original as the settings say now.
     fn export_in_background(&self, ctx: &egui::Context, order: ExportOrder, out_dir: PathBuf) {
-        let ExportOptions {
-            original_policy,
-            scene_name,
-            ..
-        } = self.settings.export;
+        let export_options = self.settings.export;
         // Made here and not from the settings alone: an order that drops
-        // scenes keeps the original whatever the person chose for it.
-        let split_order = SplitOrder::new(order.scenes, original_policy);
+        // scenes or cuts on exact pictures keeps the original whatever the
+        // person chose for it.
+        let split_order = SplitOrder::new(order.scenes, export_options.split_method());
+        let scene_name = export_options.scene_name;
         self.run_in_background(ctx, order.job, move || {
             JobEvent::Exported(export::export_scenes(
                 &order.video,
@@ -1113,9 +1130,9 @@ impl SceneSplitterApp {
                     self.queue.failed(job, Failure::from_scan_error(&error))
                 }
                 JobEvent::Exported(Ok(report)) => self.queue.finished(job, report),
-                JobEvent::Exported(Err(error)) => self
-                    .queue
-                    .failed(job, Failure::could_not_split(format!("{error:#}"))),
+                JobEvent::Exported(Err(error)) => {
+                    self.queue.failed(job, Failure::from_split_error(&error))
+                }
                 JobEvent::Crashed => self.queue.crashed(job),
             };
             self.note_refusal(told);
@@ -1455,14 +1472,24 @@ fn show_settings(
     }
 
     ui.label(theme::semibold("When a video is split", 13.0));
-    settings_controls::show_original_policy_checkbox(
-        ui,
-        &mut settings.export.original_policy,
-        format!("Move the original to the {TRASH_NAME} after the check"),
-    )
-    .on_hover_text(
-        "The new files are compared with the original first. If anything is missing or different, the original stays.",
+    settings_controls::show_cut_precision_checkbox(ui, &mut settings.export.cut_precision);
+    // An exact split keeps the original whatever this box says, so the box
+    // is not offered as if it had a say.
+    let recycling_has_a_say = matches!(
+        settings.export.split_method(),
+        SplitMethod::CopyAtKeyframes { .. }
     );
+    ui.add_enabled_ui(recycling_has_a_say, |ui| {
+        settings_controls::show_original_policy_checkbox(
+            ui,
+            &mut settings.export.original_policy,
+            format!("Move the original to the {TRASH_NAME} after the check"),
+        )
+        .on_hover_text(
+            "The new files are compared with the original first. If anything is missing or different, the original stays.",
+        )
+        .on_disabled_hover_text(OriginalAlwaysKept::CutIsExact.in_plain_words());
+    });
     settings_controls::show_scene_location_checkbox(ui, &mut settings.export.scene_location);
     settings_controls::show_scene_name_box(ui, scene_name_draft, &mut settings.export.scene_name);
     ui.checkbox(&mut settings.show_tips, "Show tips on the review screen");

@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::exact_cut::CutPrecision;
+use crate::exact_split;
+use crate::exact_verify::ExactCutProof;
 use crate::fates::ScenesToWrite;
 use crate::library::VIDEO_EXTENSIONS;
 use crate::scene_list::{SceneList, SceneListFormat};
 use crate::scene_name::SceneNamePattern;
 use crate::split::{self, SceneLocation, SceneOutcome};
+use crate::timecode::format_timestamp;
 use crate::verify::{self, SceneToVerify};
 
 /// What each system calls the place deleted files go to.
@@ -38,53 +42,160 @@ pub struct ExportOptions {
     /// How the scene files are named. A settings file from before this
     /// could be chosen has none, and gets the names the app always wrote.
     pub scene_name: SceneNamePattern,
+    /// Missing from settings saved before the choice existed, which then
+    /// cut on keyframes as they always did.
+    pub cut_precision: CutPrecision,
 }
 
 impl Default for ExportOptions {
-    /// Scenes go beside the video, and the original is recycled once the
-    /// scenes are verified, so the scenes take its place.
+    /// Scenes go beside the video, cuts go on keyframes, and the original is
+    /// recycled once the scenes are verified, so the scenes take its place.
     fn default() -> Self {
         Self {
             scene_location: SceneLocation::BesideVideo,
             original_policy: OriginalPolicy::RecycleOnceVerified,
             scene_name: SceneNamePattern::default(),
+            cut_precision: CutPrecision::NearestKeyframe,
         }
+    }
+}
+
+impl ExportOptions {
+    /// How a split with these options is carried out.
+    pub fn split_method(&self) -> SplitMethod {
+        match self.cut_precision {
+            CutPrecision::NearestKeyframe => SplitMethod::CopyAtKeyframes {
+                original_policy: self.original_policy,
+            },
+            CutPrecision::ExactFrame => SplitMethod::ExactFrames,
+        }
+    }
+}
+
+/// How the scenes of one split are written, and with it what may happen to
+/// the original afterwards.
+///
+/// Only a split that copies every packet can be compared with the original
+/// packet for packet, so only that kind carries a policy for the original.
+/// An exact split encodes the pictures around each cut again. It has no
+/// policy to carry, and so no way to ask for the original to be recycled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplitMethod {
+    CopyAtKeyframes { original_policy: OriginalPolicy },
+    ExactFrames,
+}
+
+impl SplitMethod {
+    /// What happens to the original when the scenes pass their check.
+    pub fn original_policy(self) -> OriginalPolicy {
+        match self {
+            Self::CopyAtKeyframes { original_policy } => original_policy,
+            Self::ExactFrames => OriginalPolicy::Keep,
+        }
+    }
+
+    pub fn cut_precision(self) -> CutPrecision {
+        match self {
+            Self::CopyAtKeyframes { .. } => CutPrecision::NearestKeyframe,
+            Self::ExactFrames => CutPrecision::ExactFrame,
+        }
+    }
+}
+
+/// Why a split keeps the original whatever the person chose for it.
+///
+/// This is the one model behind every "the original is always kept" in the
+/// app: the review says it before the split, the result says it after, and
+/// `SplitOrder` enforces it in between.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OriginalAlwaysKept {
+    /// A scene was dropped. The scene files do not hold the whole video, so
+    /// the original is the only place the dropped part still exists.
+    ScenesDropped,
+    /// The pictures around each cut were encoded again. No check can
+    /// compare those with the original one for one.
+    CutIsExact,
+    ScenesDroppedAndCutIsExact,
+}
+
+impl OriginalAlwaysKept {
+    /// Whether a split that drops this many scenes and cuts this precisely
+    /// keeps its original whatever was chosen, and why.
+    pub fn for_split(dropped_scene_count: usize, cut_precision: CutPrecision) -> Option<Self> {
+        match (dropped_scene_count, cut_precision) {
+            (0, CutPrecision::NearestKeyframe) => None,
+            (0, CutPrecision::ExactFrame) => Some(Self::CutIsExact),
+            (_, CutPrecision::NearestKeyframe) => Some(Self::ScenesDropped),
+            (_, CutPrecision::ExactFrame) => Some(Self::ScenesDroppedAndCutIsExact),
+        }
+    }
+
+    /// When the original is always kept and why, as the rest of a sentence
+    /// that begins with "The original is" or "It is".
+    fn rule_in_words(self) -> &'static str {
+        match self {
+            Self::ScenesDropped => {
+                "always kept when scenes are dropped, because the new files do not hold all of it."
+            }
+            Self::CutIsExact => {
+                "always kept after an exact cut, because pictures that were encoded again \
+                 cannot be compared with it one for one."
+            }
+            Self::ScenesDroppedAndCutIsExact => {
+                "always kept when scenes are dropped or cuts are exact, because the new files \
+                 do not hold all of it and pictures that were encoded again cannot be compared \
+                 with it one for one."
+            }
+        }
+    }
+
+    /// The one sentence the window shows before such a split, in place of
+    /// the choice about the original.
+    pub fn in_plain_words(self) -> String {
+        format!("The original is {}", self.rule_in_words())
+    }
+
+    /// The same rule after a sentence that has already named the original.
+    fn as_a_following_sentence(self) -> String {
+        format!("It is {}", self.rule_in_words())
     }
 }
 
 /// What may happen to the original after one split.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum OriginalRule {
-    /// Every scene is written, so the scene files together are the whole
-    /// video and what the person chose for the original applies.
+    /// Every scene is written by copying, so the scene files together are
+    /// the whole video and what the person chose for the original applies.
     AsChosen(OriginalPolicy),
-    /// A scene was dropped. The scene files do not hold the whole video, so
-    /// the original is the only place the dropped part still exists.
-    KeptBecauseScenesDropped,
+    AlwaysKept(OriginalAlwaysKept),
 }
 
-/// One split, ready to run: the scenes to write, and what may happen to the
-/// original afterwards.
+/// One split, ready to run: the scenes to write, how precisely to cut, and
+/// what may happen to the original afterwards.
 ///
-/// There is no way to make an order that drops a scene and may recycle the
-/// original. `new` is the only way to make one, and it lets the person's
-/// choice about the original through only when every scene is written.
+/// There is no way to make an order that drops a scene or cuts on exact
+/// pictures and may recycle the original. `new` is the only way to make
+/// one, and it lets the person's choice about the original through only
+/// when every scene is written and every packet is copied.
 #[derive(Debug, PartialEq)]
 pub struct SplitOrder {
     scenes: ScenesToWrite,
+    cut_precision: CutPrecision,
     original: OriginalRule,
 }
 
 impl SplitOrder {
-    /// `chosen` is what the person set for originals. It counts only when
-    /// no scene is dropped.
-    pub fn new(scenes: ScenesToWrite, chosen: OriginalPolicy) -> Self {
-        let original = if scenes.has_dropped_scenes() {
-            OriginalRule::KeptBecauseScenesDropped
-        } else {
-            OriginalRule::AsChosen(chosen)
+    pub fn new(scenes: ScenesToWrite, method: SplitMethod) -> Self {
+        let cut_precision = method.cut_precision();
+        let original = match OriginalAlwaysKept::for_split(scenes.dropped_count(), cut_precision) {
+            Some(why) => OriginalRule::AlwaysKept(why),
+            None => OriginalRule::AsChosen(method.original_policy()),
         };
-        Self { scenes, original }
+        Self {
+            scenes,
+            cut_precision,
+            original,
+        }
     }
 
     pub fn scenes(&self) -> &ScenesToWrite {
@@ -94,15 +205,19 @@ impl SplitOrder {
 
 #[derive(Debug)]
 pub enum Verification {
+    /// The scenes hold every packet of the original, unchanged.
     Passed,
+    /// The scenes of an exact split passed the checks that can be made of
+    /// them. Scenes that do not are never put in place.
+    PassedForExactCut(ExactCutProof),
     Failed(String),
 }
 
 #[derive(Debug)]
 pub enum OriginalOutcome {
     Kept,
-    /// Kept whatever the person chose, because the split dropped a scene.
-    KeptBecauseScenesDropped,
+    /// Kept whatever the person chose, for the reason given.
+    AlwaysKept(OriginalAlwaysKept),
     MovedToRecycleBin,
     KeptBecauseUnverified,
     KeptBecauseRecyclingFailed(String),
@@ -121,13 +236,44 @@ pub struct ExportReport {
 impl ExportReport {
     /// True when the scenes are verified and nothing went wrong afterwards.
     pub fn is_clean(&self) -> bool {
-        matches!(self.verification, Verification::Passed)
-            && matches!(
-                self.original,
-                OriginalOutcome::Kept
-                    | OriginalOutcome::KeptBecauseScenesDropped
-                    | OriginalOutcome::MovedToRecycleBin
-            )
+        matches!(
+            self.verification,
+            Verification::Passed | Verification::PassedForExactCut(_)
+        ) && matches!(
+            self.original,
+            OriginalOutcome::Kept
+                | OriginalOutcome::AlwaysKept(_)
+                | OriginalOutcome::MovedToRecycleBin
+        )
+    }
+
+    /// What the check of an exact split measured, one line per fact, for a
+    /// run from the command line. `None` after any other split.
+    pub fn exact_cut_measurements(&self) -> Option<String> {
+        let Verification::PassedForExactCut(proof) = &self.verification else {
+            return None;
+        };
+        let mut lines = vec![
+            format!(
+                "Pictures: {} in the original and in the scenes together, {} of them encoded again.",
+                proof.pictures, proof.pictures_encoded_again
+            ),
+            format!(
+                "Sound: {} packets, all copied unchanged. Largest shift against the picture: {:.4} s.",
+                proof.sound_packets, proof.largest_sound_shift_seconds
+            ),
+        ];
+        for (position, landing) in proof.cut_landings.iter().enumerate() {
+            lines.push(format!(
+                "Cut {}: asked for at {}, the next scene starts at {} ({:.3} s later).",
+                position + 1,
+                format_timestamp(landing.asked_for),
+                format_timestamp(landing.landed_at),
+                // A landing a rounding step early is no earlier than asked.
+                (landing.landed_at - landing.asked_for).max(0.0)
+            ));
+        }
+        Some(lines.join("\n"))
     }
 
     /// What happened, in words a person who knows nothing of video can act
@@ -178,14 +324,31 @@ impl ExportReport {
         match &self.verification {
             Verification::Passed if self.dropped_scenes > 0 => format!(
                 "Checked: each file contains its own part of the original, with nothing missing \
-                 or changed. {} and {} in no file.",
-                counted_dropped_scenes(self.dropped_scenes),
-                if self.dropped_scenes == 1 { "is" } else { "are" }
+                 or changed. {}",
+                dropped_scenes_are_in_no_file(self.dropped_scenes)
             ),
             Verification::Passed => {
                 "Checked: together they contain the whole original, with nothing missing or changed."
                     .to_owned()
             }
+            // The check ran on every scene, before the dropped ones were
+            // left out, so the count of pictures is the whole original's.
+            Verification::PassedForExactCut(proof) if self.dropped_scenes > 0 => format!(
+                "Checked before the dropped scenes were left out: every scene plays to its \
+                 end, together they have all {} pictures of the original, each scene starts on \
+                 the picture that was chosen, and the sound is the original's, unchanged. {} \
+                 around the cuts were encoded again. {}",
+                proof.pictures,
+                counted_pictures(proof.pictures_encoded_again),
+                dropped_scenes_are_in_no_file(self.dropped_scenes)
+            ),
+            Verification::PassedForExactCut(proof) => format!(
+                "Checked: every scene plays to its end, together they have all {} pictures of \
+                 the original, each scene starts on the picture that was chosen, and the sound \
+                 is the original's, unchanged. {} around the cuts were encoded again.",
+                proof.pictures,
+                counted_pictures(proof.pictures_encoded_again)
+            ),
             Verification::Failed(_) => {
                 "The check did not pass, so the original was kept. Play the scene files before you delete anything."
                     .to_owned()
@@ -195,7 +358,7 @@ impl ExportReport {
 
     fn verification_details(&self) -> Option<&str> {
         match &self.verification {
-            Verification::Passed => None,
+            Verification::Passed | Verification::PassedForExactCut(_) => None,
             Verification::Failed(reason) => Some(reason),
         }
     }
@@ -205,7 +368,9 @@ impl ExportReport {
             OriginalOutcome::Kept | OriginalOutcome::KeptBecauseUnverified => {
                 "The original is still in its place.".to_owned()
             }
-            OriginalOutcome::KeptBecauseScenesDropped => ORIGINAL_KEPT_WITH_DROPPED_SCENES.to_owned(),
+            OriginalOutcome::AlwaysKept(why) => {
+                format!("The original is still in its place. {}", why.as_a_following_sentence())
+            }
             OriginalOutcome::MovedToRecycleBin => {
                 format!("The original is in the {TRASH_NAME}. You can restore it from there.")
             }
@@ -219,7 +384,7 @@ impl ExportReport {
         match &self.original {
             OriginalOutcome::KeptBecauseRecyclingFailed(reason) => Some(reason),
             OriginalOutcome::Kept
-            | OriginalOutcome::KeptBecauseScenesDropped
+            | OriginalOutcome::AlwaysKept(_)
             | OriginalOutcome::MovedToRecycleBin
             | OriginalOutcome::KeptBecauseUnverified => None,
         }
@@ -245,18 +410,74 @@ pub fn counted_dropped_scenes(count: usize) -> String {
     }
 }
 
-/// Said before and after a split with dropped scenes, so nobody waits for
-/// the original to go to the Recycle Bin or Trash.
-pub const ORIGINAL_KEPT_WITH_DROPPED_SCENES: &str =
-    "The original is still in its place. It is always kept when scenes are dropped, \
-     because the new files do not hold all of it.";
+/// "1 scene was dropped and is in no file.", as the result of a split says
+/// it after what was checked.
+fn dropped_scenes_are_in_no_file(count: usize) -> String {
+    format!(
+        "{} and {} in no file.",
+        counted_dropped_scenes(count),
+        if count == 1 { "is" } else { "are" }
+    )
+}
 
-/// Fails only when the scenes could not be written. A failed verification is
-/// reported in the result, and always leaves the original in place.
+/// "1 picture", "50 pictures".
+fn counted_pictures(count: usize) -> String {
+    if count == 1 {
+        "1 picture".to_owned()
+    } else {
+        format!("{count} pictures")
+    }
+}
+
+/// Splits the video the way `order` says, and checks the scenes.
 ///
 /// Scene files are named by `scene_name`. The scenes that are written are
 /// numbered from one without gaps, whichever scenes were dropped.
 pub fn export_scenes(
+    video: &Path,
+    order: &SplitOrder,
+    out_dir: &Path,
+    scene_name: SceneNamePattern,
+) -> Result<ExportReport> {
+    match order.cut_precision {
+        CutPrecision::NearestKeyframe => export_copied_scenes(video, order, out_dir, scene_name),
+        CutPrecision::ExactFrame => export_exact_scenes(video, order, out_dir, scene_name),
+    }
+}
+
+/// Writes scenes that start on the exact pictures chosen, and checks them.
+///
+/// The original is never recycled after an exact split, whatever the order
+/// says about it. Fails when the scenes could not be written or did not
+/// pass their check. In both cases no scene file is put in place.
+fn export_exact_scenes(
+    video: &Path,
+    order: &SplitOrder,
+    out_dir: &Path,
+    scene_name: SceneNamePattern,
+) -> Result<ExportReport> {
+    let split = exact_split::split_on_exact_frames(video, order.scenes(), out_dir, scene_name)?;
+    let verification = Verification::PassedForExactCut(split.proof);
+    let original = match decide_about_original(order.original, &verification) {
+        OriginalDecision::AlwaysKeep(why) => OriginalOutcome::AlwaysKept(why),
+        // No order for an exact split leads to these. Should one ever, the
+        // original stays all the same.
+        OriginalDecision::Keep
+        | OriginalDecision::KeepBecauseUnverified
+        | OriginalDecision::Recycle => OriginalOutcome::AlwaysKept(OriginalAlwaysKept::CutIsExact),
+    };
+    Ok(ExportReport {
+        scene_files: split.scene_files,
+        out_dir: out_dir.to_path_buf(),
+        dropped_scenes: order.scenes().dropped_count(),
+        verification,
+        original,
+    })
+}
+/// Copies the scenes out of the video at keyframes. Fails only when the
+/// scenes could not be written. A failed verification is reported in the
+/// result, and always leaves the original in place.
+fn export_copied_scenes(
     video: &Path,
     order: &SplitOrder,
     out_dir: &Path,
@@ -291,7 +512,7 @@ pub fn export_scenes(
     };
     let original = match decide_about_original(order.original, &verification) {
         OriginalDecision::Keep => OriginalOutcome::Kept,
-        OriginalDecision::KeepBecauseScenesDropped => OriginalOutcome::KeptBecauseScenesDropped,
+        OriginalDecision::AlwaysKeep(why) => OriginalOutcome::AlwaysKept(why),
         OriginalDecision::KeepBecauseUnverified => OriginalOutcome::KeptBecauseUnverified,
         OriginalDecision::Recycle => match trash::delete(video) {
             Ok(()) => OriginalOutcome::MovedToRecycleBin,
@@ -360,21 +581,27 @@ fn has_video_extension(path: &Path) -> bool {
 #[derive(Debug, PartialEq)]
 enum OriginalDecision {
     Keep,
-    KeepBecauseScenesDropped,
+    AlwaysKeep(OriginalAlwaysKept),
     KeepBecauseUnverified,
     Recycle,
 }
 
-/// The one rule that guards the original: it is only recycled when every
-/// scene was written, the person asked for that, and the scenes passed
-/// verification.
+/// The one rule that guards the original: it is only recycled when nothing
+/// about the split says it must stay, the person asked for that, and the
+/// scenes were proven to hold every packet of it. The check of an exact cut
+/// proves less than that, so it never counts.
 fn decide_about_original(rule: OriginalRule, verification: &Verification) -> OriginalDecision {
     match (rule, verification) {
         (OriginalRule::AsChosen(OriginalPolicy::Keep), _) => OriginalDecision::Keep,
         (_, Verification::Failed(_)) => OriginalDecision::KeepBecauseUnverified,
-        (OriginalRule::KeptBecauseScenesDropped, Verification::Passed) => {
-            OriginalDecision::KeepBecauseScenesDropped
-        }
+        (
+            OriginalRule::AlwaysKept(why),
+            Verification::Passed | Verification::PassedForExactCut(_),
+        ) => OriginalDecision::AlwaysKeep(why),
+        (
+            OriginalRule::AsChosen(OriginalPolicy::RecycleOnceVerified),
+            Verification::PassedForExactCut(_),
+        ) => OriginalDecision::AlwaysKeep(OriginalAlwaysKept::CutIsExact),
         (OriginalRule::AsChosen(OriginalPolicy::RecycleOnceVerified), Verification::Passed) => {
             OriginalDecision::Recycle
         }
@@ -495,6 +722,22 @@ mod tests {
     const BOTH_POLICIES: [OriginalPolicy; 2] =
         [OriginalPolicy::Keep, OriginalPolicy::RecycleOnceVerified];
 
+    /// Every way a split can be carried out: copied with either choice
+    /// about the original, or cut on exact pictures.
+    const EVERY_METHOD: [SplitMethod; 3] = [
+        SplitMethod::CopyAtKeyframes {
+            original_policy: OriginalPolicy::Keep,
+        },
+        SplitMethod::CopyAtKeyframes {
+            original_policy: OriginalPolicy::RecycleOnceVerified,
+        },
+        SplitMethod::ExactFrames,
+    ];
+
+    fn copying(original_policy: OriginalPolicy) -> SplitMethod {
+        SplitMethod::CopyAtKeyframes { original_policy }
+    }
+
     fn three_scenes() -> CutTimes {
         let whole_video = TimeSpan {
             start: 0.0,
@@ -508,26 +751,96 @@ mod tests {
         ScenesToWrite::new(three_scenes(), fates).unwrap()
     }
 
-    #[test]
-    fn a_split_with_a_dropped_scene_keeps_the_original_whatever_was_chosen() {
-        for chosen in BOTH_POLICIES {
-            let order = SplitOrder::new(with_the_middle_scene_dropped(), chosen);
-            assert_eq!(order.original, OriginalRule::KeptBecauseScenesDropped);
+    fn exact_cut_proof() -> ExactCutProof {
+        ExactCutProof {
+            pictures: 225,
+            pictures_encoded_again: 50,
+            sound_packets: 389,
+            cut_landings: vec![crate::exact_verify::CutLanding {
+                asked_for: 2.9,
+                landed_at: 2.92,
+            }],
+            largest_sound_shift_seconds: 0.0007,
         }
     }
 
     #[test]
-    fn a_split_of_every_scene_does_what_was_chosen_for_the_original() {
+    fn a_split_with_a_dropped_scene_keeps_the_original_whatever_was_chosen() {
         for chosen in BOTH_POLICIES {
-            let order = SplitOrder::new(ScenesToWrite::every_scene(three_scenes()), chosen);
+            let order = SplitOrder::new(with_the_middle_scene_dropped(), copying(chosen));
+            assert_eq!(
+                order.original,
+                OriginalRule::AlwaysKept(OriginalAlwaysKept::ScenesDropped)
+            );
+        }
+    }
+
+    #[test]
+    fn a_copied_split_of_every_scene_does_what_was_chosen_for_the_original() {
+        for chosen in BOTH_POLICIES {
+            let order =
+                SplitOrder::new(ScenesToWrite::every_scene(three_scenes()), copying(chosen));
             assert_eq!(order.original, OriginalRule::AsChosen(chosen));
         }
     }
 
     #[test]
-    fn no_order_with_a_dropped_scene_ever_leads_to_recycling() {
-        // Every way of dropping scenes from three, with both choices about
-        // the original and both results of the check.
+    fn an_exact_split_keeps_the_original_and_says_every_reason_that_applies() {
+        let every_scene = ScenesToWrite::every_scene(three_scenes());
+        assert_eq!(
+            SplitOrder::new(every_scene, SplitMethod::ExactFrames).original,
+            OriginalRule::AlwaysKept(OriginalAlwaysKept::CutIsExact)
+        );
+        let with_a_drop = with_the_middle_scene_dropped();
+        assert_eq!(
+            SplitOrder::new(with_a_drop, SplitMethod::ExactFrames).original,
+            OriginalRule::AlwaysKept(OriginalAlwaysKept::ScenesDroppedAndCutIsExact)
+        );
+    }
+
+    #[test]
+    fn the_reason_the_original_is_always_kept_follows_from_drops_and_precision_alone() {
+        let on_keyframes = CutPrecision::NearestKeyframe;
+        let exact = CutPrecision::ExactFrame;
+        assert_eq!(OriginalAlwaysKept::for_split(0, on_keyframes), None);
+        assert_eq!(
+            OriginalAlwaysKept::for_split(2, on_keyframes),
+            Some(OriginalAlwaysKept::ScenesDropped)
+        );
+        assert_eq!(
+            OriginalAlwaysKept::for_split(0, exact),
+            Some(OriginalAlwaysKept::CutIsExact)
+        );
+        assert_eq!(
+            OriginalAlwaysKept::for_split(1, exact),
+            Some(OriginalAlwaysKept::ScenesDroppedAndCutIsExact)
+        );
+    }
+
+    #[test]
+    fn each_reason_is_one_sentence_that_names_the_original() {
+        assert_eq!(
+            OriginalAlwaysKept::ScenesDropped.in_plain_words(),
+            "The original is always kept when scenes are dropped, because the new files do \
+             not hold all of it."
+        );
+        assert_eq!(
+            OriginalAlwaysKept::CutIsExact.in_plain_words(),
+            "The original is always kept after an exact cut, because pictures that were \
+             encoded again cannot be compared with it one for one."
+        );
+        assert_eq!(
+            OriginalAlwaysKept::ScenesDroppedAndCutIsExact.in_plain_words(),
+            "The original is always kept when scenes are dropped or cuts are exact, because \
+             the new files do not hold all of it and pictures that were encoded again cannot \
+             be compared with it one for one."
+        );
+    }
+
+    #[test]
+    fn no_order_that_drops_a_scene_or_cuts_exactly_ever_leads_to_recycling() {
+        // Every way of dropping scenes from three, with every way to carry
+        // out the split and every result of the check.
         let keep_or_drop = [SceneFate::Keep, SceneFate::Drop];
         for first in keep_or_drop {
             for second in keep_or_drop {
@@ -537,12 +850,19 @@ mod tests {
                         // Dropping every scene is no split at all.
                         continue;
                     };
-                    if !scenes.has_dropped_scenes() {
-                        continue;
-                    }
-                    for chosen in BOTH_POLICIES {
-                        let order = SplitOrder::new(scenes.clone(), chosen);
-                        for verification in [Verification::Passed, failed()] {
+                    for method in EVERY_METHOD {
+                        let copies_every_scene = !scenes.has_dropped_scenes()
+                            && method.cut_precision() == CutPrecision::NearestKeyframe;
+                        if copies_every_scene {
+                            continue;
+                        }
+                        let order = SplitOrder::new(scenes.clone(), method);
+                        let every_result = [
+                            Verification::Passed,
+                            Verification::PassedForExactCut(exact_cut_proof()),
+                            failed(),
+                        ];
+                        for verification in every_result {
                             assert_ne!(
                                 decide_about_original(order.original, &verification),
                                 OriginalDecision::Recycle
@@ -556,15 +876,13 @@ mod tests {
 
     #[test]
     fn a_checked_split_with_dropped_scenes_says_why_the_original_stayed() {
+        let because_dropped = OriginalRule::AlwaysKept(OriginalAlwaysKept::ScenesDropped);
         assert_eq!(
-            decide_about_original(
-                OriginalRule::KeptBecauseScenesDropped,
-                &Verification::Passed
-            ),
-            OriginalDecision::KeepBecauseScenesDropped
+            decide_about_original(because_dropped, &Verification::Passed),
+            OriginalDecision::AlwaysKeep(OriginalAlwaysKept::ScenesDropped)
         );
         assert_eq!(
-            decide_about_original(OriginalRule::KeptBecauseScenesDropped, &failed()),
+            decide_about_original(because_dropped, &failed()),
             OriginalDecision::KeepBecauseUnverified
         );
     }
@@ -573,7 +891,7 @@ mod tests {
     fn the_result_of_a_split_with_dropped_scenes_says_what_was_dropped_and_kept() {
         let mut with_drops = report(
             Verification::Passed,
-            OriginalOutcome::KeptBecauseScenesDropped,
+            OriginalOutcome::AlwaysKept(OriginalAlwaysKept::ScenesDropped),
         );
         with_drops.dropped_scenes = 2;
         assert!(with_drops.is_clean());
@@ -590,6 +908,102 @@ mod tests {
         assert!(with_drops
             .plain_summary()
             .contains("1 scene was dropped and is in no file."));
+    }
+
+    fn exact_cut_report() -> ExportReport {
+        report(
+            Verification::PassedForExactCut(exact_cut_proof()),
+            OriginalOutcome::AlwaysKept(OriginalAlwaysKept::CutIsExact),
+        )
+    }
+
+    #[test]
+    fn an_exact_split_never_carries_a_wish_to_recycle_the_original() {
+        for original_policy in [OriginalPolicy::Keep, OriginalPolicy::RecycleOnceVerified] {
+            let options = ExportOptions {
+                original_policy,
+                cut_precision: CutPrecision::ExactFrame,
+                ..ExportOptions::default()
+            };
+            assert_eq!(options.split_method(), SplitMethod::ExactFrames);
+            assert_eq!(
+                options.split_method().original_policy(),
+                OriginalPolicy::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_on_keyframes_carries_the_setting_for_the_original() {
+        for original_policy in [OriginalPolicy::Keep, OriginalPolicy::RecycleOnceVerified] {
+            let options = ExportOptions {
+                original_policy,
+                ..ExportOptions::default()
+            };
+            assert_eq!(
+                options.split_method(),
+                SplitMethod::CopyAtKeyframes { original_policy }
+            );
+            assert_eq!(options.split_method().original_policy(), original_policy);
+        }
+    }
+
+    #[test]
+    fn cuts_go_on_keyframes_unless_chosen_otherwise() {
+        assert_eq!(
+            ExportOptions::default().cut_precision,
+            CutPrecision::NearestKeyframe
+        );
+    }
+
+    #[test]
+    fn the_result_of_an_exact_split_says_what_was_checked_and_that_the_original_is_kept() {
+        let report = exact_cut_report();
+        assert!(report.is_clean());
+        assert_eq!(report.details(), None);
+        assert_eq!(
+            report.plain_summary(),
+            "1 scene file is in\nscenes\n\n\
+             Checked: every scene plays to its end, together they have all 225 pictures of \
+             the original, each scene starts on the picture that was chosen, and the sound \
+             is the original's, unchanged. 50 pictures around the cuts were encoded again.\n\n\
+             The original is still in its place. It is always kept after an exact cut, because \
+             pictures that were encoded again cannot be compared with it one for one."
+        );
+    }
+
+    #[test]
+    fn the_result_of_an_exact_split_with_dropped_scenes_says_both_things() {
+        let mut report = exact_cut_report();
+        report.dropped_scenes = 1;
+        report.original =
+            OriginalOutcome::AlwaysKept(OriginalAlwaysKept::ScenesDroppedAndCutIsExact);
+        assert!(report.is_clean());
+        assert_eq!(
+            report.plain_summary(),
+            "1 scene file is in\nscenes\n\n\
+             Checked before the dropped scenes were left out: every scene plays to its end, \
+             together they have all 225 pictures of the original, each scene starts on the \
+             picture that was chosen, and the sound is the original's, unchanged. 50 pictures \
+             around the cuts were encoded again. 1 scene was dropped and is in no file.\n\n\
+             The original is still in its place. It is always kept when scenes are dropped or \
+             cuts are exact, because the new files do not hold all of it and pictures that \
+             were encoded again cannot be compared with it one for one."
+        );
+    }
+
+    #[test]
+    fn the_measurements_of_an_exact_split_say_where_each_cut_landed() {
+        assert_eq!(
+            exact_cut_report().exact_cut_measurements().as_deref(),
+            Some(
+                "Pictures: 225 in the original and in the scenes together, 50 of them encoded again.\n\
+                 Sound: 389 packets, all copied unchanged. Largest shift against the picture: 0.0007 s.\n\
+                 Cut 1: asked for at 00:00:02.900, the next scene starts at 00:00:02.920 (0.020 s later)."
+            )
+        );
+        let copied = report(Verification::Passed, OriginalOutcome::Kept);
+        assert_eq!(copied.exact_cut_measurements(), None);
     }
 
     #[test]
@@ -642,6 +1056,18 @@ mod tests {
                 &Verification::Passed
             ),
             OriginalDecision::Recycle
+        );
+    }
+
+    #[test]
+    fn the_check_of_an_exact_cut_never_lets_the_original_be_recycled() {
+        // No order pairs this rule with this check. The rule holds anyway.
+        assert_eq!(
+            decide_about_original(
+                OriginalRule::AsChosen(OriginalPolicy::RecycleOnceVerified),
+                &Verification::PassedForExactCut(exact_cut_proof())
+            ),
+            OriginalDecision::AlwaysKeep(OriginalAlwaysKept::CutIsExact)
         );
     }
 
