@@ -601,9 +601,9 @@ mod tests {
 
     #[test]
     fn an_unfinished_scene_has_a_shorter_path_than_the_finished_one() {
-        // The name of the clip that showed the problem: 64 characters.
+        // As long as the name of the clip that showed the problem: 64 characters.
         let video =
-            Path::new("Top Gun- Maverick (2022)- Maverick Risks Everything - Full Scene.mp4");
+            Path::new("A long film name (2022)- with spaces and bracket - whole scene 1.mp4");
         let name = SceneFileName::of(video).unwrap();
         let out_dir = Path::new("out");
 
