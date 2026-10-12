@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use crate::exact_cut::{ExactCutPlan, ScenePlan};
-use crate::ffmpeg::{FfmpegError, NotUnderstood, Program, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT};
+use crate::ffmpeg::{
+    FfmpegError, NotUnderstood, Program, Turn, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT,
+};
 use crate::tools;
 
 /// How far the time of a picture, measured from its scene's first picture,
@@ -68,7 +70,7 @@ const CLEARLY_MORE_LIKE_A_NEIGHBOUR: f64 = 0.5;
 /// What ffprobe says about how the pictures of a file are to be shown. The
 /// lines that begin with one of these have to be the same for a scene and
 /// the original.
-const SHOWN_AS_PROPERTIES: [&str; 9] = [
+const SHOWN_AS_PROPERTIES: [&str; 11] = [
     "width=",
     "height=",
     "sample_aspect_ratio=",
@@ -79,8 +81,15 @@ const SHOWN_AS_PROPERTIES: [&str; 9] = [
     // How far to turn the pictures for showing, as older and newer versions
     // of ffprobe print it.
     "TAG:rotate=",
-    "rotation=",
+    TURN_PROPERTY,
+    // The first two rows of the table the turn is worked out from, which
+    // also say whether the pictures are mirrored. ffprobe numbers the rows.
+    // The third row says where the turned picture is moved to, which players
+    // work out themselves and old versions of ffmpeg write differently.
+    "00000000:",
+    "00000001:",
 ];
+const TURN_PROPERTY: &str = "rotation=";
 const SMALL_COPIES_OF_THE_ORIGINAL_FILE: &str = "small_copies_original.gray";
 /// The longest condition that names the pictures to make small copies of.
 /// Every cut adds about 30 characters to it, and Windows takes a command
@@ -151,6 +160,15 @@ impl ShownAs {
             .map(str::to_owned)
             .collect();
         Self(properties)
+    }
+
+    /// How far the pictures are to be turned for showing, when the file
+    /// says so in the way newer versions of ffmpeg write it.
+    pub fn turn(&self) -> Option<Turn> {
+        self.0
+            .iter()
+            .find_map(|property| property.strip_prefix(TURN_PROPERTY))
+            .and_then(Turn::stated_as)
     }
 
     /// The first property stated here that `other` does not state the same
@@ -641,7 +659,7 @@ fn small_copies_from(
 }
 
 /// Asks ffprobe how the pictures of the video are to be shown.
-fn read_shown_as(video: &Path) -> Result<ShownAs, FfmpegError> {
+pub fn read_shown_as(video: &Path) -> Result<ShownAs, FfmpegError> {
     let description = tools::command(Program::Ffprobe)
         .args(["-v", "error", "-select_streams", "v:0", "-show_streams"])
         .arg(video)
@@ -1494,6 +1512,38 @@ mod tests {
                 property: "rotation=-90".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn a_scene_that_is_mirrored_and_the_original_is_not_is_not_proven() {
+        // Both are turned by a quarter. Only the table behind that differs.
+        let turned = |first_row: &str| {
+            ShownAs::from_stream_description(&format!(
+                "{SHOWN_AS_IN_THE_ORIGINAL}[SIDE_DATA]\ndisplaymatrix=\n{first_row}\n\
+                 00000001:        65536           0           0\n\
+                 00000002:            0           0  1073741824\n\nrotation=90\n[/SIDE_DATA]\n"
+            ))
+        };
+        let mut original = original();
+        original.shown_as = turned("00000000:            0      -65536           0");
+        let mut scenes = correct_scenes(&original);
+        assert!(prove(&plan(), &[cut_time()], &original, &scenes).is_ok());
+
+        scenes[0].shown_as = turned("00000000:            0       65536           0");
+        assert!(matches!(
+            prove(&plan(), &[cut_time()], &original, &scenes),
+            Err(NotProven::ShownDifferently { scene: 1, property }) if property.starts_with("00000000:")
+        ));
+    }
+
+    #[test]
+    fn the_turn_of_a_video_is_read_where_it_is_stated() {
+        let turned = ShownAs::from_stream_description(
+            "width=320\n[SIDE_DATA]\nside_data_type=Display Matrix\nrotation=-90\n[/SIDE_DATA]\n",
+        );
+        assert_eq!(turned.turn(), Turn::stated_as("-90"));
+        let upright = ShownAs::from_stream_description(SHOWN_AS_IN_THE_ORIGINAL);
+        assert_eq!(upright.turn(), None);
     }
 
     #[test]

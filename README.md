@@ -461,7 +461,7 @@ Inside each, the app uses a `scene_splitter` folder:
 2. Everything from that keyframe to the last keyframe before the scene's end is copied, untouched.
 3. The pictures from that last keyframe to the end of the scene are encoded again.
 
-ffmpeg then joins the parts without touching them. A scene with no keyframe to copy between is encoded again as a whole. A cut that happens to be on a keyframe encodes nothing. A copy only starts on a keyframe that the pictures stored after it do not reach back across.
+ffmpeg then joins the parts without touching them. A video filmed with a phone held upright is marked to be shown turned, and ffmpeg 8 loses that mark from the pictures it encodes again, so with that version the app names the turn again as it joins the parts. A scene with no keyframe to copy between is encoded again as a whole. A cut that happens to be on a keyframe encodes nothing. A copy only starts on a keyframe that the pictures stored after it do not reach back across.
 
 Sound is never encoded again. Each scene gets every packet of sound that starts while its pictures are shown, so the sound of a scene can begin up to one packet (about 0.02 seconds for AAC) after its first picture and end up to one packet after its last. Inside a scene, sound and picture are in step as in the original, to within 2 thousandths of a second.
 

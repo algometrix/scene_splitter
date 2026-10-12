@@ -33,8 +33,8 @@ use crate::exact_fallback::WhyNotExact;
 use crate::exact_verify::{self, ExactCutProof, VerifyError};
 use crate::fates::ScenesToWrite;
 use crate::ffmpeg::{
-    FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit, QUICK_ANSWER_LIMIT,
-    STEADY_OUTPUT_LIMIT,
+    FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit, Turn, TurnOption,
+    QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT,
 };
 use crate::probe;
 use crate::scene_name::SceneNamePattern;
@@ -546,6 +546,10 @@ struct SourceVideo {
     /// The steps per second of the video stream's clock.
     ticks_per_second: u32,
     sound_streams: usize,
+    /// How far the pictures are to be turned for showing, when the file
+    /// says so. A phone held upright stores what it films lying on its side
+    /// and marks it to be turned.
+    turn: Option<Turn>,
 }
 
 fn read_source_video(input: &Path) -> Result<SourceVideo, ExactCutError> {
@@ -573,12 +577,19 @@ fn read_source_video(input: &Path) -> Result<SourceVideo, ExactCutError> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    source_video_from(&properties, sound_streams).map_err(ExactCutError::Unsupported)
+    let turn = exact_verify::read_shown_as(input)
+        .map_err(read_failed)?
+        .turn();
+    source_video_from(&properties, sound_streams, turn).map_err(ExactCutError::Unsupported)
 }
 
 /// Reads ffprobe's "name=value" lines about the video stream and decides
 /// whether an exact cut can match it.
-fn source_video_from(properties: &str, sound_streams: usize) -> Result<SourceVideo, Unsupported> {
+fn source_video_from(
+    properties: &str,
+    sound_streams: usize,
+    turn: Option<Turn>,
+) -> Result<SourceVideo, Unsupported> {
     let properties: BTreeMap<&str, &str> = properties
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -649,6 +660,7 @@ fn source_video_from(properties: &str, sound_streams: usize) -> Result<SourceVid
         },
         ticks_per_second,
         sound_streams,
+        turn,
     })
 }
 
@@ -839,7 +851,8 @@ fn write_scene(
         join_arguments(
             input,
             scene,
-            source.sound_streams,
+            source,
+            tools::turn_option(),
             &parts_list_file,
             sound_file.as_deref(),
             scene_file,
@@ -1017,7 +1030,8 @@ fn parts_list_entry(part_name: &str, seconds: f64) -> String {
 fn join_arguments(
     input: &Path,
     scene: &ScenePlan,
-    sound_streams: usize,
+    source: &SourceVideo,
+    turn_option: TurnOption,
     parts_list_file: &Path,
     sound_file: Option<&Path>,
     scene_file: &Path,
@@ -1029,6 +1043,11 @@ fn join_arguments(
     let is_first_scene = scene.sound_from.is_none();
     if is_first_scene {
         arguments = arguments.option("-itsoffset", FfmpegTime::from_seconds(scene.starts_at));
+    }
+    // Where the ffmpeg in use would lose the turn of the pictures on the
+    // way through the parts, the parts are read as turned like the original.
+    for argument in turn_option.arguments(source.turn.as_ref()) {
+        arguments = arguments.with(&[&argument]);
     }
     arguments = arguments
         .with(&["-f", "concat", "-safe", "0"])
@@ -1052,7 +1071,7 @@ fn join_arguments(
         .option("-map_metadata", original)
         .option("-map_metadata:s:v:0", format!("{original}:s:v:0"))
         .with(&["-map_chapters", "-1"]);
-    for stream in 0..sound_streams {
+    for stream in 0..source.sound_streams {
         arguments = arguments.option(
             &format!("-map_metadata:s:a:{stream}"),
             format!("{original}:s:a:{stream}"),
@@ -1089,7 +1108,7 @@ mod tests {
     }
 
     fn unsupported(name: &str, value: &str) -> Unsupported {
-        source_video_from(&properties_with(name, value), 1).unwrap_err()
+        source_video_from(&properties_with(name, value), 1, None).unwrap_err()
     }
 
     fn joined(arguments: &[OsString]) -> String {
@@ -1121,7 +1140,7 @@ mod tests {
     }
 
     fn source() -> SourceVideo {
-        source_video_from(H264_PROPERTIES, 2).unwrap()
+        source_video_from(H264_PROPERTIES, 2, None).unwrap()
     }
 
     #[test]
@@ -1142,11 +1161,12 @@ mod tests {
         );
         assert_eq!(source.ticks_per_second, 12800);
         assert_eq!(source.sound_streams, 2);
+        assert_eq!(source.turn, None);
     }
 
     #[test]
     fn a_level_the_original_does_not_state_is_left_to_the_encoder() {
-        let source = source_video_from(&properties_with("level", "-99"), 0).unwrap();
+        let source = source_video_from(&properties_with("level", "-99"), 0, None).unwrap();
         assert_eq!(source.encoder.level, None);
     }
 
@@ -1157,7 +1177,7 @@ mod tests {
             ("Main", "main"),
             ("High", "high"),
         ] {
-            let source = source_video_from(&properties_with("profile", stated), 0).unwrap();
+            let source = source_video_from(&properties_with("profile", stated), 0, None).unwrap();
             assert_eq!(source.encoder.profile, expected);
         }
     }
@@ -1387,7 +1407,8 @@ mod tests {
         let second_scene = joined(&join_arguments(
             Path::new("film.mp4"),
             &plan.scenes()[1],
-            2,
+            &source(),
+            TurnOption::LeftToTheParts,
             Path::new("parts.txt"),
             Some(Path::new("sound.nut")),
             Path::new("002.mp4"),
@@ -1404,10 +1425,15 @@ mod tests {
     #[test]
     fn a_video_without_sound_is_joined_from_its_parts_alone() {
         let plan = plan();
+        let without_sound = SourceVideo {
+            sound_streams: 0,
+            ..source()
+        };
         let first_scene = joined(&join_arguments(
             Path::new("film.mp4"),
             &plan.scenes()[0],
-            0,
+            &without_sound,
+            TurnOption::LeftToTheParts,
             Path::new("parts.txt"),
             None,
             Path::new("001.mp4"),
@@ -1418,6 +1444,42 @@ mod tests {
              -map 0:v:0 -c copy -map_metadata 1 -map_metadata:s:v:0 1:s:v:0 \
              -map_chapters -1 001.mp4"
         );
+    }
+
+    #[test]
+    fn where_ffmpeg_would_lose_the_turn_it_is_named_for_the_parts_at_the_join() {
+        let plan = plan();
+        let turned = SourceVideo {
+            sound_streams: 0,
+            turn: Turn::stated_as("-90"),
+            ..source()
+        };
+        let join_with = |turn_option, source: &SourceVideo| {
+            joined(&join_arguments(
+                Path::new("film.mp4"),
+                &plan.scenes()[1],
+                source,
+                turn_option,
+                Path::new("parts.txt"),
+                None,
+                Path::new("002.mp4"),
+            ))
+        };
+
+        assert!(
+            join_with(TurnOption::NamedAtTheJoin, &turned)
+                .starts_with("-copyts -display_rotation -90 -f concat -safe 0 -i parts.txt "),
+            "{}",
+            join_with(TurnOption::NamedAtTheJoin, &turned)
+        );
+        // An ffmpeg that keeps the turn is not told, and neither is any
+        // ffmpeg about a video that states none.
+        assert!(!join_with(TurnOption::LeftToTheParts, &turned).contains("-display_rotation"));
+        let upright = SourceVideo {
+            turn: None,
+            ..turned
+        };
+        assert!(!join_with(TurnOption::NamedAtTheJoin, &upright).contains("-display_rotation"));
     }
 
     #[test]

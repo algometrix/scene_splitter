@@ -147,19 +147,29 @@ pub fn command(program: Program) -> ToolCommand {
     ToolCommand::at(program, located(program))
 }
 
-/// How the ffmpeg in use is asked to keep every picture's own time. Asked of
-/// the program once, since the answer cannot change while the app runs.
-pub fn picture_times_option() -> ffmpeg::PictureTimesOption {
-    static OPTION: OnceLock<ffmpeg::PictureTimesOption> = OnceLock::new();
-    *OPTION.get_or_init(|| {
-        let banner = command(Program::Ffmpeg)
+/// What the ffmpeg in use prints about its version. Asked of the program
+/// once, since the answer cannot change while the app runs.
+fn version_banner() -> &'static str {
+    static BANNER: OnceLock<String> = OnceLock::new();
+    BANNER.get_or_init(|| {
+        command(Program::Ffmpeg)
             .arg("-version")
             .run_for_text(ffmpeg::QUICK_ANSWER_LIMIT)
             // An ffmpeg that cannot even say its version fails the run that
             // follows with its own, better error.
-            .unwrap_or_default();
-        ffmpeg::PictureTimesOption::for_version(&banner)
+            .unwrap_or_default()
     })
+}
+
+/// How the ffmpeg in use is asked to keep every picture's own time.
+pub fn picture_times_option() -> ffmpeg::PictureTimesOption {
+    ffmpeg::PictureTimesOption::for_version(version_banner())
+}
+
+/// Whether the ffmpeg in use has to be told the turn of a video again when
+/// it joins the parts of a scene.
+pub fn turn_option() -> ffmpeg::TurnOption {
+    ffmpeg::TurnOption::for_version(version_banner())
 }
 
 /// A bare command that runs ffmpeg, for the player. Its decoders run for as
