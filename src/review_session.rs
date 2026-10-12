@@ -446,7 +446,7 @@ impl ReviewSession {
         self.new_split_precision = precision;
     }
 
-    /// How far "Move split earlier" and "Move split later" move a split.
+    /// How far "Earlier" and "Later" beside "Move this split" move a split.
     /// It follows where new splits land: a split that copies can only be
     /// cut at certain points, and an exact one on any picture.
     pub fn nudge_step(&self) -> NudgeStep {

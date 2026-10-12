@@ -151,8 +151,13 @@ const KEY_NAME_WIDTH: f32 = 130.0;
 const SPLIT_HINT: &str = "Starts the split (Ctrl+Enter).";
 const JOIN_HINT: &str = "Makes these two scenes one. You can also drag one onto the other, \
      or press J on the upper one.";
-const MOVE_SPLIT_EARLIER_LABEL: &str = "Move split earlier";
-const MOVE_SPLIT_LATER_LABEL: &str = "Move split later";
+const MOVE_SPLIT_LABEL: &str = "Move this split";
+const MOVE_SPLIT_EARLIER_LABEL: &str = "Earlier";
+const MOVE_SPLIT_LATER_LABEL: &str = "Later";
+/// Lines the row between two cards up with the text on the cards.
+const BETWEEN_SCENES_INDENT: f32 = 12.0;
+const BETWEEN_SCENES_FONT_SIZE: f32 = 12.0;
+const BETWEEN_SCENES_BUTTON_HEIGHT: f32 = 24.0;
 const MOVE_SPLIT_EARLIER_HINT: &str =
     "Moves the split between these two scenes to the point before it where the video can be cut \
      (Alt+Left on the lower scene).";
@@ -759,14 +764,13 @@ impl ReviewScreen {
             ui.label(theme::muted(ui, session.scan_summary()))
                 .on_hover_text(session.scan_details());
             if session.chapter_split_count() > 0 {
-                let leave_out = ui
-                    .link(LEAVE_OUT_CHAPTERS_LABEL)
+                let leave_out = whole_link(ui, LEAVE_OUT_CHAPTERS_LABEL)
                     .on_hover_text(LEAVE_OUT_CHAPTERS_EXPLANATION);
                 if leave_out.clicked() {
                     requests.push(ReviewRequest::LeaveOutChapterSplits);
                 }
             }
-            let scan_again = ui.link("Scan again").on_hover_text(SCAN_AGAIN_EXPLANATION);
+            let scan_again = whole_link(ui, "Scan again").on_hover_text(SCAN_AGAIN_EXPLANATION);
             if scan_again.clicked() {
                 requests.push(ReviewRequest::Rescan(ScanKind::BlackScreens));
             }
@@ -774,9 +778,8 @@ impl ReviewScreen {
                 SettingsCard::Hidden => BLACK_SCREEN_SETTINGS_LABEL,
                 SettingsCard::JustOpened | SettingsCard::Open => HIDE_BLACK_SCREEN_SETTINGS_LABEL,
             };
-            let settings_link = ui
-                .link(settings_label)
-                .on_hover_text(BLACK_SCREEN_SETTINGS_EXPLANATION);
+            let settings_link =
+                whole_link(ui, settings_label).on_hover_text(BLACK_SCREEN_SETTINGS_EXPLANATION);
             if settings_link.clicked() {
                 self.black_screen_settings = match self.black_screen_settings {
                     SettingsCard::Hidden => SettingsCard::JustOpened,
@@ -788,8 +791,7 @@ impl ReviewScreen {
             } else {
                 "Scenes missed?"
             };
-            let missed = ui
-                .link(missed_label)
+            let missed = whole_link(ui, missed_label)
                 .on_hover_text("For videos that change scene without a black screen.");
             if missed.clicked() {
                 self.missed_scenes_open = !self.missed_scenes_open;
@@ -798,7 +800,10 @@ impl ReviewScreen {
                 KeysList::Hidden => KEYS_HEADING,
                 KeysList::Shown => HIDE_KEYS_LABEL,
             };
-            if ui.link(keys_label).on_hover_text(KEYS_LINK_HINT).clicked() {
+            if whole_link(ui, keys_label)
+                .on_hover_text(KEYS_LINK_HINT)
+                .clicked()
+            {
                 self.toggle_keys_list();
             }
             requests.extend(show_save_scene_list_menu(ui, session.video()));
@@ -2188,8 +2193,31 @@ fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<Re
 
 /// The quiet way to save the list of scenes without splitting: a link that
 /// opens the three formats, then the system's dialog for where to save.
+/// A link that starts the next row when this one has no room for all of it.
+/// Broken over two rows, one link reads as two.
+fn whole_link(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    start_next_row_unless_it_fits(ui, label);
+    ui.link(label)
+}
+
+fn start_next_row_unless_it_fits(ui: &mut egui::Ui, label: &str) {
+    let width = egui::WidgetText::from(label)
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Body,
+        )
+        .size()
+        .x;
+    if ui.available_size_before_wrap().x < width {
+        ui.end_row();
+    }
+}
+
 fn show_save_scene_list_menu(ui: &mut egui::Ui, video: &Path) -> Option<ReviewRequest> {
     let mut request = None;
+    start_next_row_unless_it_fits(ui, SAVE_SCENE_LIST_LABEL);
     let link_color = ui.visuals().hyperlink_color;
     ui.scope(|ui| {
         // Drawn without a frame, in the colour of a link and no taller than
@@ -2676,21 +2704,20 @@ fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex, nudge_step: NudgeStep) ->
         scene.next().number()
     );
     let mut asked = None;
-    let row = ui.horizontal(|ui| {
+    // One group at the left, where the card headings begin. Spread over the
+    // width, the last button ran under the scroll bar and was cut off.
+    let row = ui.horizontal_wrapped(|ui| {
+        ui.add_space(BETWEEN_SCENES_INDENT);
+        if show_quiet_button(ui, &join_label, JOIN_HINT) {
+            asked = Some(BetweenScenes::Join);
+        }
+        ui.label(theme::caption(ui, MOVE_SPLIT_LABEL));
         if show_quiet_button(ui, MOVE_SPLIT_EARLIER_LABEL, earlier_hint) {
             asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Earlier));
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if show_quiet_button(ui, MOVE_SPLIT_LATER_LABEL, later_hint) {
-                asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Later));
-            }
-            // In the middle of the room the two other buttons leave.
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                if show_quiet_button(ui, &join_label, JOIN_HINT) {
-                    asked = Some(BetweenScenes::Join);
-                }
-            });
-        });
+        if show_quiet_button(ui, MOVE_SPLIT_LATER_LABEL, later_hint) {
+            asked = Some(BetweenScenes::MoveSplit(NudgeDirection::Later));
+        }
     });
     JoinRow {
         asked,
@@ -2698,10 +2725,12 @@ fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex, nudge_step: NudgeStep) ->
     }
 }
 
-/// A small button without a frame, for the row between two cards, where
-/// framed buttons would read as part of a card. Returns true when clicked.
+/// A small button for the row between two cards. It has an outline, so it
+/// reads as something to press, but it is lower than the buttons on a card.
+/// Returns true when clicked.
 fn show_quiet_button(ui: &mut egui::Ui, label: &str, hint: &str) -> bool {
-    ui.add(egui::Button::new(theme::caption(ui, label)).frame(false))
+    let text = egui::RichText::new(label).size(BETWEEN_SCENES_FONT_SIZE);
+    ui.add(egui::Button::new(text).min_size(egui::vec2(0.0, BETWEEN_SCENES_BUTTON_HEIGHT)))
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(hint)
         .clicked()
@@ -3180,15 +3209,20 @@ mod tests {
                 .fold(f32::NEG_INFINITY, f32::max)
         }
 
-        /// A spot on the row between a scene's card and the next card, this
-        /// far from the left edge of the cards.
-        fn between_scene_and_next(&self, scene: usize, from_left: f32) -> egui::Pos2 {
-            let above = self.view.scene_cards[scene];
-            let below = self.view.scene_cards[scene + 1];
-            egui::pos2(
-                above.left() + from_left,
-                (above.bottom() + below.top()) / 2.0,
-            )
+        /// The middle of the button that says `label` on the row between a
+        /// scene's card and the next card.
+        fn button_between_scene_and_next(&self, scene: usize, label: &str) -> egui::Pos2 {
+            let above = self.view.scene_cards[scene].bottom();
+            let below = self.view.scene_cards[scene + 1].top();
+            let mut places = Vec::new();
+            for clipped in &self.shapes {
+                places_of_text_in(&clipped.shape, label, &mut places);
+            }
+            places
+                .into_iter()
+                .map(|place| place.center())
+                .find(|middle| above < middle.y && middle.y < below)
+                .unwrap_or_else(|| panic!("no \"{label}\" between scenes {scene} and the next"))
         }
 
         fn split_feedback(&self) -> String {
@@ -3228,6 +3262,20 @@ mod tests {
                 usize::from(is_focus_ring)
             }
             _ => 0,
+        }
+    }
+
+    fn places_of_text_in(shape: &egui::Shape, wanted: &str, places: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    places_of_text_in(shape, wanted, places);
+                }
+            }
+            egui::Shape::Text(text) if text.galley.text() == wanted => {
+                places.push(text.visual_bounding_rect());
+            }
+            _ => {}
         }
     }
 
@@ -3419,10 +3467,9 @@ mod tests {
     }
 
     #[test]
-    fn the_buttons_at_the_ends_of_the_row_between_two_cards_move_their_split() {
-        const INTO_THE_BUTTON: f32 = 30.0;
+    fn the_buttons_on_the_row_between_two_cards_move_their_split() {
         let mut screen = Screen::with_five_scenes();
-        let earlier = screen.between_scene_and_next(1, INTO_THE_BUTTON);
+        let earlier = screen.button_between_scene_and_next(1, MOVE_SPLIT_EARLIER_LABEL);
         screen.click_at(earlier, egui::Modifiers::NONE);
         assert_eq!(screen.scene_ends(), vec![20.0, 30.0, 60.0, 80.0, 100.0]);
         assert_eq!(
@@ -3430,8 +3477,7 @@ mod tests {
             "Moved the split from 00:00:40.000 to 00:00:30.000."
         );
 
-        let card_width = screen.view.scene_cards[1].width();
-        let later = screen.between_scene_and_next(1, card_width - INTO_THE_BUTTON);
+        let later = screen.button_between_scene_and_next(1, MOVE_SPLIT_LATER_LABEL);
         screen.click_at(later, egui::Modifiers::NONE);
         assert_eq!(screen.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
         // The keys now work on the scene that starts at the moved split.
@@ -3447,21 +3493,21 @@ mod tests {
         // As wide as what is left of a window 900 points wide beside the
         // queue, and tall enough to have the first cards in view.
         const NARROW_WINDOW: egui::Vec2 = egui::vec2(600.0, 3000.0);
-        const INTO_THE_BUTTON: f32 = 30.0;
         let mut screen = Screen::showing(test_sessions::five_scenes(), NARROW_WINDOW);
         let card = screen.view.scene_cards[0];
         assert!(card.right() <= NARROW_WINDOW.x);
+        assert!(screen.right_edge_of_all_text() <= NARROW_WINDOW.x);
 
-        // All three buttons are there, each where it is expected.
-        let middle = screen.between_scene_and_next(0, card.width() / 2.0);
-        screen.click_at(middle, egui::Modifiers::NONE);
+        // All three buttons are there and each does its own thing.
+        let merge = screen.button_between_scene_and_next(0, "Merge scenes 1 and 2");
+        screen.click_at(merge, egui::Modifiers::NONE);
         assert_eq!(screen.scene_ends(), vec![40.0, 60.0, 80.0, 100.0]);
         screen.press_ctrl_z();
 
-        let later = screen.between_scene_and_next(0, card.width() - INTO_THE_BUTTON);
+        let later = screen.button_between_scene_and_next(0, MOVE_SPLIT_LATER_LABEL);
         screen.click_at(later, egui::Modifiers::NONE);
         assert_eq!(screen.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
-        let earlier = screen.between_scene_and_next(0, INTO_THE_BUTTON);
+        let earlier = screen.button_between_scene_and_next(0, MOVE_SPLIT_EARLIER_LABEL);
         screen.click_at(earlier, egui::Modifiers::NONE);
         assert_eq!(screen.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
     }
@@ -4253,10 +4299,8 @@ mod tests {
     #[test]
     fn the_join_button_between_two_cards_merges_them() {
         let mut screen = Screen::with_five_scenes();
-        let first = screen.view.scene_cards[0];
-        let second = screen.view.scene_cards[1];
-        let between = egui::pos2(first.center().x, (first.bottom() + second.top()) / 2.0);
-        screen.click_at(between, egui::Modifiers::NONE);
+        let merge = screen.button_between_scene_and_next(0, "Merge scenes 1 and 2");
+        screen.click_at(merge, egui::Modifiers::NONE);
 
         assert_eq!(screen.scene_ends(), vec![40.0, 60.0, 80.0, 100.0]);
     }
