@@ -13,6 +13,8 @@
 //!
 //! Supported: H.264 video with 8-bit 4:2:0 colour, not interlaced, in MP4,
 //! MOV or Matroska files. Anything else is refused before a file is written.
+//! Whoever asked for the split then cuts the video the normal way instead
+//! (`export`), for the reason `ExactCutError::calls_for_a_normal_cut` gives.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -27,11 +29,12 @@ use crate::exact_cut::{
     plan_exact_cuts, CopyStart, ExactCutPlan, FfmpegTime, FrameTable, PartKind, PlanError,
     ScenePart, ScenePlan, StoredFrame, EXACT_CUT_SETTING,
 };
+use crate::exact_fallback::WhyNotExact;
 use crate::exact_verify::{self, ExactCutProof, VerifyError};
 use crate::fates::ScenesToWrite;
 use crate::ffmpeg::{
-    FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit, QUICK_ANSWER_LIMIT,
-    STEADY_OUTPUT_LIMIT,
+    FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit, Turn, TurnOption,
+    QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT,
 };
 use crate::probe;
 use crate::scene_name::SceneNames;
@@ -42,6 +45,23 @@ use crate::tools;
 /// that can be set up to match what it is joined to, and both the ffmpeg the
 /// app downloads and most others carry it.
 const ENCODER: &str = "libx264";
+/// The bitstream filter that gives the encoded pictures the decode times of
+/// the copied ones they are joined to. ffmpeg has it from version 4.4 on.
+const TIME_FILTER: &str = "setts";
+
+/// The encoder an exact split looks for in the ffmpeg in use before it
+/// writes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Encoder(&'static str);
+
+impl Encoder {
+    pub const LIBX264: Self = Self(ENCODER);
+    /// Stands for the encoder on a machine whose ffmpeg was built without
+    /// it, so the tests can see what such a machine does.
+    #[cfg(test)]
+    pub const ONE_NO_FFMPEG_HAS: Self = Self("an_encoder_no_ffmpeg_has");
+}
+
 /// The quality the pictures around a cut are encoded at. At 16 a picture
 /// cannot be told from its source by eye, and the few seconds concerned make
 /// the size of the result no matter.
@@ -113,6 +133,12 @@ pub enum Unsupported {
     Clock {
         time_base: String,
     },
+    /// The file stores pictures that players leave out, as a video does
+    /// that was trimmed without encoding. The stored pictures can then not
+    /// be counted off against the pictures that are shown.
+    PicturesNeverShown {
+        count: usize,
+    },
 }
 
 impl fmt::Display for Unsupported {
@@ -148,6 +174,10 @@ impl fmt::Display for Unsupported {
                     "the video's clock ({time_base}) cannot be kept exactly"
                 )
             }
+            Self::PicturesNeverShown { count } => write!(
+                formatter,
+                "the file stores {count} pictures that are marked as never shown"
+            ),
         }
     }
 }
@@ -156,6 +186,7 @@ impl fmt::Display for Unsupported {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Step {
     LookForEncoder,
+    LookForTimeFilter,
     ReadFormat,
     ListPictures,
     EncodePart,
@@ -168,12 +199,25 @@ impl Step {
     fn in_words(self) -> &'static str {
         match self {
             Self::LookForEncoder => "could not list the encoders of ffmpeg",
+            Self::LookForTimeFilter => "could not list the bitstream filters of ffmpeg",
             Self::ReadFormat => "could not read how the video is encoded",
             Self::ListPictures => "could not list the pictures of the video",
             Self::EncodePart => "could not encode the pictures around a cut",
             Self::CopyPart => "could not copy a part of a scene",
             Self::CopySound => "could not copy the sound of a scene",
             Self::JoinScene => "could not join the parts of a scene",
+        }
+    }
+
+    /// Whether the step writes a part of a scene. The steps before those
+    /// only read the video and ask ffmpeg what it can do.
+    fn writes_a_scene(self) -> bool {
+        match self {
+            Self::EncodePart | Self::CopyPart | Self::CopySound | Self::JoinScene => true,
+            Self::LookForEncoder
+            | Self::LookForTimeFilter
+            | Self::ReadFormat
+            | Self::ListPictures => false,
         }
     }
 }
@@ -185,6 +229,9 @@ pub enum ExactCutError {
     Unsupported(Unsupported),
     /// The ffmpeg in use was built without the encoder.
     EncoderMissing,
+    /// The ffmpeg in use is too old to set the decode times of the pictures
+    /// it encodes.
+    TimeFilterMissing,
     Plan(PlanError),
     Ffmpeg {
         step: Step,
@@ -208,6 +255,7 @@ impl ExactCutError {
             Self::EncoderMissing => {
                 "Exact cuts need an encoder that this copy of ffmpeg does not have."
             }
+            Self::TimeFilterMissing => "This copy of ffmpeg is too old for exact cuts.",
             Self::NotProven(_) => {
                 "The scenes were cut on the exact pictures, but they did not pass the check and were thrown away."
             }
@@ -219,6 +267,62 @@ impl ExactCutError {
             "{what_happened} {ORIGINAL_UNTOUCHED} {}",
             normal_cut_offer()
         )
+    }
+
+    /// Why the video is to be cut the normal way instead, at the nearest
+    /// points where it can be cut. `None` when a normal cut would meet the
+    /// same trouble, so the failure itself is what the person has to hear.
+    ///
+    /// A failure calls for a normal cut when it says something about exact
+    /// cuts and this video: the video is of a kind they are not made for,
+    /// the ffmpeg in use cannot make them, or the try was made and did not
+    /// hold up. By then nothing of the try is left: its scenes never left
+    /// the unfinished folder, which is removed whenever a split fails.
+    ///
+    /// A full disk, an ffmpeg that does not start and a drive that stopped
+    /// answering say nothing about exact cuts. A second try on top of those
+    /// would only make the person wait for the same failure.
+    pub fn calls_for_a_normal_cut(&self) -> Option<WhyNotExact> {
+        match self {
+            Self::Unsupported(what) => Some(WhyNotExact::KindOfVideo(what.clone())),
+            Self::EncoderMissing => Some(WhyNotExact::EncoderMissing),
+            Self::TimeFilterMissing => Some(WhyNotExact::FfmpegTooOld),
+            Self::Plan(problem) => Some(WhyNotExact::Pictures(problem.clone())),
+            Self::NotProven(VerifyError::NotProven(_)) => Some(WhyNotExact::DidNotPassTheCheck {
+                details: self.to_string(),
+            }),
+            Self::NotProven(VerifyError::DoesNotDecode { source, .. })
+                if ran_and_found_fault(source) =>
+            {
+                Some(WhyNotExact::DidNotPassTheCheck {
+                    details: self.to_string(),
+                })
+            }
+            Self::Ffmpeg { step, source }
+                if step.writes_a_scene() && ran_and_found_fault(source) =>
+            {
+                Some(WhyNotExact::CouldNotBeWritten {
+                    details: self.to_string(),
+                })
+            }
+            Self::NotProven(
+                VerifyError::DoesNotDecode { .. } | VerifyError::SmallCopiesUnreadable { .. },
+            )
+            | Self::Ffmpeg { .. }
+            | Self::Disk { .. } => None,
+        }
+    }
+}
+
+/// Whether ffmpeg ran and found fault with what it was given, which says
+/// something about the video. That it could not be started, went silent or
+/// was lost says something about the machine.
+fn ran_and_found_fault(error: &FfmpegError) -> bool {
+    match error {
+        FfmpegError::Failed { .. } | FfmpegError::OutputNotUnderstood { .. } => true,
+        FfmpegError::CouldNotStart { .. }
+        | FfmpegError::TimedOut { .. }
+        | FfmpegError::LostContact { .. } => false,
     }
 }
 
@@ -238,6 +342,12 @@ impl fmt::Display for ExactCutError {
             Self::Unsupported(what) => write!(formatter, "{what}"),
             Self::EncoderMissing => {
                 write!(formatter, "this ffmpeg has no {ENCODER} encoder")
+            }
+            Self::TimeFilterMissing => {
+                write!(
+                    formatter,
+                    "this ffmpeg has no {TIME_FILTER} bitstream filter"
+                )
             }
             Self::Plan(problem) => write!(formatter, "{problem}"),
             Self::Ffmpeg { step, source } => write!(formatter, "{}: {source}", step.in_words()),
@@ -278,12 +388,11 @@ pub fn split_on_exact_frames(
     scenes: &ScenesToWrite,
     out_dir: &Path,
     names: impl Into<SceneNames>,
+    encoder: Encoder,
 ) -> Result<ExactSplit> {
     let cuts = scenes.cuts();
     // Everything that can be refused is refused before a file is written.
-    refuse_other_containers(input)?;
-    look_for_encoder()?;
-    let source = read_source_video(input)?;
+    let source = refuse_what_is_known_at_a_glance(input, encoder)?;
     let table = read_frame_table(input)?;
     let plan = plan_exact_cuts(&table, cuts).map_err(ExactCutError::Plan)?;
 
@@ -298,9 +407,12 @@ pub fn split_on_exact_frames(
         names,
         |unfinished| {
             write_scenes(input, &source, &plan, unfinished)?;
-            let proven =
-                exact_verify::verify_exact_split(input, &unfinished.files, &plan, cuts.as_slice())
-                    .map_err(ExactCutError::NotProven)?;
+            let written = exact_verify::WrittenScenes {
+                files: &unfinished.files,
+                scratch_folder: &unfinished.folder,
+            };
+            let proven = exact_verify::verify_exact_split(input, written, &plan, cuts.as_slice())
+                .map_err(ExactCutError::NotProven)?;
             proof = Some(proven);
             Ok(())
         },
@@ -311,6 +423,43 @@ pub fn split_on_exact_frames(
         scene_files: split::written_files(&outcomes),
         proof,
     })
+}
+
+/// The plan an exact split of `input` at `cuts` would follow, for tests that
+/// check scene files against it themselves.
+#[cfg(test)]
+pub fn plan_of(input: &Path, cuts: &crate::scenes::CutTimes) -> Result<ExactCutPlan> {
+    let table = read_frame_table(input)?;
+    Ok(plan_exact_cuts(&table, cuts).map_err(ExactCutError::Plan)?)
+}
+
+/// Whether an exact cut of `input` can be tried, as far as that shows
+/// without listing its pictures: `None`, or why it cannot. For telling the
+/// person before the split what the split will do.
+///
+/// Fails when the video or ffmpeg could not be asked. The split then finds
+/// the same trouble and reports it.
+pub fn why_no_exact_cut_at_a_glance(input: &Path) -> Result<Option<WhyNotExact>, ExactCutError> {
+    match refuse_what_is_known_at_a_glance(input, Encoder::LIBX264) {
+        Ok(_can_be_tried) => Ok(None),
+        Err(refusal) => match refusal.calls_for_a_normal_cut() {
+            Some(why) => Ok(Some(why)),
+            None => Err(refusal),
+        },
+    }
+}
+
+/// Refuses a video whose file name, ffmpeg or way of storing pictures rules
+/// out an exact cut. These take a moment to find out, where listing every
+/// picture takes as long as reading through the file.
+fn refuse_what_is_known_at_a_glance(
+    input: &Path,
+    encoder: Encoder,
+) -> Result<SourceVideo, ExactCutError> {
+    refuse_other_containers(input)?;
+    look_for_encoder(encoder)?;
+    look_for_time_filter()?;
+    read_source_video(input)
 }
 
 fn refuse_other_containers(input: &Path) -> Result<(), ExactCutError> {
@@ -329,7 +478,7 @@ fn refuse_other_containers(input: &Path) -> Result<(), ExactCutError> {
 
 /// Fails with [`ExactCutError::EncoderMissing`] when the ffmpeg in use
 /// cannot encode H.264 the way an exact cut needs.
-fn look_for_encoder() -> Result<(), ExactCutError> {
+fn look_for_encoder(encoder: Encoder) -> Result<(), ExactCutError> {
     let listing = tools::command(Program::Ffmpeg)
         .args(["-nostdin", "-v", "error", "-encoders"])
         .run_for_text(QUICK_ANSWER_LIMIT)
@@ -337,11 +486,36 @@ fn look_for_encoder() -> Result<(), ExactCutError> {
             step: Step::LookForEncoder,
             source,
         })?;
-    if lists_encoder(&listing, ENCODER) {
+    if lists_encoder(&listing, encoder.0) {
         Ok(())
     } else {
         Err(ExactCutError::EncoderMissing)
     }
+}
+
+/// Fails with [`ExactCutError::TimeFilterMissing`] when the ffmpeg in use is
+/// from before version 4.4, which brought the filter that sets the decode
+/// times of encoded pictures. Without this the first encoding would fail on
+/// an option it does not know, after the video was read through.
+fn look_for_time_filter() -> Result<(), ExactCutError> {
+    let listing = tools::command(Program::Ffmpeg)
+        .args(["-nostdin", "-v", "error", "-bsfs"])
+        .run_for_text(QUICK_ANSWER_LIMIT)
+        .map_err(|source| ExactCutError::Ffmpeg {
+            step: Step::LookForTimeFilter,
+            source,
+        })?;
+    if lists_bitstream_filter(&listing, TIME_FILTER) {
+        Ok(())
+    } else {
+        Err(ExactCutError::TimeFilterMissing)
+    }
+}
+
+/// Whether ffmpeg's list of bitstream filters names `filter`. The list has
+/// a heading and then one name to a line.
+fn lists_bitstream_filter(listing: &str, filter: &str) -> bool {
+    listing.lines().any(|line| line.trim() == filter)
 }
 
 /// Whether ffmpeg's list of encoders names `encoder`. A line of it reads
@@ -372,6 +546,10 @@ struct SourceVideo {
     /// The steps per second of the video stream's clock.
     ticks_per_second: u32,
     sound_streams: usize,
+    /// How far the pictures are to be turned for showing, when the file
+    /// says so. A phone held upright stores what it films lying on its side
+    /// and marks it to be turned.
+    turn: Option<Turn>,
 }
 
 fn read_source_video(input: &Path) -> Result<SourceVideo, ExactCutError> {
@@ -399,12 +577,19 @@ fn read_source_video(input: &Path) -> Result<SourceVideo, ExactCutError> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    source_video_from(&properties, sound_streams).map_err(ExactCutError::Unsupported)
+    let turn = exact_verify::read_shown_as(input)
+        .map_err(read_failed)?
+        .turn();
+    source_video_from(&properties, sound_streams, turn).map_err(ExactCutError::Unsupported)
 }
 
 /// Reads ffprobe's "name=value" lines about the video stream and decides
 /// whether an exact cut can match it.
-fn source_video_from(properties: &str, sound_streams: usize) -> Result<SourceVideo, Unsupported> {
+fn source_video_from(
+    properties: &str,
+    sound_streams: usize,
+    turn: Option<Turn>,
+) -> Result<SourceVideo, Unsupported> {
     let properties: BTreeMap<&str, &str> = properties
         .lines()
         .filter_map(|line| line.split_once('='))
@@ -475,6 +660,7 @@ fn source_video_from(properties: &str, sound_streams: usize) -> Result<SourceVid
         },
         ticks_per_second,
         sound_streams,
+        turn,
     })
 }
 
@@ -501,6 +687,7 @@ fn read_frame_table(input: &Path) -> Result<FrameTable, ExactCutError> {
     })?;
 
     let mut stored = Vec::new();
+    let mut never_shown = 0;
     tools::command(Program::Ffprobe)
         .args(["-v", "error"])
         .args(KEYFRAMES_AS_THE_CONTAINER_MARKS_THEM)
@@ -512,19 +699,50 @@ fn read_frame_table(input: &Path) -> Result<FrameTable, ExactCutError> {
             if line.trim().is_empty() {
                 return Ok(());
             }
-            let frame = parse_stored_frame(line, container_start)
+            let listed = parse_stored_frame(line, container_start)
                 .map_err(|problem| NotUnderstood(format!("packet line {line:?}, {problem}")))?;
-            stored.push(frame);
+            match listed.showing {
+                Showing::Shown => stored.push(listed.frame),
+                Showing::NeverShown => never_shown += 1,
+            }
             Ok(())
         })
         .map_err(list_failed)?;
+    // The plan counts pictures off against what a player shows. A stored
+    // picture that players leave out would put every count after it one off.
+    if never_shown > 0 {
+        return Err(ExactCutError::Unsupported(
+            Unsupported::PicturesNeverShown { count: never_shown },
+        ));
+    }
     FrameTable::from_stored_order(stored).map_err(ExactCutError::Plan)
 }
+
+/// Whether a stored picture is shown when the video plays.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Showing {
+    Shown,
+    /// The file marks the picture as one to decode and then leave out. A
+    /// video trimmed without encoding keeps the pictures before its new
+    /// start that way, since the ones after them are built on them.
+    NeverShown,
+}
+
+/// One line of ffprobe's list of stored pictures.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ListedFrame {
+    frame: StoredFrame,
+    showing: Showing,
+}
+
+/// The letter ffprobe puts among a packet's flags when players leave its
+/// picture out.
+const NEVER_SHOWN_FLAG: char = 'D';
 
 /// ffprobe prints these fields in the order pts, pts_time, dts, dts_time,
 /// flags, whatever order they were asked for in. Times are moved onto the
 /// clock `ffmpeg -ss` uses, which counts from the container's start.
-fn parse_stored_frame(line: &str, container_start: f64) -> Result<StoredFrame, &'static str> {
+fn parse_stored_frame(line: &str, container_start: f64) -> Result<ListedFrame, &'static str> {
     let fields: Vec<&str> = line.split(',').map(str::trim).collect();
     let [shown_ticks, shown_at, decoded_ticks, decoded_at, flags, ..] = fields[..] else {
         return Err("expected at least five fields");
@@ -536,11 +754,19 @@ fn parse_stored_frame(line: &str, container_start: f64) -> Result<StoredFrame, &
     let decoded_ticks: Option<i64> = decoded_ticks.parse().ok();
     let decoded_at: Option<f64> = decoded_at.parse().ok();
 
-    Ok(StoredFrame {
-        shown_at: shown_at - container_start,
-        decoded_at: decoded_at.map(|decoded_at| decoded_at - container_start),
-        reorder_ticks: decoded_ticks.map(|decoded_ticks| shown_ticks - decoded_ticks),
-        is_keyframe: flags.starts_with('K'),
+    let showing = if flags.contains(NEVER_SHOWN_FLAG) {
+        Showing::NeverShown
+    } else {
+        Showing::Shown
+    };
+    Ok(ListedFrame {
+        frame: StoredFrame {
+            shown_at: shown_at - container_start,
+            decoded_at: decoded_at.map(|decoded_at| decoded_at - container_start),
+            reorder_ticks: decoded_ticks.map(|decoded_ticks| shown_ticks - decoded_ticks),
+            is_keyframe: flags.starts_with('K'),
+        },
+        showing,
     })
 }
 
@@ -625,7 +851,8 @@ fn write_scene(
         join_arguments(
             input,
             scene,
-            source.sound_streams,
+            source,
+            tools::turn_option(),
             &parts_list_file,
             sound_file.as_deref(),
             scene_file,
@@ -803,7 +1030,8 @@ fn parts_list_entry(part_name: &str, seconds: f64) -> String {
 fn join_arguments(
     input: &Path,
     scene: &ScenePlan,
-    sound_streams: usize,
+    source: &SourceVideo,
+    turn_option: TurnOption,
     parts_list_file: &Path,
     sound_file: Option<&Path>,
     scene_file: &Path,
@@ -815,6 +1043,11 @@ fn join_arguments(
     let is_first_scene = scene.sound_from.is_none();
     if is_first_scene {
         arguments = arguments.option("-itsoffset", FfmpegTime::from_seconds(scene.starts_at));
+    }
+    // Where the ffmpeg in use would lose the turn of the pictures on the
+    // way through the parts, the parts are read as turned like the original.
+    for argument in turn_option.arguments(source.turn.as_ref()) {
+        arguments = arguments.with(&[&argument]);
     }
     arguments = arguments
         .with(&["-f", "concat", "-safe", "0"])
@@ -838,7 +1071,7 @@ fn join_arguments(
         .option("-map_metadata", original)
         .option("-map_metadata:s:v:0", format!("{original}:s:v:0"))
         .with(&["-map_chapters", "-1"]);
-    for stream in 0..sound_streams {
+    for stream in 0..source.sound_streams {
         arguments = arguments.option(
             &format!("-map_metadata:s:a:{stream}"),
             format!("{original}:s:a:{stream}"),
@@ -875,7 +1108,7 @@ mod tests {
     }
 
     fn unsupported(name: &str, value: &str) -> Unsupported {
-        source_video_from(&properties_with(name, value), 1).unwrap_err()
+        source_video_from(&properties_with(name, value), 1, None).unwrap_err()
     }
 
     fn joined(arguments: &[OsString]) -> String {
@@ -907,7 +1140,7 @@ mod tests {
     }
 
     fn source() -> SourceVideo {
-        source_video_from(H264_PROPERTIES, 2).unwrap()
+        source_video_from(H264_PROPERTIES, 2, None).unwrap()
     }
 
     #[test]
@@ -928,11 +1161,12 @@ mod tests {
         );
         assert_eq!(source.ticks_per_second, 12800);
         assert_eq!(source.sound_streams, 2);
+        assert_eq!(source.turn, None);
     }
 
     #[test]
     fn a_level_the_original_does_not_state_is_left_to_the_encoder() {
-        let source = source_video_from(&properties_with("level", "-99"), 0).unwrap();
+        let source = source_video_from(&properties_with("level", "-99"), 0, None).unwrap();
         assert_eq!(source.encoder.level, None);
     }
 
@@ -943,7 +1177,7 @@ mod tests {
             ("Main", "main"),
             ("High", "high"),
         ] {
-            let source = source_video_from(&properties_with("profile", stated), 0).unwrap();
+            let source = source_video_from(&properties_with("profile", stated), 0, None).unwrap();
             assert_eq!(source.encoder.profile, expected);
         }
     }
@@ -1011,21 +1245,51 @@ mod tests {
 
     #[test]
     fn a_stored_picture_is_read_with_both_its_times() {
-        let frame = parse_stored_frame("51200,4.000000,50176,3.920000,K_", 0.0).unwrap();
+        let listed = parse_stored_frame("51200,4.000000,50176,3.920000,K_", 0.0).unwrap();
         assert_eq!(
-            frame,
-            StoredFrame {
-                shown_at: 4.0,
-                decoded_at: Some(3.92),
-                reorder_ticks: Some(1024),
-                is_keyframe: true,
+            listed,
+            ListedFrame {
+                frame: StoredFrame {
+                    shown_at: 4.0,
+                    decoded_at: Some(3.92),
+                    reorder_ticks: Some(1024),
+                    is_keyframe: true,
+                },
+                showing: Showing::Shown,
             }
         );
     }
 
     #[test]
+    fn a_picture_that_players_leave_out_is_read_as_never_shown() {
+        // As ffprobe lists the pictures before the new start of a video
+        // that was trimmed without encoding, in old and new versions.
+        for line in [
+            "-1024,-0.080000,-2048,-0.160000,_D",
+            "-1024,-0.080000,-2048,-0.160000,KD_",
+        ] {
+            let listed = parse_stored_frame(line, 0.0).unwrap();
+            assert_eq!(listed.showing, Showing::NeverShown, "{line}");
+        }
+        let shown = parse_stored_frame("0,0.000000,-1024,-0.080000,K__", 0.0).unwrap();
+        assert_eq!(shown.showing, Showing::Shown);
+    }
+
+    #[test]
+    fn the_time_filter_is_found_by_its_whole_name() {
+        let listing = "Bitstream filters:\naac_adtstoasc\nsetts\ntrace_headers\n";
+        assert!(lists_bitstream_filter(listing, "setts"));
+        assert!(!lists_bitstream_filter(
+            "Bitstream filters:\nsetts_of_another_kind\n",
+            "setts"
+        ));
+    }
+
+    #[test]
     fn a_picture_without_a_decode_time_is_still_read() {
-        let frame = parse_stored_frame("120,1.620000,N/A,N/A,___", 1.5).unwrap();
+        let frame = parse_stored_frame("120,1.620000,N/A,N/A,___", 1.5)
+            .unwrap()
+            .frame;
         assert!((frame.shown_at - 0.12).abs() < 1e-9);
         assert_eq!(frame.decoded_at, None);
         assert_eq!(frame.reorder_ticks, None);
@@ -1143,7 +1407,8 @@ mod tests {
         let second_scene = joined(&join_arguments(
             Path::new("film.mp4"),
             &plan.scenes()[1],
-            2,
+            &source(),
+            TurnOption::LeftToTheParts,
             Path::new("parts.txt"),
             Some(Path::new("sound.nut")),
             Path::new("002.mp4"),
@@ -1160,10 +1425,15 @@ mod tests {
     #[test]
     fn a_video_without_sound_is_joined_from_its_parts_alone() {
         let plan = plan();
+        let without_sound = SourceVideo {
+            sound_streams: 0,
+            ..source()
+        };
         let first_scene = joined(&join_arguments(
             Path::new("film.mp4"),
             &plan.scenes()[0],
-            0,
+            &without_sound,
+            TurnOption::LeftToTheParts,
             Path::new("parts.txt"),
             None,
             Path::new("001.mp4"),
@@ -1174,6 +1444,42 @@ mod tests {
              -map 0:v:0 -c copy -map_metadata 1 -map_metadata:s:v:0 1:s:v:0 \
              -map_chapters -1 001.mp4"
         );
+    }
+
+    #[test]
+    fn where_ffmpeg_would_lose_the_turn_it_is_named_for_the_parts_at_the_join() {
+        let plan = plan();
+        let turned = SourceVideo {
+            sound_streams: 0,
+            turn: Turn::stated_as("-90"),
+            ..source()
+        };
+        let join_with = |turn_option, source: &SourceVideo| {
+            joined(&join_arguments(
+                Path::new("film.mp4"),
+                &plan.scenes()[1],
+                source,
+                turn_option,
+                Path::new("parts.txt"),
+                None,
+                Path::new("002.mp4"),
+            ))
+        };
+
+        assert!(
+            join_with(TurnOption::NamedAtTheJoin, &turned)
+                .starts_with("-copyts -display_rotation -90 -f concat -safe 0 -i parts.txt "),
+            "{}",
+            join_with(TurnOption::NamedAtTheJoin, &turned)
+        );
+        // An ffmpeg that keeps the turn is not told, and neither is any
+        // ffmpeg about a video that states none.
+        assert!(!join_with(TurnOption::LeftToTheParts, &turned).contains("-display_rotation"));
+        let upright = SourceVideo {
+            turn: None,
+            ..turned
+        };
+        assert!(!join_with(TurnOption::NamedAtTheJoin, &upright).contains("-display_rotation"));
     }
 
     #[test]
@@ -1204,6 +1510,123 @@ mod tests {
                 words.contains("turn off \"Cut on the exact picture (slower)\" in Settings"),
                 "{words}"
             );
+        }
+    }
+
+    fn ffmpeg_found_fault() -> FfmpegError {
+        FfmpegError::OutputNotUnderstood {
+            program: Program::Ffmpeg,
+            detail: "it reported problems while it ran".to_owned(),
+        }
+    }
+
+    fn ffmpeg_went_silent() -> FfmpegError {
+        FfmpegError::TimedOut {
+            program: Program::Ffmpeg,
+            limit: EXACT_CUT_STALL_LIMIT,
+        }
+    }
+
+    #[test]
+    fn what_is_known_before_writing_calls_for_a_normal_cut_and_says_why() {
+        let not_h264 = Unsupported::Codec {
+            name: "hevc".to_owned(),
+        };
+        assert_eq!(
+            ExactCutError::Unsupported(not_h264.clone()).calls_for_a_normal_cut(),
+            Some(WhyNotExact::KindOfVideo(not_h264))
+        );
+        assert_eq!(
+            ExactCutError::EncoderMissing.calls_for_a_normal_cut(),
+            Some(WhyNotExact::EncoderMissing)
+        );
+        assert_eq!(
+            ExactCutError::TimeFilterMissing.calls_for_a_normal_cut(),
+            Some(WhyNotExact::FfmpegTooOld)
+        );
+        assert_eq!(
+            ExactCutError::Plan(PlanError::NoPictures).calls_for_a_normal_cut(),
+            Some(WhyNotExact::Pictures(PlanError::NoPictures))
+        );
+    }
+
+    #[test]
+    fn an_exact_cut_that_was_not_proven_calls_for_a_normal_cut_as_a_failed_try() {
+        let not_proven = ExactCutError::NotProven(VerifyError::NotProven(
+            exact_verify::NotProven::SceneCount {
+                planned: 2,
+                written: 1,
+            },
+        ));
+        assert_eq!(
+            not_proven.calls_for_a_normal_cut().unwrap(),
+            WhyNotExact::DidNotPassTheCheck {
+                details: "the exact cut could not be proven good: 2 scenes were planned but 1 \
+                          were written"
+                    .to_owned()
+            }
+        );
+
+        let scene_does_not_decode = ExactCutError::NotProven(VerifyError::DoesNotDecode {
+            file: PathBuf::from("002.mp4"),
+            source: ffmpeg_found_fault(),
+        });
+        assert!(matches!(
+            scene_does_not_decode.calls_for_a_normal_cut(),
+            Some(WhyNotExact::DidNotPassTheCheck { .. })
+        ));
+    }
+
+    #[test]
+    fn a_part_ffmpeg_refused_to_write_calls_for_a_normal_cut_as_a_failed_try() {
+        for step in [
+            Step::EncodePart,
+            Step::CopyPart,
+            Step::CopySound,
+            Step::JoinScene,
+        ] {
+            let failure = ExactCutError::Ffmpeg {
+                step,
+                source: ffmpeg_found_fault(),
+            };
+            assert!(
+                matches!(
+                    failure.calls_for_a_normal_cut(),
+                    Some(WhyNotExact::CouldNotBeWritten { .. })
+                ),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trouble_a_normal_cut_would_meet_too_stays_a_failure() {
+        let failures = [
+            // The drive stopped answering while a part was written.
+            ExactCutError::Ffmpeg {
+                step: Step::EncodePart,
+                source: ffmpeg_went_silent(),
+            },
+            // The video could not be read at all.
+            ExactCutError::Ffmpeg {
+                step: Step::ReadFormat,
+                source: ffmpeg_found_fault(),
+            },
+            ExactCutError::Ffmpeg {
+                step: Step::ListPictures,
+                source: ffmpeg_found_fault(),
+            },
+            ExactCutError::Disk {
+                doing: "create parts".to_owned(),
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+            ExactCutError::NotProven(VerifyError::DoesNotDecode {
+                file: PathBuf::from("film.mp4"),
+                source: ffmpeg_went_silent(),
+            }),
+        ];
+        for failure in failures {
+            assert_eq!(failure.calls_for_a_normal_cut(), None, "{failure}");
         }
     }
 

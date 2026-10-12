@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::cache::{CacheUse, SourcedDetection};
 use crate::detect::{ScanDepth, ScanKind, ScanProgress};
+use crate::exact_fallback::{ExactCutLook, NoWayToCut};
 use crate::exact_split::ExactCutError;
 use crate::export::ExportReport;
 use crate::fates::ScenesToWrite;
@@ -80,9 +81,17 @@ impl Failure {
     }
 
     /// Why a split failed. A failed exact cut says what it says about
-    /// itself, which includes the way back to a cut without encoding.
+    /// itself, which includes the way back to a cut without encoding. So
+    /// does a video that could be cut neither on the exact pictures nor at
+    /// the nearest points where it can be cut.
     pub fn from_split_error(error: &anyhow::Error) -> Self {
         let details = format!("{error:#}");
+        if let Some(no_way) = error.downcast_ref::<NoWayToCut>() {
+            return Self {
+                plain_words: no_way.in_plain_words(),
+                details: Some(details),
+            };
+        }
         match error.downcast_ref::<ExactCutError>() {
             Some(exact_cut) => Self {
                 plain_words: exact_cut.in_plain_words(),
@@ -433,6 +442,20 @@ impl Queue {
         match &mut self.job_mut(id).ok()?.status {
             JobStatus::Reviewing(session) => Some(session),
             _ => None,
+        }
+    }
+
+    /// Notes what a look at the video's file said about cutting it on
+    /// exact pictures. The look runs in the background, and the video may
+    /// have left its review or the queue by the time it is back. A video
+    /// that has no review any more has nobody to tell, which is fine.
+    pub fn note_exact_cut_look(&mut self, id: JobId, look: ExactCutLook) {
+        let review = self
+            .job_mut(id)
+            .ok()
+            .and_then(|job| job.status.kept_review_mut());
+        if let Some(review) = review {
+            review.note_exact_cut_look(look);
         }
     }
 
@@ -813,7 +836,7 @@ mod tests {
     use super::*;
     use crate::cache::DetectionSource;
     use crate::detect::{Detection, ScanStage};
-    use crate::export::{OriginalOutcome, Verification};
+    use crate::export::{CutOutcome, OriginalOutcome, Verification};
     use crate::ffmpeg::{Program, TimeLimit};
     use crate::hardcut::{HardCutCandidate, HardCutSettings};
     use crate::plan::SceneIndex;
@@ -853,6 +876,7 @@ mod tests {
             scene_files: Vec::new(),
             out_dir: PathBuf::from("scenes"),
             dropped_scenes: 0,
+            cut: CutOutcome::AsAskedFor,
             verification: Verification::Passed,
             original: OriginalOutcome::Kept,
         }
@@ -1756,6 +1780,43 @@ mod tests {
             failure.details.as_deref(),
             Some("this ffmpeg has no libx264 encoder")
         );
+    }
+
+    #[test]
+    fn a_video_that_could_be_cut_neither_way_says_what_to_do_about_its_splits() {
+        let no_way = NoWayToCut {
+            why_not_exact: crate::exact_fallback::WhyNotExact::EncoderMissing,
+            obstacle: crate::exact_fallback::CannotMoveSplits::SplitsMeet {
+                first: 3.6,
+                second: 4.4,
+                cut_point: 4.0,
+            },
+        };
+        let failure = Failure::from_split_error(&anyhow::Error::new(no_way.clone()));
+
+        assert_eq!(failure.plain_words, no_way.in_plain_words());
+        assert!(failure
+            .plain_words
+            .contains("Nothing was written, and the original was not changed."));
+        assert_eq!(failure.details, Some(no_way.to_string()));
+    }
+
+    #[test]
+    fn what_a_look_at_the_file_said_reaches_the_review_wherever_it_is_kept() {
+        let (mut queue, ids) = queue_with(2);
+        let id = ids[0];
+        bring_to_review(&mut queue, id);
+        let cannot = ExactCutLook::CannotBeCut(crate::exact_fallback::WhyNotExact::EncoderMissing);
+
+        // The look comes back after the video was marked ready.
+        queue.mark_ready(id).unwrap();
+        queue.note_exact_cut_look(id, cannot.clone());
+        let review = queue.job(id).unwrap().status().kept_review().unwrap();
+        assert_eq!(review.exact_cut_look(), &cannot);
+
+        // A video that is still waiting has no review to tell.
+        queue.note_exact_cut_look(ids[1], cannot);
+        assert_eq!(stage(&queue, ids[1]), Stage::Waiting);
     }
 
     #[test]

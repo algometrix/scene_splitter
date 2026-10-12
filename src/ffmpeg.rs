@@ -137,6 +137,65 @@ impl PictureTimesOption {
     }
 }
 
+/// How far the pictures of a video are to be turned for showing, in degrees,
+/// written as ffprobe states it: "90", "-90", "-180".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn(String);
+
+impl Turn {
+    /// `None` for anything that is not a number of degrees.
+    pub fn stated_as(degrees: &str) -> Option<Self> {
+        let degrees = degrees.trim();
+        degrees
+            .parse::<f64>()
+            .ok()
+            .filter(|degrees| degrees.is_finite())
+            .map(|_degrees| Self(degrees.to_owned()))
+    }
+}
+
+/// Whether the turn of a video has to be named again where ffmpeg joins the
+/// parts of a scene.
+///
+/// The mark that says how far to turn the pictures comes to a scene from
+/// its parts. ffmpeg 8 drops it from a part whose pictures it encodes again,
+/// so a scene that begins with such a part came out lying on its side. The
+/// versions before and after keep it. Asked to, every version from 7 on
+/// puts the same mark on the joined scene, which 7 and 9 would have had
+/// anyway.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TurnOption {
+    /// The joined scene takes the turn from its parts.
+    LeftToTheParts,
+    /// The turn is named for the parts as they are read to be joined.
+    NamedAtTheJoin,
+}
+
+/// The one version known to drop the mark from pictures it encodes again.
+const VERSION_THAT_DROPS_THE_TURN: u32 = 8;
+
+impl TurnOption {
+    /// Chosen from what `ffmpeg -version` prints first. A build without a
+    /// version number is a development build of a later version.
+    pub fn for_version(banner: &str) -> Self {
+        match major_version(banner) {
+            Some(VERSION_THAT_DROPS_THE_TURN) => Self::NamedAtTheJoin,
+            Some(_) | None => Self::LeftToTheParts,
+        }
+    }
+
+    /// The options that name `turn` for the input that follows them. None
+    /// for a video that states no turn, or where the parts carry it.
+    pub fn arguments(self, turn: Option<&Turn>) -> Vec<String> {
+        match (self, turn) {
+            (Self::NamedAtTheJoin, Some(Turn(degrees))) => {
+                vec!["-display_rotation".to_owned(), degrees.clone()]
+            }
+            (Self::NamedAtTheJoin, None) | (Self::LeftToTheParts, _) => Vec::new(),
+        }
+    }
+}
+
 fn major_version(banner: &str) -> Option<u32> {
     let version = banner.strip_prefix(VERSION_BANNER_START)?;
     // Some builds write the version as a git tag, "n7.1".
@@ -1047,6 +1106,37 @@ mod tests {
         assert_eq!(option("something else"), new);
         assert_eq!(old.arguments()[..2], ["-vsync", "passthrough"]);
         assert_eq!(new.arguments()[..2], ["-fps_mode", "passthrough"]);
+    }
+
+    #[test]
+    fn only_the_version_that_drops_the_turn_has_it_named_at_the_join() {
+        let option = TurnOption::for_version;
+        let named = TurnOption::NamedAtTheJoin;
+        let left = TurnOption::LeftToTheParts;
+        assert_eq!(option("ffmpeg version 4.4.1-full_build Copyright"), left);
+        assert_eq!(option("ffmpeg version 6.1.1-3ubuntu5 Copyright"), left);
+        assert_eq!(option("ffmpeg version 7.1.5-0+deb13u1 Copyright"), left);
+        assert_eq!(option("ffmpeg version 8.0 Copyright"), named);
+        assert_eq!(option("ffmpeg version n8.1.3-18-g46d899d7a0"), named);
+        assert_eq!(option("ffmpeg version n9.0.2-27-g7e93014c5b"), left);
+        assert_eq!(option("ffmpeg version N-118193-g5f38c82536"), left);
+
+        let quarter = Turn::stated_as("-90").unwrap();
+        assert_eq!(
+            named.arguments(Some(&quarter)),
+            vec!["-display_rotation", "-90"]
+        );
+        assert!(named.arguments(None).is_empty());
+        assert!(left.arguments(Some(&quarter)).is_empty());
+    }
+
+    #[test]
+    fn a_turn_is_a_number_of_degrees_kept_as_it_was_stated() {
+        assert_eq!(Turn::stated_as(" -180 "), Some(Turn("-180".to_owned())));
+        assert_eq!(Turn::stated_as("90"), Some(Turn("90".to_owned())));
+        assert_eq!(Turn::stated_as("nan"), None);
+        assert_eq!(Turn::stated_as("N/A"), None);
+        assert_eq!(Turn::stated_as(""), None);
     }
 
     #[test]

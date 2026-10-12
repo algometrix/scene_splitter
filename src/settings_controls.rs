@@ -258,7 +258,9 @@ pub const EXACT_CUT_LABEL: &str = EXACT_CUT_SETTING;
 const EXACT_CUT_EXPLANATION: &str =
     "Normally a video can only be cut at certain points. With this on, a split \
      is made on the very picture you choose, and a few seconds around each cut are \
-     encoded again. That takes longer, and the original is always kept.";
+     encoded again. That takes longer, and the original is always kept. A video \
+     that cannot be cut that way is cut at the nearest points instead, and the \
+     result says so.";
 
 pub fn show_cut_precision_checkbox(
     ui: &mut egui::Ui,
@@ -438,6 +440,7 @@ mod tests {
     fn the_exact_cut_texts_say_what_is_encoded_and_that_the_original_stays() {
         assert!(EXACT_CUT_EXPLANATION.contains("encoded"));
         assert!(EXACT_CUT_EXPLANATION.contains("the original is always kept"));
+        assert!(EXACT_CUT_EXPLANATION.contains("cut at the nearest points instead"));
     }
 
     #[test]

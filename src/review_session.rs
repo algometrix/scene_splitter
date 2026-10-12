@@ -14,6 +14,7 @@ use crate::cache::{DetectionSource, SourcedDetection};
 use crate::chapters::ChapterSplits;
 use crate::detect::ScanKind;
 use crate::exact_cut::CutPrecision;
+use crate::exact_fallback::ExactCutLook;
 use crate::fates::{NothingToWrite, SceneFate, ScenesToWrite};
 use crate::focus::{self, PictureStep, ReviewFocus, SceneStep};
 use crate::folder_settings::DetectionSettings;
@@ -335,6 +336,9 @@ pub struct ReviewSession {
     /// Where a split the person adds lands. It follows the setting, which
     /// the app passes on, since settings belong to no one review.
     new_split_precision: CutPrecision,
+    /// Whether this video can be cut on exact pictures, as far as a look at
+    /// its file says. The app looks, since the session reads no files.
+    exact_cut_look: ExactCutLook,
 }
 
 impl ReviewSession {
@@ -404,7 +408,27 @@ impl ReviewSession {
             replacing_agreed_for: None,
             rescan_awaiting_consent: None,
             new_split_precision: CutPrecision::NearestKeyframe,
+            exact_cut_look: ExactCutLook::NotLooked,
             chapter_splits,
+        }
+    }
+
+    pub fn exact_cut_look(&self) -> &ExactCutLook {
+        &self.exact_cut_look
+    }
+
+    /// The app says how far its look at the video's file has come.
+    pub fn note_exact_cut_look(&mut self, look: ExactCutLook) {
+        self.exact_cut_look = look;
+    }
+
+    /// What to tell the person before a split that cuts with `precision`:
+    /// that this video will not be cut on the exact pictures, and why. Only
+    /// while exact cuts are asked for and a look at the file found a reason.
+    pub fn exact_cut_notice_for(&self, precision: CutPrecision) -> Option<String> {
+        match precision {
+            CutPrecision::NearestKeyframe => None,
+            CutPrecision::ExactFrame => self.exact_cut_look.notice_before_the_split(),
         }
     }
 
@@ -1691,6 +1715,32 @@ mod tests {
 
         assert_eq!(session.0.split_time_near(47.36), Some(50.0));
         assert_eq!(session.0.split_near(47.36), SplitFeedback::Added(50.0));
+    }
+
+    #[test]
+    fn a_video_that_cannot_be_cut_exactly_says_so_before_the_split_while_exact_cuts_are_on() {
+        let mut session = test_sessions::five_scenes();
+        assert_eq!(session.exact_cut_look(), &ExactCutLook::NotLooked);
+        assert_eq!(session.exact_cut_notice_for(CutPrecision::ExactFrame), None);
+
+        let encoder_missing = crate::exact_fallback::WhyNotExact::EncoderMissing;
+        session.note_exact_cut_look(ExactCutLook::CannotBeCut(encoder_missing.clone()));
+        assert_eq!(
+            session.exact_cut_notice_for(CutPrecision::ExactFrame),
+            Some(encoder_missing.before_the_split_in_plain_words())
+        );
+        // With exact cuts off nobody asked for one, so there is nothing to say.
+        assert_eq!(
+            session.exact_cut_notice_for(CutPrecision::NearestKeyframe),
+            None
+        );
+    }
+
+    #[test]
+    fn a_video_that_can_be_cut_exactly_has_no_notice() {
+        let mut session = test_sessions::five_scenes();
+        session.note_exact_cut_look(ExactCutLook::CanBeTried);
+        assert_eq!(session.exact_cut_notice_for(CutPrecision::ExactFrame), None);
     }
 
     /// Five scenes with one split added on an exact picture, at 47.36 s,
