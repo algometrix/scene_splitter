@@ -193,7 +193,7 @@ mod tests {
             decoded_frames: 40,
             decoded_windows: 1,
             hard_cut_candidates,
-            chapters: None,
+            chapters: crate::detect::ChapterMarks::NeverRead,
         }
     }
 
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn a_video_with_chapters_reports_how_many_marks_it_has() {
         let with_chapters = Detection {
-            chapters: Some(vec![
+            chapters: crate::detect::ChapterMarks::Read(vec![
                 crate::chapters::Chapter {
                     start: 0.0,
                     title: None,

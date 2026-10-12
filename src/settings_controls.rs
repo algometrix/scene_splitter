@@ -5,7 +5,7 @@
 use eframe::egui;
 
 use crate::detect::{ScanMode, ScanSettings};
-use crate::exact_cut::CutPrecision;
+use crate::exact_cut::{CutPrecision, EXACT_CUT_SETTING};
 use crate::export::OriginalPolicy;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::scene_name::{PatternError, Placeholder, SceneNamePattern};
@@ -27,7 +27,7 @@ const THEME_BOX_ID: &str = "settings_theme";
 const SCENE_NAME_LABEL: &str = "Name scene files";
 const SCENE_NAME_HINT_INTRODUCTION: &str =
     "What each scene file is called. The ending of the video's name, such as .mp4, is added. \
-     These stand for:";
+     You can use:";
 const SCENE_NAME_REFUSED_NOTE: &str = "Until that is fixed, scene files are still named like";
 
 /// The box a scene name pattern is typed into. What is typed is often not a
@@ -254,9 +254,9 @@ pub fn show_scene_location_checkbox(
 
 /// The setting for cutting on the exact picture, as the window names it.
 /// The message of a failed exact cut names it the same way.
-pub const EXACT_CUT_LABEL: &str = "Cut on the exact picture (slower)";
+pub const EXACT_CUT_LABEL: &str = EXACT_CUT_SETTING;
 const EXACT_CUT_EXPLANATION: &str =
-    "A video can only be cut at certain points without encoding. With this on, a split \
+    "Normally a video can only be cut at certain points. With this on, a split \
      is made on the very picture you choose, and a few seconds around each cut are \
      encoded again. That takes longer, and the original is always kept.";
 

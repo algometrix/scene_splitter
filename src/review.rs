@@ -26,7 +26,9 @@ use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::{
     CutIndex, NudgeDirection, NudgeStep, SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
 };
-use crate::review_session::{counted, ExportObstacle, ReviewRequest, ReviewSession, SceneListNote};
+use crate::review_session::{
+    counted, EarlierSceneFiles, ExportObstacle, ReviewRequest, ReviewSession, SceneListNote,
+};
 use crate::scan::UndecodedFrames;
 use crate::scene_list::SceneListFormat;
 use crate::selection::ClickKind;
@@ -81,11 +83,11 @@ const DRAG_HINT_OFFSET: egui::Vec2 = egui::vec2(16.0, 16.0);
 /// user reads three lines and skips eight.
 const TIPS: [(&str, &str); 3] = [
     (
-        "Join",
-        "Drag one scene onto another, or press Join between two scenes.",
+        "Merge",
+        "Drag one scene onto another, or press Merge between two scenes.",
     ),
     (
-        "Cut",
+        "Split",
         "Click a picture to play from there, then press S where the scene should end.",
     ),
     (
@@ -94,8 +96,10 @@ const TIPS: [(&str, &str); 3] = [
     ),
 ];
 /// Every key of the review screen, and what it does. "The scene" is the
-/// one with the dark frame, which `KEYS_INTRODUCTION` says.
-const KEYS: [(&str, &str); 15] = [
+/// one with the thick frame, which `KEYS_INTRODUCTION` says. The frame is
+/// named by its shape: it is dark in the light palette and light in the
+/// dark one.
+const KEYS: [(&str, &str); 16] = [
     (
         "Up, Down",
         "Go to the scene above or below. Home and End go to the first and the last.",
@@ -103,12 +107,12 @@ const KEYS: [(&str, &str); 15] = [
     ("Shift+Up or Down", "Select more scenes, or fewer."),
     ("Enter, Space", "Play the scene."),
     ("Left, Right", "Choose a picture of the scene to play from."),
-    ("J", "Join the scene with the one below it."),
+    ("J", "Merge the scene with the one below it."),
     ("M", "Merge the selected scenes."),
-    ("U", "Take a merged scene apart again."),
+    ("U", "Take a merged scene apart."),
     (
         "X",
-        "Drop the scene, so no file is written for it. Again to keep it.",
+        "Drop the scene, so no file is written for it. Press X again to keep it.",
     ),
     (
         "Alt+Left or Right",
@@ -125,11 +129,19 @@ const KEYS: [(&str, &str); 15] = [
         "Tab",
         "Go through the buttons and boxes. Space presses the one that is marked.",
     ),
+    ("Ctrl+O", "Add videos."),
     ("F1", "Show or hide this list."),
 ];
-const KEYS_INTRODUCTION: &str = "The keys work on the scene with the dark frame. \
+const KEYS_INTRODUCTION: &str = "The keys work on the scene with the thick frame around it. \
      M, U and X work on the selected scenes when any are selected. \
      While the player is open, Space pauses it and Left and Right skip in it.";
+/// The list names the keys as most keyboards do. `input.modifiers.command`,
+/// which the screens read, is Cmd on a Mac.
+const KEYS_ON_THIS_SYSTEM: Option<&str> = if cfg!(target_os = "macos") {
+    Some("Use Cmd where this list says Ctrl.")
+} else {
+    None
+};
 const KEYS_HEADING: &str = "Keys";
 const SHOW_KEYS_LABEL: &str = "Show keys";
 const HIDE_KEYS_LABEL: &str = "Hide keys";
@@ -180,11 +192,10 @@ const RESCAN_WARNING: &str = "Scanning again removes the merges and splits you m
 const SPLIT_LATER_LABEL: &str = "Split later";
 const SPLIT_LATER_EXPLANATION: &str =
     "Keeps these scenes and shows the next video (Ctrl+Shift+Enter). Nothing is written yet. \
-     When you have reviewed the others, split them all with one button in the list on the left.";
+     When you have reviewed the others, press \"Split ready videos\" above the list on the left.";
 const LEAVE_OUT_CHAPTERS_LABEL: &str = "Leave out the chapter marks";
 const LEAVE_OUT_CHAPTERS_EXPLANATION: &str =
-    "Joins the scenes again wherever only a chapter mark of the file separates them. \
-     Undo brings them back.";
+    "Merges the scenes that only a chapter mark keeps apart. Undo brings the splits back.";
 const BLACK_SCREEN_SETTINGS_LABEL: &str = "Black screen settings";
 const HIDE_BLACK_SCREEN_SETTINGS_LABEL: &str = "Hide the black screen settings";
 const BLACK_SCREEN_SETTINGS_EXPLANATION: &str =
@@ -195,7 +206,22 @@ const BLACK_SCREEN_SETTINGS_APPLY_NOTE: &str =
 const GENERAL_SETTINGS_IN_USE: &str = "This video is scanned with the general settings.";
 const FOLDER_SETTINGS_IN_USE: &str =
     "This video is scanned with the settings remembered for its folder.";
-const REMEMBER_FOR_FOLDER_LABEL: &str = "Remember for this folder";
+const REMEMBER_FOR_FOLDER_LABEL: &str = "Remember these settings for this folder";
+/// How the folder is named when the video's path does not say which it is.
+const FOLDER_NOT_KNOWN: &str = "this video's folder";
+const SCAN_AGAIN_EXPLANATION: &str =
+    "Looks for black screens again, with the scan settings as they are now.";
+const HIDE_MISSED_SCENES_LABEL: &str = "Hide the settings for missed scenes";
+const MERGE_SELECTED_LABEL: &str = "Merge selected";
+const MERGE_SELECTED_HINT: &str = "Merges the selected scenes into one (M).";
+const TAKE_APART_LABEL: &str = "Take merged scenes apart";
+const TAKE_APART_HINT: &str = "Takes the selected merged scenes apart (U).";
+const TAKE_APART_HERE_HINT: &str = "Takes the merged scene apart at this point.";
+const REPLACE_EARLIER_FILES_LABEL: &str = "Replace them";
+/// How many earlier scene files, or splits, a warning names before it says
+/// how many more there are. The hover names the rest.
+const MOST_NAMED_IN_A_WARNING: usize = 3;
+const MOST_NAMED_IN_A_HOVER: usize = 30;
 const USE_GENERAL_SETTINGS_LABEL: &str = "Use the general settings for this folder";
 /// A chapter title longer than this is cut short on the scene card. The
 /// whole title is one hover away.
@@ -205,11 +231,11 @@ const CHAPTER_TITLE_FONT_SIZE: f32 = 14.0;
 
 const DROP_SCENE_LABEL: &str = "Drop this scene";
 const DROP_SCENE_HINT: &str = "Leaves this scene out of the split, so no file is written for it. \
-     X does the same for the selected scenes, or for the scene with the dark frame.";
+     X does the same for the selected scenes, or for the scene with the thick frame.";
 const KEEP_SCENE_LABEL: &str = "Keep this scene";
 const KEEP_SCENE_HINT: &str =
     "Writes this scene to a file after all. X does the same for the selected scenes, \
-     or for the scene with the dark frame.";
+     or for the scene with the thick frame.";
 /// On the card and in the hover text of a scene that is not written.
 const DROPPED_BADGE: &str = "Dropped, not written";
 /// On a timeline block too narrow to name its scene as well.
@@ -740,9 +766,7 @@ impl ReviewScreen {
                     requests.push(ReviewRequest::LeaveOutChapterSplits);
                 }
             }
-            let scan_again = ui
-                .link("Scan again")
-                .on_hover_text("Looks for black screens again, with the current settings.");
+            let scan_again = ui.link("Scan again").on_hover_text(SCAN_AGAIN_EXPLANATION);
             if scan_again.clicked() {
                 requests.push(ReviewRequest::Rescan(ScanKind::BlackScreens));
             }
@@ -760,7 +784,7 @@ impl ReviewScreen {
                 };
             }
             let missed_label = if self.missed_scenes_open {
-                "Hide the options for missed scenes"
+                HIDE_MISSED_SCENES_LABEL
             } else {
                 "Scenes missed?"
             };
@@ -1309,10 +1333,7 @@ impl ReviewScreen {
         };
         let hint = match self.drop_target(ctx) {
             Some(target) => merge_description(&span_between(source, target)),
-            None => format!(
-                "Drop scene {} on another scene to merge them",
-                source.number()
-            ),
+            None => drag_hint(source),
         };
         egui::Area::new(egui::Id::new("drag_hint"))
             .order(egui::Order::Tooltip)
@@ -1691,8 +1712,13 @@ fn focus_key_requests(
     })
 }
 
+/// Whether `letter` was pressed by itself. With Ctrl or Alt held a letter
+/// is some other shortcut, the system's or a later one of this screen.
+fn letter_pressed(input: &egui::InputState, letter: egui::Key) -> bool {
+    !input.modifiers.command && !input.modifiers.alt && input.key_pressed(letter)
+}
+
 fn letter_key_request(input: &egui::InputState) -> Option<ReviewRequest> {
-    // With Ctrl or Alt held a letter is some other shortcut.
     if input.modifiers.command || input.modifiers.alt {
         return None;
     }
@@ -1780,11 +1806,10 @@ fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<Review
     }
     let (merge, select_all, undo, drop_or_keep) = ctx.input(|input| {
         (
-            input.key_pressed(egui::Key::M),
+            letter_pressed(input, egui::Key::M),
             input.modifiers.command && input.key_pressed(egui::Key::A),
             input.modifiers.command && input.key_pressed(egui::Key::Z),
-            // With Ctrl or Alt held a letter is some other shortcut.
-            !input.modifiers.command && !input.modifiers.alt && input.key_pressed(egui::Key::X),
+            letter_pressed(input, egui::Key::X),
         )
     });
     // This screen is behind everything else, so it is the last to be
@@ -1860,17 +1885,116 @@ fn split_button_label(file_count: usize, dropped_count: usize) -> String {
 /// back.
 fn original_always_kept_hint(why: OriginalAlwaysKept) -> String {
     let keep_every_scene = "The check still compares every new file with its part of the original.";
-    let cut_without_encoding = format!(
-        "Turn off \"{}\" in Settings to cut without encoding.",
+    let get_the_choice_back = format!(
+        "Turn off \"{}\" in Settings to choose what happens to the original again.",
         settings_controls::EXACT_CUT_LABEL
     );
     match why {
         OriginalAlwaysKept::ScenesDropped => keep_every_scene.to_owned(),
-        OriginalAlwaysKept::CutIsExact => cut_without_encoding,
-        OriginalAlwaysKept::ScenesDroppedAndCutIsExact => {
-            format!("{keep_every_scene} {cut_without_encoding}")
-        }
+        OriginalAlwaysKept::CutIsExact => get_the_choice_back,
+        // Here turning the setting off is only half of the way back.
+        OriginalAlwaysKept::ScenesDroppedAndCutIsExact => format!(
+            "{keep_every_scene} You choose what happens to the original again once no scene \
+             is dropped and \"{}\" is off in Settings.",
+            settings_controls::EXACT_CUT_LABEL
+        ),
     }
+}
+
+/// What the pointer reads while a scene card is dragged over nothing it
+/// can be merged with. "Drag", since to drop a scene means to leave it out
+/// of the split on this screen.
+fn drag_hint(dragged: SceneIndex) -> String {
+    format!(
+        "Drag scene {} onto another scene to merge them",
+        dragged.number()
+    )
+}
+
+/// The first of `named`, then how many more there are: "a, b, c and 9
+/// more". All of them when they are few.
+fn first_of(named: &[String], most: usize) -> String {
+    let shown = named.iter().take(most).cloned().collect::<Vec<_>>();
+    match named.len().saturating_sub(most) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// Which scene files a split would replace, by name, so that a file that
+/// only looks like a scene of this video is seen before it is gone.
+fn earlier_files_warning(earlier_files: &EarlierSceneFiles) -> String {
+    format!(
+        "{} from an earlier split would be replaced: {}.",
+        counted(earlier_files.file_count(), "scene file"),
+        first_of(&earlier_files.file_names, MOST_NAMED_IN_A_WARNING)
+    )
+}
+
+/// Every file of the warning, one to a line, and where they are.
+fn earlier_files_hover(earlier_files: &EarlierSceneFiles) -> String {
+    let mut lines = vec![format!("In {}:", earlier_files.scene_dir.display())];
+    lines.extend(
+        earlier_files
+            .file_names
+            .iter()
+            .take(MOST_NAMED_IN_A_HOVER)
+            .cloned(),
+    );
+    let more = earlier_files
+        .file_count()
+        .saturating_sub(MOST_NAMED_IN_A_HOVER);
+    if more > 0 {
+        lines.push(format!("and {more} more"));
+    }
+    lines.push(format!(
+        "Files with names the new split does not use go to the {TRASH_NAME}."
+    ));
+    lines.join("\n")
+}
+
+/// The times of some splits, as a warning names them.
+fn split_times_in_words(times: &[f64]) -> String {
+    let stamps: Vec<String> = times.iter().map(|&time| format_timestamp(time)).collect();
+    first_of(&stamps, MOST_NAMED_IN_A_WARNING)
+}
+
+/// Why a copy cannot make the splits at `times`, and the two ways on.
+fn splits_off_cut_points_warning(times: &[f64]) -> String {
+    let which = match times.len() {
+        1 => "1 split is on an exact picture".to_owned(),
+        several => format!("{several} splits are on exact pictures"),
+    };
+    format!(
+        "{which}, where the video can only be cut with \"{}\" on: at {}. \
+         Move {} to the nearest {} where the video can be cut, or turn that setting back on.",
+        settings_controls::EXACT_CUT_LABEL,
+        split_times_in_words(times),
+        if times.len() == 1 { "it" } else { "them" },
+        if times.len() == 1 { "point" } else { "points" },
+    )
+}
+
+fn move_splits_label(split_count: usize) -> &'static str {
+    if split_count == 1 {
+        "Move it to the nearest point"
+    } else {
+        "Move them to the nearest points"
+    }
+}
+
+/// Why the splits at `times` stayed where they are, and what is left to do.
+fn splits_stuck_warning(times: &[f64]) -> String {
+    let (which, each) = match times.len() {
+        1 => ("1 split cannot move", "it"),
+        _ => ("Some splits cannot move", "each of them"),
+    };
+    format!(
+        "{which}, because another split is at the nearest point where the video can be cut: \
+         at {}. Merge the scenes on both sides of {each}, or turn \"{}\" back on in Settings.",
+        split_times_in_words(times),
+        settings_controls::EXACT_CUT_LABEL
+    )
 }
 
 /// Why the split has not started, with the way past it when there is one.
@@ -1879,14 +2003,11 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
     let mut request = None;
     match session.export_obstacle()? {
         ExportObstacle::EarlierSceneFiles(earlier_files) => {
-            let warning = format!(
-                "{} from an earlier split would be replaced.",
-                counted(earlier_files.file_count, "scene file")
-            );
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(palette.warning_text, warning)
-                    .on_hover_text(format!("They are in {}", earlier_files.scene_dir.display()));
-                if ui.add(theme::danger_button(ui, "Replace them")).clicked() {
+                ui.colored_label(palette.warning_text, earlier_files_warning(earlier_files))
+                    .on_hover_text(earlier_files_hover(earlier_files));
+                let replace = theme::danger_button(ui, REPLACE_EARLIER_FILES_LABEL);
+                if ui.add(replace).clicked() {
                     // The answer is for the files in this folder and no other.
                     request = Some(ReviewRequest::ReplaceEarlierFiles {
                         scene_dir: earlier_files.scene_dir.clone(),
@@ -1900,6 +2021,20 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
                     egui::RichText::new(problem).color(palette.danger),
                 ));
                 theme::copy_details_button(ui, problem);
+            });
+        }
+        ExportObstacle::SplitsOffCutPoints(times) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(palette.warning_text, splits_off_cut_points_warning(times));
+                // Not a danger button: Undo takes the move back.
+                if ui.button(move_splits_label(times.len())).clicked() {
+                    request = Some(ReviewRequest::MoveSplitsToCutPoints);
+                }
+            });
+        }
+        ExportObstacle::SplitsStuckOffCutPoints(times) => {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(palette.warning_text, splits_stuck_warning(times));
             });
         }
     }
@@ -1963,11 +2098,11 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
     let span_to_merge = session.selection().span_to_merge();
     let merge_label = match &span_to_merge {
         Some(span) => merge_description(span),
-        None => "Merge selected".to_owned(),
+        None => MERGE_SELECTED_LABEL.to_owned(),
     };
     let merge_button = ui
         .add_enabled(span_to_merge.is_some(), egui::Button::new(merge_label))
-        .on_hover_text("Joins the selected scenes into one (M).")
+        .on_hover_text(MERGE_SELECTED_HINT)
         .on_disabled_hover_text(
             "Click a scene, then Shift-click another, to choose the scenes to merge.",
         );
@@ -1978,10 +2113,10 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
     let undo_merge_button = ui
         .add_enabled(
             session.has_merged_scene_selected(),
-            egui::Button::new("Undo merge"),
+            egui::Button::new(TAKE_APART_LABEL),
         )
-        .on_hover_text("Takes the selected merged scenes apart again (U).")
-        .on_disabled_hover_text("Select a merged scene to take it apart again.");
+        .on_hover_text(TAKE_APART_HINT)
+        .on_disabled_hover_text("Select a merged scene to take it apart.");
     if undo_merge_button.clicked() {
         request = Some(ReviewRequest::TakeSelectedApart);
     }
@@ -2235,14 +2370,10 @@ fn show_settings_scope(
     ui.horizontal_wrapped(|ui| match scope {
         SettingsScope::General => {
             ui.label(theme::muted(ui, GENERAL_SETTINGS_IN_USE));
-            let folder = folder_settings::folder_of(video)
-                .map(|folder| folder.display().to_string())
-                .unwrap_or_default();
-            let remember = ui.button(REMEMBER_FOR_FOLDER_LABEL).on_hover_text(format!(
-                "Keeps the detection settings as they are now for the videos in {folder}, \
-                 whatever the general settings become. \
-                 What you change here afterwards applies to that folder alone."
-            ));
+            let folder = folder_settings::folder_of(video);
+            let remember = ui
+                .button(REMEMBER_FOR_FOLDER_LABEL)
+                .on_hover_text(remember_for_folder_hint(folder.as_deref()));
             if remember.clicked() {
                 request = Some(ReviewRequest::RememberForFolder);
             }
@@ -2252,7 +2383,7 @@ fn show_settings_scope(
             ui.label(theme::muted(ui, FOLDER_SETTINGS_IN_USE))
                 .on_hover_text(&folder);
             let use_general = ui.button(USE_GENERAL_SETTINGS_LABEL).on_hover_text(format!(
-                "Forgets the detection settings remembered for {folder}. \
+                "Forgets the scan settings remembered for {folder}. \
                      Its videos are scanned with the general settings again."
             ));
             if use_general.clicked() {
@@ -2422,6 +2553,9 @@ fn show_keys_card(ui: &mut egui::Ui) -> KeysCard {
             });
         });
         ui.add(egui::Label::new(theme::muted(ui, KEYS_INTRODUCTION)).wrap());
+        if let Some(keys_on_this_system) = KEYS_ON_THIS_SYSTEM {
+            ui.add(egui::Label::new(theme::muted(ui, keys_on_this_system)).wrap());
+        }
         let room_for_an_action =
             (ui.available_width() - KEY_NAME_WIDTH - TIP_COLUMN_GAP).max(MIN_TIP_WIDTH);
         egui::Grid::new("keys")
@@ -2515,15 +2649,29 @@ struct JoinRow {
     height: f32,
 }
 
+/// What "Remember these settings for this folder" keeps, in the words the
+/// screen uses for the two sets of settings, and for which folder.
+fn remember_for_folder_hint(folder: Option<&Path>) -> String {
+    let folder = match folder {
+        Some(folder) => folder.display().to_string(),
+        None => FOLDER_NOT_KNOWN.to_owned(),
+    };
+    format!(
+        "Keeps the black screen settings and the settings for missed scenes as they are now \
+         for the videos in {folder}, whatever the general settings become. \
+         What you change here afterwards applies to that folder alone."
+    )
+}
+
 /// The row between two scene cards, which is where the split between them
-/// is: a small button to join the two, and one at each end to move the
+/// is: a small button to merge the two, and one at each end to move the
 /// split, earlier at the left and later at the right. `nudge_step` is how
 /// far those two move it, which their hover texts say.
 fn show_join_row(ui: &mut egui::Ui, scene: SceneIndex, nudge_step: NudgeStep) -> JoinRow {
     let earlier_hint = move_split_hint(NudgeDirection::Earlier, nudge_step);
     let later_hint = move_split_hint(NudgeDirection::Later, nudge_step);
     let join_label = format!(
-        "Join scenes {} and {}",
+        "Merge scenes {} and {}",
         scene.number(),
         scene.next().number()
     );
@@ -2570,10 +2718,11 @@ fn show_separate_button(
     let Some(&cut_index) = part.layout.merged_cuts.get(part.position_in_scene) else {
         return;
     };
-    let label = format!("Separate here ({})", format_clock(plan.cut_time(cut_index)));
-    let separate = ui
-        .button(label)
-        .on_hover_text("Splits the merged scene in two at this point again.");
+    let label = format!(
+        "Take apart here ({})",
+        format_clock(plan.cut_time(cut_index))
+    );
+    let separate = ui.button(label).on_hover_text(TAKE_APART_HERE_HINT);
     if separate.clicked() {
         input.cut_to_split_again = Some(cut_index);
     }
@@ -3370,6 +3519,167 @@ mod tests {
     }
 
     #[test]
+    fn m_with_alt_or_ctrl_held_merges_nothing() {
+        let mut screen = Screen::with_five_scenes();
+        screen.click_scene(0, egui::Modifiers::NONE);
+        screen.click_scene(2, egui::Modifiers::SHIFT);
+        screen.press(egui::Key::M, egui::Modifiers::ALT);
+        screen.press(egui::Key::M, egui::Modifiers::COMMAND);
+        assert_eq!(screen.session.scene_count(), 5);
+
+        screen.press_plain(egui::Key::M);
+        assert_eq!(screen.session.scene_count(), 3);
+    }
+
+    #[test]
+    fn the_keys_list_names_the_frame_by_its_shape_and_every_key_of_the_window() {
+        // The frame is dark in one palette and light in the other.
+        for text in [KEYS_INTRODUCTION, DROP_SCENE_HINT, KEEP_SCENE_HINT] {
+            assert!(text.contains("thick frame"), "{text}");
+            assert!(!text.contains("dark frame"), "{text}");
+        }
+        let action_of = |wanted: &str| {
+            KEYS.iter()
+                .find(|(key, _)| *key == wanted)
+                .map(|(_, action)| *action)
+        };
+        assert_eq!(action_of("Ctrl+O"), Some("Add videos."));
+        assert_eq!(
+            action_of("X"),
+            Some("Drop the scene, so no file is written for it. Press X again to keep it.")
+        );
+        assert_eq!(
+            KEYS_ON_THIS_SYSTEM.is_some(),
+            cfg!(target_os = "macos"),
+            "only a Mac has another name for Ctrl"
+        );
+    }
+
+    #[test]
+    fn putting_scenes_together_is_called_merging_everywhere() {
+        let merge_texts = [
+            TIPS[0].0,
+            TIPS[0].1,
+            KEYS[4].1,
+            KEYS[5].1,
+            MERGE_SELECTED_HINT,
+            LEAVE_OUT_CHAPTERS_EXPLANATION,
+        ];
+        for text in merge_texts {
+            assert!(text.contains("Merge") || text.contains("merge"), "{text}");
+            assert!(!text.contains("Join") && !text.contains("join"), "{text}");
+        }
+        assert_eq!(
+            drag_hint(SceneIndex::new(2)),
+            "Drag scene 3 onto another scene to merge them"
+        );
+    }
+
+    #[test]
+    fn the_warning_about_earlier_scene_files_names_them() {
+        let two = EarlierSceneFiles {
+            scene_dir: PathBuf::from("videos"),
+            file_names: vec!["Rocky 001.mp4".to_owned(), "Rocky 002.mp4".to_owned()],
+        };
+        assert_eq!(
+            earlier_files_warning(&two),
+            "2 scene files from an earlier split would be replaced: \
+             Rocky 001.mp4, Rocky 002.mp4."
+        );
+        let one = EarlierSceneFiles {
+            scene_dir: PathBuf::from("videos"),
+            file_names: vec!["Rocky 2.mp4".to_owned()],
+        };
+        assert_eq!(
+            earlier_files_warning(&one),
+            "1 scene file from an earlier split would be replaced: Rocky 2.mp4."
+        );
+
+        let many = EarlierSceneFiles {
+            scene_dir: PathBuf::from("videos"),
+            file_names: EarlierSceneFiles::numbered_names(12),
+        };
+        let warning = earlier_files_warning(&many);
+        assert!(warning.ends_with("no_such_video_scene_003.mp4 and 9 more."));
+        // The hover names every one of them, and the folder.
+        let hover = earlier_files_hover(&many);
+        assert!(hover.starts_with("In videos:"), "{hover}");
+        assert!(hover.contains("no_such_video_scene_012.mp4"), "{hover}");
+        assert!(hover.contains(TRASH_NAME), "{hover}");
+    }
+
+    #[test]
+    fn the_warning_about_splits_on_exact_pictures_says_where_and_what_to_do() {
+        assert_eq!(
+            splits_off_cut_points_warning(&[47.36]),
+            "1 split is on an exact picture, where the video can only be cut with \
+             \"Cut on the exact picture (slower)\" on: at 00:00:47.360. \
+             Move it to the nearest point where the video can be cut, \
+             or turn that setting back on."
+        );
+        let several = splits_off_cut_points_warning(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!(
+            several.starts_with("5 splits are on exact pictures"),
+            "{several}"
+        );
+        assert!(several.contains("00:00:03.000 and 2 more"), "{several}");
+        assert!(
+            several.contains("Move them to the nearest points"),
+            "{several}"
+        );
+        assert_eq!(move_splits_label(1), "Move it to the nearest point");
+        assert_eq!(move_splits_label(2), "Move them to the nearest points");
+
+        let stuck = splits_stuck_warning(&[41.0]);
+        assert!(stuck.starts_with("1 split cannot move"), "{stuck}");
+        assert!(stuck.contains("00:00:41.000"), "{stuck}");
+    }
+
+    #[test]
+    fn the_button_that_moves_exact_splits_asks_for_just_that() {
+        let mut screen = Screen::with_five_scenes();
+        screen
+            .session
+            .place_new_splits(crate::exact_cut::CutPrecision::ExactFrame);
+        screen.session.split_near(47.36);
+        screen
+            .session
+            .place_new_splits(crate::exact_cut::CutPrecision::NearestKeyframe);
+        screen.session.apply(
+            ReviewRequest::Split,
+            &crate::review_session::test_sessions::nothing_in_the_way,
+        );
+        assert!(matches!(
+            screen.session.export_obstacle(),
+            Some(ExportObstacle::SplitsOffCutPoints(_))
+        ));
+
+        screen.session.apply(
+            ReviewRequest::MoveSplitsToCutPoints,
+            &crate::review_session::test_sessions::nothing_in_the_way,
+        );
+        assert_eq!(screen.session.export_obstacle(), None);
+        assert_eq!(
+            screen.scene_ends(),
+            vec![20.0, 40.0, 50.0, 60.0, 80.0, 100.0]
+        );
+    }
+
+    #[test]
+    fn remembering_for_a_folder_says_what_is_kept_and_for_which_folder() {
+        let named = remember_for_folder_hint(Some(Path::new("videos")));
+        assert!(named.contains("for the videos in videos,"), "{named}");
+        assert!(named.contains("black screen settings"), "{named}");
+        assert!(named.contains("settings for missed scenes"), "{named}");
+        // A video whose folder is not known still gets a whole sentence.
+        let unnamed = remember_for_folder_hint(None);
+        assert!(
+            unnamed.contains("for the videos in this video's folder,"),
+            "{unnamed}"
+        );
+    }
+
+    #[test]
     fn the_buttons_that_move_a_split_say_how_far_it_moves() {
         let one_picture = NudgeStep::OnePicture { seconds: 0.04 };
         for direction in [NudgeDirection::Earlier, NudgeDirection::Later] {
@@ -3708,8 +4018,15 @@ mod tests {
         let exact = original_always_kept_hint(OriginalAlwaysKept::CutIsExact);
         let both = original_always_kept_hint(OriginalAlwaysKept::ScenesDroppedAndCutIsExact);
         assert!(dropped.contains("still compares every new file"));
-        assert!(exact.contains(settings_controls::EXACT_CUT_LABEL));
-        assert_eq!(both, format!("{dropped} {exact}"));
+        assert_eq!(
+            exact,
+            "Turn off \"Cut on the exact picture (slower)\" in Settings to choose what happens \
+             to the original again."
+        );
+        // With both, turning the setting off does not bring the choice back.
+        assert!(both.starts_with(&dropped), "{both}");
+        assert!(both.contains("once no scene is dropped"), "{both}");
+        assert!(both.contains(settings_controls::EXACT_CUT_LABEL), "{both}");
     }
 
     #[test]
@@ -4420,7 +4737,7 @@ mod tests {
     /// and add a split of their own.
     fn session_with_chapters() -> ReviewSession {
         let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
-        detection.chapters = Some(vec![
+        detection.chapters = crate::detect::ChapterMarks::Read(vec![
             crate::chapters::Chapter {
                 start: 0.0,
                 title: Some("Opening".to_owned()),

@@ -10,8 +10,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::detect::{self, Detection, OnScanProgress, ScanDepth, ScanSettings};
-use crate::probe;
+use crate::detect::{self, ChapterMarks, Detection, OnScanProgress, ScanDepth, ScanSettings};
 use crate::scan::UndecodedFrames;
 
 /// Raised whenever the stored layout changes, or detection changes in a way
@@ -109,11 +108,15 @@ fn detect_with_cache_in(
         let stored = load_stored_scan(scans_dir, &fingerprint, settings)
             .filter(|detection| detection.satisfies(depth));
         if let Some(mut detection) = stored {
-            if detection.chapters.is_none() {
+            if detection.chapters == ChapterMarks::NeverRead {
                 // Stored before chapter marks were read. Reading them takes
-                // a moment, where scanning again could take minutes.
-                detection.chapters = Some(probe::read_chapters(video)?);
-                remember_scan(scans_dir, &fingerprint, settings, &detection, video);
+                // a moment, where scanning again could take minutes. When
+                // they cannot be read the stored scan is still good, and
+                // the stored file is left as it is, to try again next time.
+                detection.chapters = ChapterMarks::read_from(video);
+                if matches!(detection.chapters, ChapterMarks::Read(_)) {
+                    remember_scan(scans_dir, &fingerprint, settings, &detection, video);
+                }
             }
             return Ok(SourcedDetection {
                 detection,
@@ -301,7 +304,7 @@ mod tests {
             decoded_frames: 1219,
             decoded_windows: 23,
             hard_cut_candidates: None,
-            chapters: None,
+            chapters: crate::detect::ChapterMarks::NeverRead,
         }
     }
 
@@ -385,7 +388,7 @@ mod tests {
         let loaded = load_stored_scan(&dir.0, &fingerprint(), &settings()).unwrap();
         // Not "no chapters" but "never looked", which is what makes the
         // caller read them.
-        assert_eq!(loaded.chapters, None);
+        assert_eq!(loaded.chapters, ChapterMarks::NeverRead);
         assert!(loaded.chapter_marks().is_empty());
     }
 
@@ -420,7 +423,7 @@ mod tests {
         assert_eq!(reused.source, DetectionSource::StoredScan);
         // Everything else is as stored, which a new scan would not give.
         assert_eq!(reused.detection.cuts, detection().cuts);
-        let chapters = reused.detection.chapters.clone().unwrap();
+        let chapters = reused.detection.chapter_marks();
         assert_eq!(chapters.len(), 1);
         assert_eq!(chapters[0].title.as_deref(), Some("Second part"));
         // And they are stored now, so the next time nothing is read again.
@@ -431,10 +434,45 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_scan_is_still_used_when_the_chapter_marks_cannot_be_read() {
+        let dir = ScansDir::for_test("unreadable_chapters");
+        // Not a video, so no chapter marks can be read from it, with or
+        // without the video tools in place.
+        let not_a_video = dir.0.join("not_a_video.mp4");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(&not_a_video, b"this is not a video").unwrap();
+        let fingerprint = VideoFingerprint::of(&not_a_video).unwrap();
+        // What an earlier version stored for this file: no word on chapters.
+        store_scan(&dir.0, &fingerprint, &settings(), &detection()).unwrap();
+
+        let reused = detect_with_cache_in(
+            &dir.0,
+            &not_a_video,
+            &settings(),
+            CacheUse::ReuseStoredScan,
+            ScanDepth::BlackScreens,
+            &detect::no_scan_progress,
+        )
+        .unwrap();
+
+        // The minutes of scanning that were stored are not thrown away.
+        assert_eq!(reused.source, DetectionSource::StoredScan);
+        assert_eq!(reused.detection.cuts, detection().cuts);
+        assert!(reused.detection.chapters.problem().is_some());
+        assert!(reused.detection.chapter_marks().is_empty());
+        // And the stored scan is as it was, so the marks are looked for
+        // again the next time.
+        assert_eq!(
+            load_stored_scan(&dir.0, &fingerprint, &settings()),
+            Some(detection())
+        );
+    }
+
+    #[test]
     fn chapter_marks_are_stored_with_the_scan() {
         let dir = ScansDir::for_test("chapters");
         let with_chapters = Detection {
-            chapters: Some(vec![
+            chapters: crate::detect::ChapterMarks::Read(vec![
                 crate::chapters::Chapter {
                     start: 0.0,
                     title: Some("Opening".to_owned()),
@@ -454,7 +492,7 @@ mod tests {
 
         // A video without chapters is told apart from one never looked at.
         let without_chapters = Detection {
-            chapters: Some(Vec::new()),
+            chapters: crate::detect::ChapterMarks::Read(Vec::new()),
             ..detection()
         };
         store_scan(&dir.0, &fingerprint(), &settings(), &without_chapters).unwrap();

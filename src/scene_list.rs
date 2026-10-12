@@ -52,7 +52,7 @@ impl SceneListFormat {
     pub fn label(self) -> &'static str {
         match self {
             Self::Csv => "Table for a spreadsheet (CSV)",
-            Self::Chapters => "Chapter marks for ffmpeg",
+            Self::Chapters => "Chapter marks to add to a video (ffmpeg metadata)",
             Self::Edl => "Edit list for an editing program (EDL)",
         }
     }
@@ -323,13 +323,29 @@ impl SceneList {
     }
 }
 
+/// A spreadsheet reads a cell that starts with one of these as a formula
+/// and runs it.
+const FORMULA_STARTS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+/// Put before such a cell, this makes a spreadsheet show the text as it is.
+const TEXT_NOT_FORMULA_MARK: char = '\'';
+
 /// A field as a CSV table holds it: in double quotes when it contains a
 /// comma, a quote or a line break, with each quote inside doubled.
+///
+/// Chapter titles come from the video file and file names from its name, so
+/// neither is to be trusted: a title such as "=HYPERLINK(...)" would be run
+/// as a formula by the spreadsheet the table is made for. Such a field is
+/// marked as plain text.
 fn csv_field(field: &str) -> String {
-    if !field.contains([',', '"', '\n', '\r']) {
-        return field.to_owned();
+    let plain_text = if field.starts_with(FORMULA_STARTS) {
+        format!("{TEXT_NOT_FORMULA_MARK}{field}")
+    } else {
+        field.to_owned()
+    };
+    if !plain_text.contains([',', '"', '\n', '\r']) {
+        return plain_text;
     }
-    format!("\"{}\"", field.replace('"', "\"\""))
+    format!("\"{}\"", plain_text.replace('"', "\"\""))
 }
 
 /// A value as ffmpeg's metadata format holds it.
@@ -359,6 +375,31 @@ fn on_one_line(text: &str) -> String {
 
 fn milliseconds(seconds: f64) -> u64 {
     (seconds.max(0.0) * MILLISECONDS_PER_SECOND).round() as u64
+}
+
+#[cfg(test)]
+mod csv_field_tests {
+    use super::csv_field;
+
+    #[test]
+    fn a_field_a_spreadsheet_would_run_as_a_formula_is_marked_as_text() {
+        assert_eq!(
+            csv_field("=HYPERLINK(\"http://example.invalid\",\"Opening\")"),
+            "\"'=HYPERLINK(\"\"http://example.invalid\"\",\"\"Opening\"\")\""
+        );
+        assert_eq!(csv_field("+1"), "'+1");
+        assert_eq!(csv_field("-credits-"), "'-credits-");
+        assert_eq!(csv_field("@home"), "'@home");
+        assert_eq!(csv_field("\tindented"), "'\tindented");
+    }
+
+    #[test]
+    fn an_ordinary_field_is_left_as_it_is() {
+        assert_eq!(csv_field("Opening"), "Opening");
+        assert_eq!(csv_field("1 + 1 = 2"), "1 + 1 = 2");
+        assert_eq!(csv_field("holiday_scene_001.mp4"), "holiday_scene_001.mp4");
+        assert_eq!(csv_field("a, b"), "\"a, b\"");
+    }
 }
 
 #[cfg(test)]

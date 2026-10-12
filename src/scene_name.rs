@@ -6,15 +6,21 @@
 //! the same video left there.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::folder_settings::{PathCase, SYSTEM_PATH_CASE};
 use crate::timecode::TimeSpan;
 
 /// The pattern that gives the names this app has always written:
 /// "<video name>_scene_001" and so on.
 const DEFAULT_PATTERN: &str = "{name}_scene_{number}";
+/// What stands between the video's name and the scene number in a name the
+/// default pattern gives.
+const DEFAULT_NAME_MARKER: &str = "_scene_";
+/// Scenes are numbered from one.
+pub const FIRST_SCENE_NUMBER: usize = 1;
 /// Long enough for any sensible name, and short enough to be held in the
 /// settings without an allocation, which keeps the settings cheap to copy
 /// and compare in every frame.
@@ -158,7 +164,10 @@ impl fmt::Display for PatternError {
                 write!(formatter, "A file name cannot contain a line break or tab.")
             }
             Self::CharacterNotAllowed(character) => {
-                write!(formatter, "A file name cannot contain {character}")
+                write!(
+                    formatter,
+                    "A file name cannot contain the character {character}."
+                )
             }
             Self::ReservedName(name) => write!(
                 formatter,
@@ -366,8 +375,71 @@ fn is_time_for_file_name(text: &str) -> bool {
     all_digits(hours) && hours.len() >= 2 && all_digits(minutes) && all_digits(seconds)
 }
 
-fn is_number(text: &str) -> bool {
+fn is_all_digits(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|digit| digit.is_ascii_digit())
+}
+
+/// Whether `text` could have been written for `{number}`: digits only, and
+/// at least as many as every scene number has. "Film 2" and "Film 12" are
+/// other videos, not scenes of "Film".
+fn is_scene_number(text: &str) -> bool {
+    text.len() >= MIN_NUMBER_DIGITS && is_all_digits(text)
+}
+
+/// Whether `text` could have been written for `{count}`, which has no
+/// leading zeros.
+fn is_scene_count(text: &str) -> bool {
+    is_all_digits(text) && !text.starts_with('0')
+}
+
+/// The number of the first scene as a split writes it when its numbers have
+/// `digits` digits: "001", or "0001" in a split into a thousand scenes.
+fn first_scene_number(digits: usize) -> String {
+    format!("{FIRST_SCENE_NUMBER:0digits$}")
+}
+
+/// `text` without `prefix` at its start, or `None` when it starts with
+/// something else. Where the system finds a file whatever capitals are used
+/// to ask for it, capitals do not tell two names apart here either.
+fn strip_prefix_spelled<'text>(
+    text: &'text str,
+    prefix: &str,
+    case: PathCase,
+) -> Option<&'text str> {
+    if case == PathCase::Matters {
+        return text.strip_prefix(prefix);
+    }
+    let mut rest = text.chars();
+    for wanted in prefix.chars() {
+        let found = rest.next()?;
+        if !found.to_lowercase().eq(wanted.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(rest.as_str())
+}
+
+/// Whether two file names are the same file in one folder.
+pub fn is_same_file_name(one: &str, other: &str, case: PathCase) -> bool {
+    strip_prefix_spelled(one, other, case) == Some("")
+}
+
+/// Whether a file has the name the default pattern gives a scene, of
+/// whatever video. Scenes sit next to the videos they came from, and a
+/// scene should not be split a second time just because its folder was
+/// added again.
+///
+/// This knows the default naming only. Which video a file with another name
+/// came from cannot be told from the name alone, and guessing would hide
+/// videos the person wants to add.
+pub fn is_default_scene_file(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some((video_name, number)) = stem.rsplit_once(DEFAULT_NAME_MARKER) else {
+        return false;
+    };
+    !video_name.is_empty() && is_scene_number(number)
 }
 
 fn digits_of(count: usize) -> usize {
@@ -438,7 +510,8 @@ impl SceneNaming {
             .iter()
             .enumerate()
             .map(|(position, scene)| {
-                let file_name = self.file_name(position + 1, scenes.len(), *scene);
+                let number = FIRST_SCENE_NUMBER + position;
+                let file_name = self.file_name(number, scenes.len(), *scene);
                 check_file_name(&file_name).map(|()| file_name)
             })
             .collect()
@@ -468,24 +541,103 @@ impl SceneNaming {
         file_name
     }
 
-    /// Whether `path` has a name this naming would give a scene of this
-    /// video, whatever its number, its count and its times.
-    pub fn is_scene_of_this_video(&self, path: &Path) -> bool {
+    /// The video's own file name, as the naming read it.
+    pub fn video_file_name(&self) -> String {
+        format!("{}.{}", self.video_name, self.extension)
+    }
+
+    pub fn extension(&self) -> &str {
+        &self.extension
+    }
+
+    /// Those of `files` that an earlier split of this video wrote, going by
+    /// their names. Whatever is returned here a new split replaces or
+    /// removes, so a name has to fit in every part to count.
+    ///
+    /// A number with more digits than scene numbers usually have is only
+    /// written by a split into a thousand scenes or more, and such a split
+    /// also wrote its first scene with that many digits. Without that first
+    /// scene among `files`, a longer number is taken for part of another
+    /// video's name: "Film 2049" is not scene 2049 of "Film".
+    pub fn scenes_of_earlier_splits(&self, files: Vec<PathBuf>) -> Vec<PathBuf> {
+        self.scenes_of_earlier_splits_spelled(files, SYSTEM_PATH_CASE)
+    }
+
+    fn scenes_of_earlier_splits_spelled(
+        &self,
+        files: Vec<PathBuf>,
+        case: PathCase,
+    ) -> Vec<PathBuf> {
+        let numbered: Vec<(PathBuf, Vec<String>)> = files
+            .into_iter()
+            .map(|file| {
+                let numbers = self
+                    .scene_numbers_in(&file, case)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                (file, numbers)
+            })
+            .collect();
+        let is_among_the_numbers = |wanted: &str| {
+            numbered
+                .iter()
+                .any(|(_, numbers)| numbers.iter().any(|number| number == wanted))
+        };
+        let could_be_from_a_split = |number: &String| {
+            number.len() == MIN_NUMBER_DIGITS
+                || is_among_the_numbers(&first_scene_number(number.len()))
+        };
+        numbered
+            .iter()
+            .filter(|(_, numbers)| numbers.iter().any(could_be_from_a_split))
+            .map(|(file, _)| file.clone())
+            .collect()
+    }
+
+    /// Every scene number the name of `path` can be read as holding, when
+    /// the name is one this naming could have given a scene of this video,
+    /// whatever its number, its count and its times. Empty for any other
+    /// name. There is more than one reading only where a pattern puts two
+    /// numbers side by side, as "{number}{count}" does.
+    fn scene_numbers_in<'path>(&self, path: &'path Path, case: PathCase) -> Vec<&'path str> {
         let same_extension = path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case(&self.extension));
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            return false;
+            return Vec::new();
         };
-        same_extension && self.matches(&self.pattern.pieces(), stem)
+        if !same_extension {
+            return Vec::new();
+        }
+        let mut numbers = Vec::new();
+        let reading = Reading {
+            text: stem,
+            number: None,
+        };
+        self.read_numbers(&self.pattern.pieces(), reading, case, &mut numbers);
+        numbers
     }
 
-    /// Whether `text` is what `pieces` could have written. A placeholder
-    /// can stand for text of several lengths, so each length is tried.
-    fn matches(&self, pieces: &[Piece], text: &str) -> bool {
+    /// Adds to `numbers` the scene number of every way the rest of a name
+    /// is what `pieces` could have written. A placeholder can stand for
+    /// text of several lengths, so each length is tried.
+    fn read_numbers<'text>(
+        &self,
+        pieces: &[Piece],
+        reading: Reading<'text>,
+        case: PathCase,
+        numbers: &mut Vec<&'text str>,
+    ) {
+        let Reading { text, number } = reading;
         let Some((first, later_pieces)) = pieces.split_first() else {
-            return text.is_empty();
+            if let (true, Some(number)) = (text.is_empty(), number) {
+                if !numbers.contains(&number) {
+                    numbers.push(number);
+                }
+            }
+            return;
         };
         let fixed_text = match first {
             Piece::Text(fixed) => Some(*fixed),
@@ -493,20 +645,45 @@ impl SceneNaming {
             Piece::Stands(_) => None,
         };
         if let Some(fixed) = fixed_text {
-            return text
-                .strip_prefix(fixed)
-                .is_some_and(|rest| self.matches(later_pieces, rest));
+            if let Some(rest) = strip_prefix_spelled(text, fixed, case) {
+                let reading = Reading { text: rest, number };
+                self.read_numbers(later_pieces, reading, case, numbers);
+            }
+            return;
         }
+        let is_the_scene_number = *first == Piece::Stands(Placeholder::Number);
         let is_what_it_stands_for: fn(&str) -> bool = match first {
             Piece::Stands(Placeholder::Start | Placeholder::Length) => is_time_for_file_name,
-            _ => is_number,
+            Piece::Stands(Placeholder::Count) => is_scene_count,
+            _ => is_scene_number,
         };
-        text.char_indices()
+        let ends = text
+            .char_indices()
             .map(|(end, character)| end + character.len_utf8())
-            .any(|end| {
-                is_what_it_stands_for(&text[..end]) && self.matches(later_pieces, &text[end..])
-            })
+            .filter(|&end| is_what_it_stands_for(&text[..end]));
+        for end in ends {
+            let (written, rest) = text.split_at(end);
+            let number = match (is_the_scene_number, number) {
+                (false, number) => number,
+                (true, None) => Some(written),
+                (true, Some(read_before)) if read_before == written => number,
+                // A pattern that names the number twice writes the same
+                // number twice.
+                (true, Some(_another_number)) => continue,
+            };
+            let reading = Reading { text: rest, number };
+            self.read_numbers(later_pieces, reading, case, numbers);
+        }
     }
+}
+
+/// How far a file name has been read against a pattern.
+#[derive(Clone, Copy)]
+struct Reading<'text> {
+    /// What of the name is still to be read.
+    text: &'text str,
+    /// The scene number read so far, once the pattern has named it.
+    number: Option<&'text str>,
 }
 
 fn check_file_name(file_name: &str) -> Result<(), NamingError> {
@@ -529,6 +706,25 @@ mod tests {
 
     fn naming(video: &str, typed: &str) -> SceneNaming {
         SceneNaming::of(Path::new(video), pattern(typed)).unwrap()
+    }
+
+    /// Whether the name alone fits a scene of this video, with capitals
+    /// counting.
+    fn is_named_as_a_scene(naming: &SceneNaming, file_name: &str) -> bool {
+        !naming
+            .scene_numbers_in(Path::new(file_name), PathCase::Matters)
+            .is_empty()
+    }
+
+    /// Which of `file_names` an earlier split of `video` wrote, going by
+    /// the pattern `typed`.
+    fn earlier_scenes(video: &str, typed: &str, file_names: &[&str]) -> Vec<String> {
+        let files = file_names.iter().map(PathBuf::from).collect();
+        naming(video, typed)
+            .scenes_of_earlier_splits_spelled(files, PathCase::Matters)
+            .into_iter()
+            .map(|file| file.display().to_string())
+            .collect()
     }
 
     fn scenes_of_a_minute(count: usize) -> Vec<TimeSpan> {
@@ -735,7 +931,7 @@ mod tests {
         }
         assert_eq!(
             PatternError::CharacterNotAllowed('?').to_string(),
-            "A file name cannot contain ?"
+            "A file name cannot contain the character ?."
         );
     }
 
@@ -787,10 +983,7 @@ mod tests {
             "holiday_scene_1000.mp4",
             "out/holiday_scene_007.MP4",
         ] {
-            assert!(
-                naming.is_scene_of_this_video(Path::new(scene_file)),
-                "{scene_file}"
-            );
+            assert!(is_named_as_a_scene(&naming, scene_file), "{scene_file}");
         }
     }
 
@@ -804,8 +997,11 @@ mod tests {
             "holiday_scene_notes.mp4",
             "holiday_scene_.mp4",
             "holiday_scene_001_copy.mp4",
+            // Scene numbers have three digits or more.
+            "holiday_scene_1.mp4",
+            "holiday_scene_12.mp4",
         ] {
-            assert!(!naming.is_scene_of_this_video(Path::new(other)), "{other}");
+            assert!(!is_named_as_a_scene(&naming, other), "{other}");
         }
     }
 
@@ -822,11 +1018,22 @@ mod tests {
             let naming = naming("My film 2.mp4", typed);
             for file_name in naming.file_names(&scenes_of_a_minute(12)).unwrap() {
                 assert!(
-                    naming.is_scene_of_this_video(Path::new(&file_name)),
+                    is_named_as_a_scene(&naming, &file_name),
                     "{file_name} of {typed}"
                 );
             }
-            assert!(!naming.is_scene_of_this_video(Path::new("My film 2.mp4")));
+            assert!(!is_named_as_a_scene(&naming, "My film 2.mp4"));
+            let written: Vec<PathBuf> = naming
+                .file_names(&scenes_of_a_minute(1200))
+                .unwrap()
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            assert_eq!(
+                naming.scenes_of_earlier_splits(written.clone()),
+                written,
+                "a split into more than a thousand scenes, named {typed}"
+            );
         }
     }
 
@@ -854,5 +1061,133 @@ mod tests {
             assert_eq!(parse(&typed), Ok(vec![Piece::Stands(placeholder)]));
             assert!(!placeholder.meaning().is_empty());
         }
+    }
+
+    #[test]
+    fn another_video_with_a_number_in_its_name_is_not_a_scene_of_this_one() {
+        // Each pair is a video and another video beside it, which a split
+        // of the first must never replace or remove.
+        let videos_and_neighbours = [
+            ("Rocky.mp4", "{name} {number}", "Rocky 2.mp4"),
+            (
+                "Blade Runner.mp4",
+                "{name} {number}",
+                "Blade Runner 2049.mp4",
+            ),
+            ("show.mp4", "{name}_{number}", "show_2.mp4"),
+            ("clip.mp4", "{name}{number}", "clip1.mp4"),
+            ("clip.mp4", "{name}{number}", "clip12.mp4"),
+            ("film.mp4", "{name} - {number}", "film - 1984.mp4"),
+        ];
+        for (video, typed, neighbour) in videos_and_neighbours {
+            assert_eq!(
+                earlier_scenes(video, typed, &[video, neighbour]),
+                Vec::<String>::new(),
+                "{neighbour} beside {video}, named {typed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_video_with_a_long_number_stays_out_of_a_split_with_three_digit_scenes() {
+        assert_eq!(
+            earlier_scenes(
+                "Blade Runner.mp4",
+                "{name} {number}",
+                &[
+                    "Blade Runner 001.mp4",
+                    "Blade Runner 002.mp4",
+                    "Blade Runner 2049.mp4"
+                ]
+            ),
+            ["Blade Runner 001.mp4", "Blade Runner 002.mp4"]
+        );
+    }
+
+    #[test]
+    fn scenes_with_four_digits_count_when_their_first_scene_is_there() {
+        assert_eq!(
+            earlier_scenes(
+                "film.mp4",
+                "{name}_{number}",
+                &["film_0001.mp4", "film_1000.mp4", "film_10000.mp4"]
+            ),
+            ["film_0001.mp4", "film_1000.mp4"]
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_names_the_number_twice_wants_the_same_number_twice() {
+        let naming = naming("film.mp4", "{number} {name} {number}");
+        assert!(is_named_as_a_scene(&naming, "007 film 007.mp4"));
+        assert!(!is_named_as_a_scene(&naming, "007 film 008.mp4"));
+    }
+
+    #[test]
+    fn a_count_with_a_leading_zero_was_not_written_by_a_split() {
+        let naming = naming("film.mp4", "{name} {number} of {count}");
+        assert!(is_named_as_a_scene(&naming, "film 001 of 12.mp4"));
+        assert!(!is_named_as_a_scene(&naming, "film 001 of 012.mp4"));
+    }
+
+    #[test]
+    fn capitals_tell_scene_files_apart_only_where_the_system_does() {
+        let naming = naming("Holiday.mp4", "{name} Part {number}");
+        let retyped = Path::new("holiday part 001.mp4");
+        assert!(naming
+            .scene_numbers_in(retyped, PathCase::Matters)
+            .is_empty());
+        assert_eq!(naming.scene_numbers_in(retyped, PathCase::Ignored), ["001"]);
+        // Letters beyond ASCII have capitals too.
+        assert_eq!(
+            strip_prefix_spelled("\u{c9}t\u{e9} 1", "\u{e9}T\u{c9}", PathCase::Ignored),
+            Some(" 1")
+        );
+        assert_eq!(strip_prefix_spelled("abc", "abcd", PathCase::Ignored), None);
+        assert!(is_same_file_name("Film.MP4", "film.mp4", PathCase::Ignored));
+        assert!(!is_same_file_name(
+            "Film.MP4",
+            "film.mp4",
+            PathCase::Matters
+        ));
+        assert!(!is_same_file_name(
+            "film.mp4x",
+            "film.mp4",
+            PathCase::Ignored
+        ));
+    }
+
+    #[test]
+    fn the_default_marker_is_the_one_in_the_default_pattern() {
+        assert_eq!(
+            DEFAULT_PATTERN,
+            format!("{{name}}{DEFAULT_NAME_MARKER}{{number}}")
+        );
+    }
+
+    #[test]
+    fn scenes_named_by_default_are_recognised_whatever_their_video() {
+        assert!(is_default_scene_file(Path::new(
+            "videos/holiday_scene_001.mp4"
+        )));
+        assert!(is_default_scene_file(Path::new("holiday_scene_123.mkv")));
+        // A split into a thousand scenes or more numbers with four digits.
+        assert!(is_default_scene_file(Path::new("holiday_scene_1000.mp4")));
+        let names = naming("holiday.mp4", DEFAULT_PATTERN)
+            .file_names(&scenes_of_a_minute(1000))
+            .unwrap();
+        assert!(names
+            .iter()
+            .all(|name| is_default_scene_file(Path::new(name))));
+    }
+
+    #[test]
+    fn ordinary_videos_are_not_mistaken_for_scenes_named_by_default() {
+        assert!(!is_default_scene_file(Path::new("holiday.mp4")));
+        assert!(!is_default_scene_file(Path::new(
+            "crime_scene_investigation.mp4"
+        )));
+        assert!(!is_default_scene_file(Path::new("_scene_001.mp4")));
+        assert!(!is_default_scene_file(Path::new("holiday_scene_1.mp4")));
     }
 }

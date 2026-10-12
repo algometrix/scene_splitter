@@ -5,8 +5,8 @@
 //! The videos and their stages live in `queue`, the review of a video in
 //! `review_session`. Everything drawn here only reads them and returns what
 //! the person asked for as an `AppRequest`. `SceneSplitterApp::apply` is the
-//! one place that acts on those. The sidebar's Settings section is the one
-//! exception: it edits the settings it is handed.
+//! one place that acts on those. The settings are no exception: a control
+//! works on a copy, and a copy that differs comes back as a request.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -28,11 +28,12 @@ use crate::export::{
 };
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
-use crate::player::{Player, PlayerEvent};
+use crate::player::{Player, PlayerEvent, SplitHere};
 use crate::queue::{ExportOrder, Failure, Job, JobId, JobStatus, Queue, Refused, ScanOrder};
 use crate::review::{file_name, ReviewScreen};
 use crate::review_session::{
-    counted, EarlierSceneFiles, FollowUp, ReviewRequest, ReviewSession, SceneListNote,
+    counted, EarlierSceneFiles, ExportObstacle, FollowUp, ReviewRequest, ReviewSession,
+    SceneListNote,
 };
 use crate::scene_list::{FrameRate, SceneList, SceneListFormat};
 use crate::scene_name::SceneNamePattern;
@@ -69,7 +70,9 @@ const PATH_HINT: &str = if cfg!(windows) {
 } else {
     "/videos or /videos/film.mp4"
 };
-const DROP_PROMPT: &str = "or drop videos or a folder anywhere in this window";
+const DRAG_PROMPT: &str = "or drag videos or a folder into this window";
+const DRAG_PROMPT_IN_SIDEBAR: &str = "Or drag videos or a folder into the window.";
+const DRAG_PROMPT_IN_ADD_DIALOG: &str = "You can also drag videos or a folder into the window.";
 /// The steps of using the app, shown on the first screen.
 const WELCOME_STEPS: [(&str, &str); 3] = [
     (
@@ -91,31 +94,43 @@ const BYTES_PER_MEGABYTE: u64 = 1024 * 1024;
 /// The bar under the count of ready videos that have been split, in the
 /// sidebar.
 const BATCH_BAR_HEIGHT: f32 = 6.0;
-const SPLIT_READY_EXPLANATION: &str =
-    "Splits every video you marked with \"Split later\", one after another, \
+const SPLIT_READY_EXPLANATION: &str = "Splits every ready video, one after another, \
      each into the scenes you reviewed. Each one is checked like any other split.";
 const BATCH_RUNNING_HEADING: &str = "Splitting the ready videos";
-const BATCH_OVER_HEADING: &str = "The ready videos were split";
-const READY_EXPLANATION: &str =
-    "Nothing is written yet. This video is split with the other ready videos \
-     when you press the button for that in the list on the left.";
+/// True however the run went, since the summary under it says how.
+const BATCH_OVER_HEADING: &str = "Finished with the ready videos";
+const HIDE_BATCH_SUMMARY_LABEL: &str = "Hide this summary";
+const HIDE_PROBLEMS_LABEL: &str = "Hide these messages";
+const NOTHING_WRITTEN_YET: &str = "Nothing is written yet.";
+const READY_WHILE_A_RUN_IS_UNDER_WAY: &str =
+    "The ready videos are being split now, one after another. If this video was marked \
+     ready after that began, the button to split it comes back above the list on the left \
+     when the others are done.";
 const EDIT_AGAIN_LABEL: &str = "Edit the scenes again";
 const EDIT_AGAIN_EXPLANATION: &str =
     "Takes this video back into review. It is then no longer ready, \
      until you press \"Split later\" again.";
 const WINDOW_SETTINGS_HEADING: &str = "How the window looks";
-const FOLDERS_HEADING: &str = "Folders with their own detection settings";
+const FOLDERS_HEADING: &str = "Folders with their own scan settings";
 const FOLDERS_EXPLANATION: &str =
-    "Videos in these folders are not scanned with the settings above. \
+    "Videos in these folders are not scanned with the general settings. \
      Change a folder's settings on the review screen of one of its videos.";
+const SETTINGS_SAVED_NOTE: &str =
+    "Changes are saved straight away. Scan settings apply the next time a video is scanned.";
+const RESTORE_DEFAULTS_LABEL: &str = "Restore default settings";
+const RESTORE_DEFAULTS_EXPLANATION: &str = "Puts every setting here back to how it was at first.";
+/// Under the button and not in a hover: it cannot be taken back, so it is
+/// said where it is read without pointing.
+const RESTORE_DEFAULTS_NOTE: &str = "Also forgets the settings remembered for folders. \
+     What happens to originals stays as it is.";
 const FORGET_FOLDER_EXPLANATION: &str =
     "Videos in this folder are scanned with the general settings again.";
 /// Problems are few and each is a line of text. Should something go wrong
 /// over and over, only the newest are kept, so the sidebar stays usable.
 const MOST_PROBLEMS_KEPT: usize = 5;
-const DROP_EXPLANATION: &str =
-    "Scene Splitter finds the black screens between scenes and cuts the video there, \
-     without re-encoding it.";
+const WELCOME_EXPLANATION: &str =
+    "Scene Splitter finds the black screens between scenes and cuts the video there. \
+     The scenes are copied as they are, so nothing is encoded again.";
 
 /// Opens the window and blocks until it is closed. With `first_path` that
 /// video, or every video in that folder, is queued at once, to be scanned
@@ -191,6 +206,10 @@ enum AppRequest {
     },
     /// What the person said when asked, once, about recycling originals.
     AnswerRecyclingQuestion(RecyclingAnswer),
+    /// Use these settings from now on. The Settings section hands back the
+    /// settings as its controls left them, whenever they differ from those
+    /// in use.
+    ChangeSettingsTo(Box<Settings>),
 }
 
 /// The answers to the question that is asked before the first split that
@@ -445,7 +464,6 @@ impl SceneSplitterApp {
         self.forget_review_screens_no_longer_shown();
         self.drop_the_recycling_question_unless_its_split_can_still_start();
 
-        let export_options_before = self.settings.export;
         let keyboard = self.keyboard_owner();
         self.leave_escape_to_the_text_box(ctx, keyboard);
         // The player is in front of the review screen but drawn after it,
@@ -472,7 +490,7 @@ impl SceneSplitterApp {
                             &self.add_feedback,
                             &self.problems,
                             SettingsSection {
-                                settings: &mut self.settings,
+                                settings: &self.settings,
                                 problem: &self.settings_problem,
                                 scene_name_draft: &mut self.scene_name_draft,
                             },
@@ -487,7 +505,6 @@ impl SceneSplitterApp {
         requests.extend(self.show_recycling_question(ctx));
         self.apply(ctx, requests);
 
-        self.forget_export_obstacles_if_scenes_go_elsewhere(export_options_before);
         self.text_box_had_the_keyboard = ctx.wants_keyboard_input();
         self.save_settings_once_changed(ctx);
     }
@@ -531,15 +548,23 @@ impl SceneSplitterApp {
         }
     }
 
-    /// A warning about the scene files of an earlier split names the folder
-    /// the scenes go to, and counts the files there that are named as the
-    /// scenes would be. Wherever in the window the person changes that
-    /// folder or that name, the sidebar or a review screen, this is the one
-    /// place that notices, so no warning about the old ones stays on any
-    /// review.
-    fn forget_export_obstacles_if_scenes_go_elsewhere(&mut self, before: ExportOptions) {
-        let now = self.settings.export;
-        if now.scene_location != before.scene_location || now.scene_name != before.scene_name {
+    /// The one place the settings in use are replaced, wherever in the
+    /// window the person changed them.
+    ///
+    /// What stands between a review and its split was found under the old
+    /// settings. A warning about the scene files of an earlier split names
+    /// the folder the scenes go to and the files there that are named as
+    /// the scenes would be, and a warning about splits on exact pictures
+    /// holds only while cuts are not exact. When one of those three changes,
+    /// no such warning stays on any review.
+    fn use_settings(&mut self, settings: Settings) {
+        let before = self.settings.export;
+        let now = settings.export;
+        self.settings = settings;
+        let obstacles_are_outdated = now.scene_location != before.scene_location
+            || now.scene_name != before.scene_name
+            || now.cut_precision != before.cut_precision;
+        if obstacles_are_outdated {
             self.queue.forget_export_obstacles();
         }
     }
@@ -629,6 +654,7 @@ impl SceneSplitterApp {
             AppRequest::AnswerRecyclingQuestion(answer) => {
                 self.answer_recycling_question(ctx, answer);
             }
+            AppRequest::ChangeSettingsTo(settings) => self.use_settings(*settings),
         }
     }
 
@@ -694,7 +720,7 @@ impl SceneSplitterApp {
         let Some(answered) = settings_after_recycling_answer(&self.settings, answer) else {
             return;
         };
-        self.settings = answered;
+        self.use_settings(answered);
         match awaiting {
             SplitAwaitingAnswer::OneVideo(job) => self.start_export(ctx, job),
             SplitAwaitingAnswer::ReadyVideos => self.start_batch(ctx),
@@ -766,10 +792,23 @@ impl SceneSplitterApp {
     /// Starts the split of a video that waited for it, with every safeguard
     /// a single split has. Returns how its turn ended when no split was
     /// started, and `None` when one is running now.
+    ///
+    /// Every safeguard is checked here, when the turn comes, and not when
+    /// the run began: the settings and the video's scenes may have changed
+    /// since, and each split uses what is in force at its own start.
     fn start_ready_split(&mut self, ctx: &egui::Context, job: JobId) -> Option<SplitOutcome> {
         let Some(review) = self.queue.ready_review(job) else {
             return Some(SplitOutcome::NoLongerReady);
         };
+        if split_waits_for_the_recycling_answer(&self.settings, review.dropped_count()) {
+            // Left ready. The next run asks before it starts.
+            return Some(SplitOutcome::OriginalNotSettled);
+        }
+        let off_cut_points = review.splits_off_cut_points_for(self.settings.export.cut_precision);
+        if !off_cut_points.is_empty() {
+            self.hold_back(job, ExportObstacle::SplitsOffCutPoints(off_cut_points));
+            return Some(SplitOutcome::SplitsOnExactPictures);
+        }
         let video = Arc::clone(review.video());
         let found = look_for_earlier_scene_files(&video, self.settings.export);
         let may_split = review.may_split_over(&found);
@@ -782,7 +821,7 @@ impl SceneSplitterApp {
             }
         };
         if !may_split {
-            self.hold_back_for_earlier_files(job, earlier_files);
+            self.hold_back(job, ExportObstacle::EarlierSceneFiles(earlier_files));
             return Some(SplitOutcome::EarlierFilesInTheWay);
         }
         let order = match self.queue.start_ready_export(job) {
@@ -796,21 +835,17 @@ impl SceneSplitterApp {
         None
     }
 
-    /// Scene files of an earlier split turned up where a ready video's
-    /// scenes would go, and the person never agreed to replace those. Nobody
-    /// is asked in the middle of a run. The video goes back into review with
-    /// the question open on it, for the person to find there.
-    fn hold_back_for_earlier_files(&mut self, job: JobId, earlier_files: EarlierSceneFiles) {
+    /// Something stands in the way of a ready video's split that only the
+    /// person can decide about: scene files of an earlier split they never
+    /// agreed to replace, or splits a copy cannot make. Nobody is asked in
+    /// the middle of a run. The video goes back into review with the
+    /// question open on it, for the person to find there.
+    fn hold_back(&mut self, job: JobId, obstacle: ExportObstacle) {
         let taken_back = self.queue.edit_again(job);
         self.note_refusal(taken_back);
-        let Some(review) = self.queue.review_mut(job) else {
-            return;
-        };
-        let asked = review.apply(ReviewRequest::Split, &|| Ok(earlier_files.clone()));
-        debug_assert!(
-            asked.is_none(),
-            "a split over files nobody agreed to replace must wait"
-        );
+        if let Some(review) = self.queue.review_mut(job) {
+            review.hold_back_from_the_ready_run(obstacle);
+        }
     }
 
     /// The dialog stays open on a mistake, with the reason in it, so a
@@ -886,7 +921,7 @@ impl SceneSplitterApp {
     /// Takes over a change of settings made on a review screen. It is saved
     /// with every other change once the frame is over.
     fn change_settings(&mut self, change: SettingsChange) {
-        self.settings = self.settings.changed_by(change);
+        self.use_settings(self.settings.changed_by(change));
     }
 
     fn split_at_playhead(&mut self, job: JobId, time: f64) {
@@ -1070,7 +1105,11 @@ impl SceneSplitterApp {
             ),
             None => (Vec::new(), None),
         };
-        match active.player.show(ctx, &scenes, split_would_land_at) {
+        let split_here = SplitHere {
+            precision: self.settings.export.cut_precision,
+            would_land_at: split_would_land_at,
+        };
+        match active.player.show(ctx, &scenes, split_here) {
             PlayerEvent::StillOpen => None,
             PlayerEvent::Closed => Some(AppRequest::ClosePlayer),
             PlayerEvent::SplitRequested(time) => Some(AppRequest::SplitAtPlayhead { job, time }),
@@ -1251,7 +1290,15 @@ impl SceneSplitterApp {
             }
             JobStatus::ReadyToSplit(review) => {
                 let cut_precision = self.settings.export.cut_precision;
-                show_ready(ctx, id, &name, ReadySplit::of(review, cut_precision))
+                let way_to_split = if self.batch_is_running() {
+                    WayToSplitReady::RunUnderWay
+                } else {
+                    WayToSplitReady::Button {
+                        ready_count: self.queue.ready_jobs().len(),
+                    }
+                };
+                let split = ReadySplit::of(review, cut_precision);
+                show_ready(ctx, id, &name, split, way_to_split)
             }
             JobStatus::Exporting(_) => {
                 show_busy(ctx, &format!("Writing and checking the scenes of {name}"));
@@ -1300,7 +1347,7 @@ fn split_outcome_of(event: &JobEvent) -> Option<SplitOutcome> {
     }
 }
 
-/// Looks where the scenes of this video would go now, and counts the scene
+/// Looks where the scenes of this video would go now, and names the scene
 /// files an earlier split of it left there under the name scenes get now.
 fn look_for_earlier_scene_files(
     video: &Path,
@@ -1308,13 +1355,12 @@ fn look_for_earlier_scene_files(
 ) -> Result<EarlierSceneFiles, String> {
     let scene_dir = split::scene_dir(video, export_options.scene_location)
         .map_err(|error| format!("{error:#}"))?;
-    let file_count =
+    let earlier_files =
         split::scene_files_from_earlier_splits(video, &scene_dir, export_options.scene_name)
-            .map_err(|error| format!("{error:#}"))?
-            .len();
+            .map_err(|error| format!("{error:#}"))?;
     Ok(EarlierSceneFiles {
         scene_dir,
-        file_count,
+        file_names: split::file_names_of(&earlier_files),
     })
 }
 
@@ -1358,9 +1404,9 @@ fn status_color(palette: &theme::Palette, status: &JobStatus) -> egui::Color32 {
     }
 }
 
-/// What the Settings section of the sidebar shows and changes.
+/// What the Settings section of the sidebar shows.
 struct SettingsSection<'app> {
-    settings: &'app mut Settings,
+    settings: &'app Settings,
     /// Why the saved settings could not be read or written, or empty.
     problem: &'app str,
     scene_name_draft: &'app mut SceneNameDraft,
@@ -1385,7 +1431,7 @@ fn show_queue(
     if add_button.clicked() {
         requests.push(AppRequest::OpenAddDialog);
     }
-    ui.label(theme::caption(ui, "Or drop videos or a folder anywhere."));
+    ui.label(theme::caption(ui, DRAG_PROMPT_IN_SIDEBAR));
     if !add_feedback.is_empty() {
         ui.label(theme::caption(ui, add_feedback));
     }
@@ -1413,7 +1459,7 @@ fn show_queue(
             problem,
             scene_name_draft,
         } = settings_section;
-        show_settings(ui, settings, problem, scene_name_draft);
+        requests.extend(show_settings(ui, settings, problem, scene_name_draft));
     });
     requests
 }
@@ -1446,7 +1492,7 @@ fn show_ready_videos(
     if let Some(batch) = batch.filter(|batch| batch.is_over()) {
         ui.label(theme::semibold(BATCH_OVER_HEADING, 13.0));
         ui.add(theme::selectable(theme::caption(ui, batch.summary())).wrap());
-        if ui.button("Dismiss").clicked() {
+        if ui.button(HIDE_BATCH_SUMMARY_LABEL).clicked() {
             requests.push(AppRequest::DismissBatchSummary);
         }
     }
@@ -1477,7 +1523,7 @@ fn show_problems(ui: &mut egui::Ui, problems: &[String]) -> Option<AppRequest> {
     }
     ui.horizontal_wrapped(|ui| {
         theme::copy_details_button(ui, &problems.join("\n"));
-        if ui.button("Dismiss").clicked() {
+        if ui.button(HIDE_PROBLEMS_LABEL).clicked() {
             request = Some(AppRequest::DismissProblems);
         }
     });
@@ -1496,12 +1542,17 @@ fn path_from_pasted_text(text: &str) -> Option<PathBuf> {
 
 /// The settings section. Whatever changes here is saved and used from then
 /// on, by the window and by the command line.
+///
+/// The controls work on a copy of the settings in use. When they leave it
+/// different, the copy is returned for the app to take over, which is where
+/// a change of settings can be checked against what is going on.
 fn show_settings(
     ui: &mut egui::Ui,
-    settings: &mut Settings,
+    in_use: &Settings,
     problem: &str,
     scene_name_draft: &mut SceneNameDraft,
-) {
+) -> Option<AppRequest> {
+    let mut settings = in_use.clone();
     let palette = theme::palette(ui.ctx());
     if !problem.is_empty() {
         ui.add(theme::selectable(
@@ -1544,7 +1595,7 @@ fn show_settings(
     ui.horizontal_wrapped(|ui| {
         settings_controls::show_hard_cut_controls(
             ui,
-            &mut settings.hard_cuts,
+            &mut settings.detection.hard_cuts,
             "settings_hard_cut_sensitivity",
         );
     });
@@ -1553,27 +1604,27 @@ fn show_settings(
     // and the defaults suit most films, so it stays folded away.
     ui.add_space(4.0);
     egui::CollapsingHeader::new("Advanced: what counts as a black screen").show(ui, |ui| {
-        settings_controls::show_black_screen_controls(ui, &mut settings.scan);
+        settings_controls::show_black_screen_controls(ui, &mut settings.detection.scan);
     });
-    show_folders_with_their_own_settings(ui, settings);
+    show_folders_with_their_own_settings(ui, &mut settings);
 
     ui.add_space(4.0);
-    ui.label(theme::caption(
-        ui,
-        "Changes are saved straight away. Detection settings apply the next time a video is scanned.",
-    ));
-    let restore = ui.button("Restore default settings").on_hover_text(
-        "Puts every setting here back to how it was at first, except what happens to originals. \
-         Settings remembered for folders are forgotten too.",
-    );
+    ui.label(theme::caption(ui, SETTINGS_SAVED_NOTE));
+    let restore = ui
+        .button(RESTORE_DEFAULTS_LABEL)
+        .on_hover_text(RESTORE_DEFAULTS_EXPLANATION);
+    ui.add(egui::Label::new(theme::caption(ui, RESTORE_DEFAULTS_NOTE)).wrap());
     if restore.clicked() {
-        *settings = settings.restored_to_defaults();
+        settings = in_use.restored_to_defaults();
     }
+    (settings != *in_use).then(|| AppRequest::ChangeSettingsTo(Box::new(settings)))
 }
 
 /// The folders whose videos are not scanned with the general settings shown
 /// above, each with the way to make it an ordinary folder again. Draws
 /// nothing while no folder has settings of its own.
+///
+/// `settings` is the copy the Settings section works on.
 fn show_folders_with_their_own_settings(ui: &mut egui::Ui, settings: &mut Settings) {
     if settings.folders.is_empty() {
         return;
@@ -1769,10 +1820,7 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
             if !dialog.problem.is_empty() {
                 ui.colored_label(palette.danger, &dialog.problem);
             }
-            ui.label(theme::caption(
-                ui,
-                "You can also drop videos or a folder anywhere in the window.",
-            ));
+            ui.label(theme::caption(ui, DRAG_PROMPT_IN_ADD_DIALOG));
         });
 
     // The dialog is in front of everything, so Escape is its to take.
@@ -1814,6 +1862,40 @@ impl RecyclingSubject<'_> {
         }
     }
 
+    /// Whether the answer decides about one original or about several.
+    fn originals(self) -> HowManyOriginals {
+        match self {
+            Self::OneVideo(_)
+            | Self::ReadyVideos(ReadyOriginals {
+                may_be_moved: 1, ..
+            }) => HowManyOriginals::One,
+            Self::ReadyVideos(_) => HowManyOriginals::Several,
+        }
+    }
+
+    /// The question itself, which is the title of the dialog.
+    fn question(self) -> String {
+        match self.originals() {
+            HowManyOriginals::One => format!("Move the original to the {TRASH_NAME}?"),
+            HowManyOriginals::Several => format!("Move the originals to the {TRASH_NAME}?"),
+        }
+    }
+
+    fn move_label(self) -> String {
+        match self.originals() {
+            HowManyOriginals::One => format!("Move it to the {TRASH_NAME}"),
+            HowManyOriginals::Several => format!("Move them to the {TRASH_NAME}"),
+        }
+    }
+
+    fn keep_label(self) -> &'static str {
+        match self.originals() {
+            HowManyOriginals::One => "Keep the original",
+            HowManyOriginals::Several => "Keep the originals",
+        }
+    }
+
+    /// Whose originals would be moved, short enough for one line.
     fn named(self) -> String {
         match self {
             Self::OneVideo(name) => name.to_owned(),
@@ -1825,16 +1907,30 @@ impl RecyclingSubject<'_> {
                 may_be_moved,
                 always_kept: 0,
             }) => format!("all {may_be_moved} videos that are ready to split"),
-            // The rest keep their originals, and the person should not
-            // think the answer is about those.
             Self::ReadyVideos(ReadyOriginals {
                 may_be_moved,
                 always_kept,
             }) => format!(
-                "{may_be_moved} of the {} videos that are ready to split. The others have \
-                 dropped scenes, so their originals are always kept",
+                "{may_be_moved} of the {} videos that are ready to split",
                 may_be_moved + always_kept
             ),
+        }
+    }
+
+    /// What goes for the ready videos the answer is not about. They keep
+    /// their originals, and the person should not think it is about those.
+    /// The question is only asked while cuts are not exact, so dropped
+    /// scenes are the one reason an original is always kept here.
+    fn the_rest(self) -> Option<String> {
+        match self {
+            Self::OneVideo(_) | Self::ReadyVideos(ReadyOriginals { always_kept: 0, .. }) => None,
+            Self::ReadyVideos(ReadyOriginals { always_kept: 1, .. }) => Some(
+                "The other video has dropped scenes, so its original is always kept.".to_owned(),
+            ),
+            Self::ReadyVideos(ReadyOriginals { always_kept, .. }) => Some(format!(
+                "The other {always_kept} videos have dropped scenes, so their originals are \
+                 always kept."
+            )),
         }
     }
 
@@ -1854,6 +1950,12 @@ impl RecyclingSubject<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HowManyOriginals {
+    One,
+    Several,
+}
+
 /// Asked once, before the first split that would move an original to the
 /// Recycle Bin or Trash: what will happen, and on what condition. Returns
 /// the person's answer, if they gave one in this frame.
@@ -1866,7 +1968,7 @@ fn show_recycling_question(
         theme::show_backdrop(ctx, "recycling_question_backdrop", egui::Order::Middle);
     let mut answer = None;
     let mut open = true;
-    egui::Window::new(format!("Move the original to the {TRASH_NAME}?"))
+    egui::Window::new(subject.question())
         .open(&mut open)
         .order(egui::Order::Foreground)
         .collapsible(false)
@@ -1877,6 +1979,9 @@ fn show_recycling_question(
             ui.add(egui::Label::new(subject.what_happens()).wrap());
             ui.add(egui::Label::new(theme::semibold(&named, 14.0)).truncate())
                 .on_hover_text(&named);
+            if let Some(the_rest) = subject.the_rest() {
+                ui.add(egui::Label::new(theme::muted(ui, the_rest)).wrap());
+            }
             ui.add(
                 egui::Label::new(
                     "That only happens if the new files pass the check: together they must \
@@ -1898,11 +2003,11 @@ fn show_recycling_question(
             );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                let move_it = theme::primary_button(ui, format!("Move it to the {TRASH_NAME}"));
+                let move_it = theme::primary_button(ui, subject.move_label());
                 if ui.add(move_it).clicked() {
                     answer = Some(RecyclingAnswer::MoveOriginal);
                 }
-                let keep_it = egui::Button::new("Keep the original")
+                let keep_it = egui::Button::new(subject.keep_label())
                     .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
                 let keep_it = ui.add(keep_it).on_hover_text(subject.what_keeping_does());
                 if keep_it.clicked() {
@@ -1934,13 +2039,13 @@ fn show_welcome(ctx: &egui::Context) -> Option<AppRequest> {
     let mut add_videos = false;
     show_centered_card(ctx, |ui| {
         ui.label(theme::semibold("Cut a long video into its scenes", 20.0));
-        ui.label(theme::muted(ui, DROP_EXPLANATION));
+        ui.label(theme::muted(ui, WELCOME_EXPLANATION));
         ui.add_space(4.0);
         add_videos = ui
             .add(theme::primary_button(ui, "Add videos"))
             .on_hover_text("Ctrl+O")
             .clicked();
-        ui.label(theme::caption(ui, DROP_PROMPT));
+        ui.label(theme::caption(ui, DRAG_PROMPT));
         ui.add_space(10.0);
         // The text column wraps only when told how wide it may be, and that
         // has to be measured out here: inside the grid no width is known yet.
@@ -2024,6 +2129,39 @@ impl ReadySplit {
     }
 }
 
+/// How a video that is ready gets split, which its page says so that the
+/// person knows where to go next.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WayToSplitReady {
+    /// With the button above the list, which names this many ready videos.
+    Button { ready_count: usize },
+    /// A run over the ready videos is under way, and the button is away
+    /// until it is over.
+    RunUnderWay,
+}
+
+impl WayToSplitReady {
+    /// Names the button by what is written on it.
+    fn in_words(self) -> String {
+        match self {
+            Self::Button { ready_count } => {
+                let others = if ready_count > 1 {
+                    "split this video with the others"
+                } else {
+                    "split this video"
+                };
+                format!(
+                    "{NOTHING_WRITTEN_YET} Press \"{}\" above the list on the left to {others}.",
+                    split_ready_label(ready_count)
+                )
+            }
+            Self::RunUnderWay => {
+                format!("{NOTHING_WRITTEN_YET} {READY_WHILE_A_RUN_IS_UNDER_WAY}")
+            }
+        }
+    }
+}
+
 /// A video that waits to be split with the other ready videos, with the way
 /// back into its review.
 fn show_ready(
@@ -2031,6 +2169,7 @@ fn show_ready(
     job: JobId,
     name: &str,
     split: ReadySplit,
+    way_to_split: WayToSplitReady,
 ) -> Option<AppRequest> {
     let mut request = None;
     show_centered_card(ctx, |ui| {
@@ -2039,7 +2178,7 @@ fn show_ready(
         if let Some(why) = split.original_always_kept {
             ui.label(theme::muted(ui, why.in_plain_words()));
         }
-        ui.label(theme::muted(ui, READY_EXPLANATION));
+        ui.label(theme::muted(ui, way_to_split.in_words()));
         let edit_again = ui
             .button(EDIT_AGAIN_LABEL)
             .on_hover_text(EDIT_AGAIN_EXPLANATION);
@@ -2477,7 +2616,7 @@ mod tests {
         assert!(matches!(
             review.export_obstacle(),
             Some(crate::review_session::ExportObstacle::EarlierSceneFiles(found))
-                if found.file_count == 1
+                if found.file_count() == 1
         ));
         // The run is over, and says what happened.
         let batch = app.batch.as_ref().unwrap();
@@ -2507,6 +2646,100 @@ mod tests {
         );
         // Still in review, untouched.
         assert_eq!(app.queue.review(job).unwrap().scene_count(), 5);
+    }
+
+    #[test]
+    fn a_turn_that_could_move_an_original_unasked_is_not_split() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_ready_video_in(Path::new("no_such_folder"));
+        // The run began while every original was kept, so nothing was
+        // asked. Since then the settings came to say "move it", which is
+        // what turning exact cuts off during a run does on a fresh install.
+        app.batch = SplitBatch::of(app.queue.ready_jobs());
+        app.settings.export.original_policy = OriginalPolicy::RecycleOnceVerified;
+        assert!(app.settings.must_ask_before_recycling());
+
+        app.advance_batch(&ctx);
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.is_over());
+        assert!(
+            batch.summary().contains("It is still ready"),
+            "{}",
+            batch.summary()
+        );
+        // Not split, not taken back, and nobody asked in the middle of it.
+        assert_eq!(app.queue.ready_jobs(), vec![job]);
+        assert_eq!(app.recycling_question_for, None);
+
+        // The next run asks before it starts.
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        assert_eq!(
+            app.recycling_question_for,
+            Some(SplitAwaitingAnswer::ReadyVideos)
+        );
+    }
+
+    /// An app with one ready video that has a split on an exact picture, at
+    /// 47.36 s, and with cuts turned off exact again since. Originals are
+    /// kept, so nothing is asked about those.
+    fn app_with_a_ready_video_split_on_an_exact_picture() -> (SceneSplitterApp, JobId) {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        app.settings.export.original_policy = OriginalPolicy::Keep;
+        app.settings.export.cut_precision = CutPrecision::ExactFrame;
+        app.tell_the_review_where_new_splits_land();
+        app.split_at_playhead(job, 47.36);
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        assert_eq!(app.queue.ready_jobs(), vec![job]);
+
+        let mut copying = app.settings.clone();
+        copying.export.cut_precision = CutPrecision::NearestKeyframe;
+        app.apply_request(&ctx, AppRequest::ChangeSettingsTo(Box::new(copying)));
+        (app, job)
+    }
+
+    #[test]
+    fn a_ready_video_with_splits_on_exact_pictures_is_held_back_when_cuts_are_not_exact() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_ready_video_split_on_an_exact_picture();
+
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        // Back in review with the question open, and nothing was written.
+        let review = app.queue.review(job).unwrap();
+        assert_eq!(
+            review.export_obstacle(),
+            Some(&ExportObstacle::SplitsOffCutPoints(vec![47.36]))
+        );
+        let batch = app.batch.as_ref().unwrap();
+        assert!(batch.is_over());
+        assert!(
+            batch.summary().contains("on exact pictures"),
+            "{}",
+            batch.summary()
+        );
+        assert!(app.problems.is_empty());
+
+        // Moving the split and saying "split later" again makes it ready.
+        app.tell_the_review_where_new_splits_land();
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::MoveSplitsToCutPoints]);
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::SplitLater]);
+        assert_eq!(app.queue.ready_jobs(), vec![job]);
+        let cuts = app.queue.ready_review(job).unwrap().accepted_cuts();
+        assert_eq!(cuts.as_slice(), [20.0, 40.0, 50.0, 60.0, 80.0]);
+    }
+
+    #[test]
+    fn turning_exact_cuts_back_on_takes_the_warning_about_exact_splits_off() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_ready_video_split_on_an_exact_picture();
+        app.apply_request(&ctx, AppRequest::SplitReadyVideos);
+        assert!(app.queue.review(job).unwrap().export_obstacle().is_some());
+
+        let mut exact = app.settings.clone();
+        exact.export.cut_precision = CutPrecision::ExactFrame;
+        app.apply_request(&ctx, AppRequest::ChangeSettingsTo(Box::new(exact.clone())));
+        assert_eq!(app.settings, exact);
+        assert_eq!(app.queue.review(job).unwrap().export_obstacle(), None);
     }
 
     #[test]
@@ -2583,10 +2816,80 @@ mod tests {
         assert_eq!(ready(3, 0).named(), "all 3 videos that are ready to split");
         assert_eq!(
             ready(2, 1).named(),
-            "2 of the 3 videos that are ready to split. The others have dropped scenes, so \
-             their originals are always kept"
+            "2 of the 3 videos that are ready to split"
         );
         assert!(ready(3, 0).what_happens().starts_with("After each split"));
+    }
+
+    #[test]
+    fn the_recycling_question_says_what_goes_for_the_videos_it_is_not_about() {
+        let ready = |may_be_moved, always_kept| {
+            RecyclingSubject::ReadyVideos(ReadyOriginals {
+                may_be_moved,
+                always_kept,
+            })
+        };
+        assert_eq!(RecyclingSubject::OneVideo("film.mp4").the_rest(), None);
+        assert_eq!(ready(3, 0).the_rest(), None);
+        assert_eq!(
+            ready(2, 1).the_rest().as_deref(),
+            Some("The other video has dropped scenes, so its original is always kept.")
+        );
+        assert_eq!(
+            ready(1, 2).the_rest().as_deref(),
+            Some("The other 2 videos have dropped scenes, so their originals are always kept.")
+        );
+    }
+
+    #[test]
+    fn the_recycling_question_speaks_of_one_original_or_of_several() {
+        let ready = |may_be_moved, always_kept| {
+            RecyclingSubject::ReadyVideos(ReadyOriginals {
+                may_be_moved,
+                always_kept,
+            })
+        };
+        for one in [
+            RecyclingSubject::OneVideo("film.mp4"),
+            ready(1, 0),
+            ready(1, 3),
+        ] {
+            assert_eq!(
+                one.question(),
+                format!("Move the original to the {TRASH_NAME}?")
+            );
+            assert_eq!(one.move_label(), format!("Move it to the {TRASH_NAME}"));
+            assert_eq!(one.keep_label(), "Keep the original");
+        }
+        for several in [ready(2, 0), ready(3, 1)] {
+            assert_eq!(
+                several.question(),
+                format!("Move the originals to the {TRASH_NAME}?")
+            );
+            assert_eq!(
+                several.move_label(),
+                format!("Move them to the {TRASH_NAME}")
+            );
+            assert_eq!(several.keep_label(), "Keep the originals");
+        }
+    }
+
+    #[test]
+    fn the_page_of_a_ready_video_names_the_button_that_splits_it() {
+        assert_eq!(
+            WayToSplitReady::Button { ready_count: 3 }.in_words(),
+            "Nothing is written yet. Press \"Split 3 ready videos\" above the list on the left \
+             to split this video with the others."
+        );
+        assert_eq!(
+            WayToSplitReady::Button { ready_count: 1 }.in_words(),
+            "Nothing is written yet. Press \"Split 1 ready video\" above the list on the left \
+             to split this video."
+        );
+        // While a run is under way that button is not there to press.
+        let during_a_run = WayToSplitReady::RunUnderWay.in_words();
+        assert!(during_a_run.starts_with("Nothing is written yet."));
+        assert!(!during_a_run.contains("Press"), "{during_a_run}");
     }
 
     /// Two videos, both reviewed, with nobody asked about originals yet.
@@ -2834,8 +3137,8 @@ mod tests {
         let by_default_name = look_for_earlier_scene_files(&video, ExportOptions::default());
         let by_part = look_for_earlier_scene_files(&video, named_by_part);
         let _ = std::fs::remove_dir_all(&folder);
-        assert_eq!(by_default_name.map(|found| found.file_count), Ok(1));
-        assert_eq!(by_part.map(|found| found.file_count), Ok(2));
+        assert_eq!(by_default_name.map(|found| found.file_count()), Ok(1));
+        assert_eq!(by_part.map(|found| found.file_count()), Ok(2));
     }
 
     #[test]
@@ -2890,7 +3193,7 @@ mod tests {
             found,
             Ok(EarlierSceneFiles {
                 scene_dir: folder,
-                file_count: 0,
+                file_names: Vec::new(),
             })
         );
     }
@@ -2916,14 +3219,17 @@ mod tests {
             beside,
             Ok(EarlierSceneFiles {
                 scene_dir: folder,
-                file_count: 1,
+                file_names: vec!["film_scene_001.mp4".to_owned()],
             })
         );
         assert_eq!(
             in_new_folder,
             Ok(EarlierSceneFiles {
                 scene_dir: new_folder,
-                file_count: 2,
+                file_names: vec![
+                    "film_scene_001.mp4".to_owned(),
+                    "film_scene_002.mp4".to_owned(),
+                ],
             })
         );
     }
@@ -2957,21 +3263,23 @@ mod tests {
         let three_in_the_way = || -> Result<EarlierSceneFiles, String> {
             Ok(EarlierSceneFiles {
                 scene_dir: PathBuf::from("videos"),
-                file_count: 3,
+                file_names: EarlierSceneFiles::numbered_names(3),
             })
         };
         let review = app.queue.review_mut(job).unwrap();
         review.apply(ReviewRequest::Split, &three_in_the_way);
         assert!(review.export_obstacle().is_some());
 
-        // Nothing changed: the warning stays.
-        let options_before = app.settings.export;
-        app.forget_export_obstacles_if_scenes_go_elsewhere(options_before);
+        // A setting that has nothing to do with it: the warning stays.
+        let mut without_tips = app.settings.clone();
+        without_tips.show_tips = false;
+        app.use_settings(without_tips);
         assert!(app.queue.review(job).unwrap().export_obstacle().is_some());
 
         // Ticked in the sidebar, which sends no request to any review.
-        app.settings.export.scene_location = SceneLocation::NewFolder;
-        app.forget_export_obstacles_if_scenes_go_elsewhere(options_before);
+        let mut in_a_new_folder = app.settings.clone();
+        in_a_new_folder.export.scene_location = SceneLocation::NewFolder;
+        app.use_settings(in_a_new_folder);
         assert!(app.queue.review(job).unwrap().export_obstacle().is_none());
     }
 
@@ -2981,18 +3289,18 @@ mod tests {
         let three_in_the_way = || -> Result<EarlierSceneFiles, String> {
             Ok(EarlierSceneFiles {
                 scene_dir: PathBuf::from("videos"),
-                file_count: 3,
+                file_names: EarlierSceneFiles::numbered_names(3),
             })
         };
         let review = app.queue.review_mut(job).unwrap();
         review.apply(ReviewRequest::Split, &three_in_the_way);
         assert!(review.export_obstacle().is_some());
 
-        // Typed into the box in the sidebar. The files that were counted
-        // had the old name, so the count no longer says anything.
-        let options_before = app.settings.export;
-        app.settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
-        app.forget_export_obstacles_if_scenes_go_elsewhere(options_before);
+        // Typed into the box in the sidebar. The files that were named
+        // had the old name, so the warning no longer says anything.
+        let mut renamed = app.settings.clone();
+        renamed.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
+        app.use_settings(renamed);
         assert!(app.queue.review(job).unwrap().export_obstacle().is_none());
     }
 

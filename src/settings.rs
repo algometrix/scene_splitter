@@ -9,13 +9,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::detect::ScanSettings;
 use crate::export::{ExportOptions, OriginalPolicy};
 use crate::folder_settings::{
     self, DetectionInUse, DetectionSettings, FolderSettings, SettingsScope,
 };
 use crate::folders;
-use crate::hardcut::HardCutSettings;
 use crate::theme::ThemeChoice;
 
 const APP_FOLDER: &str = "scene_splitter";
@@ -24,14 +22,18 @@ const SETTINGS_FILE: &str = "settings.json";
 /// A missing part of the file falls back to its default, so a file written
 /// by an older version keeps working.
 ///
-/// `scan` and `hard_cuts` are the general detection settings. A video in a
-/// folder listed in `folders` is scanned with that folder's instead.
+/// `detection` holds the general detection settings. A video in a folder
+/// listed in `folders` is scanned with that folder's instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub scan: ScanSettings,
+    /// One value, the same kind a folder remembers, so that a setting added
+    /// to it is general and per folder at once. In the file its parts stand
+    /// beside the other settings, as `scan` and `hard_cuts`, where they
+    /// always stood.
+    #[serde(flatten)]
+    pub detection: DetectionSettings,
     pub export: ExportOptions,
-    pub hard_cuts: HardCutSettings,
     /// The folders whose videos are scanned with settings of their own.
     /// Empty in a file from before folders could have any.
     pub folders: FolderSettings,
@@ -59,9 +61,8 @@ impl Default for Settings {
     /// Tips start on, so a first-time user is told what to do.
     fn default() -> Self {
         Self {
-            scan: ScanSettings::default(),
+            detection: DetectionSettings::default(),
             export: ExportOptions::default(),
-            hard_cuts: HardCutSettings::default(),
             folders: FolderSettings::default(),
             show_tips: true,
             recycling_question: RecyclingQuestion::NotAskedYet,
@@ -167,10 +168,7 @@ impl Settings {
 
     /// The detection settings of videos whose folder has none of its own.
     pub fn general_detection(&self) -> DetectionSettings {
-        DetectionSettings {
-            scan: self.scan,
-            hard_cuts: self.hard_cuts,
-        }
+        self.detection
     }
 
     /// The detection settings a video is scanned with: those remembered for
@@ -224,10 +222,7 @@ impl Settings {
     pub fn change_detection_for(&mut self, video: &Path, detection: DetectionSettings) {
         match self.detection_for(video).scope {
             SettingsScope::Folder(folder) => self.folders.remember(&folder, detection),
-            SettingsScope::General => {
-                self.scan = detection.scan;
-                self.hard_cuts = detection.hard_cuts;
-            }
+            SettingsScope::General => self.detection = detection,
         }
     }
 
@@ -288,9 +283,9 @@ pub fn settings_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::detect::ScanMode;
+    use crate::detect::{ScanMode, ScanSettings};
     use crate::exact_cut::CutPrecision;
-    use crate::hardcut::Sensitivity;
+    use crate::hardcut::{HardCutSettings, Sensitivity};
     use crate::scene_name::SceneNamePattern;
     use crate::split::SceneLocation;
 
@@ -318,13 +313,13 @@ mod tests {
 
     fn changed_settings() -> Settings {
         let mut settings = Settings::default();
-        settings.scan.mode = ScanMode::EveryFrame;
-        settings.scan.criteria.min_seconds = 0.5;
+        settings.detection.scan.mode = ScanMode::EveryFrame;
+        settings.detection.scan.criteria.min_seconds = 0.5;
         settings.export.scene_location = SceneLocation::NewFolder;
         settings.export.original_policy = OriginalPolicy::Keep;
         settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
-        settings.hard_cuts.sensitivity = Sensitivity::High;
-        settings.hard_cuts.min_scene_seconds = 300.0;
+        settings.detection.hard_cuts.sensitivity = Sensitivity::High;
+        settings.detection.hard_cuts.min_scene_seconds = 300.0;
         settings.show_tips = false;
         settings.recycling_question = RecyclingQuestion::Answered;
         settings.theme = ThemeChoice::Dark;
@@ -359,8 +354,8 @@ mod tests {
 
         let loaded = Settings::load_from(&file.0).unwrap().unwrap();
         assert_eq!(loaded.export.scene_location, SceneLocation::NewFolder);
-        assert_eq!(loaded.scan, ScanSettings::default());
-        assert_eq!(loaded.hard_cuts, HardCutSettings::default());
+        assert_eq!(loaded.detection.scan, ScanSettings::default());
+        assert_eq!(loaded.detection.hard_cuts, HardCutSettings::default());
         assert!(loaded.show_tips);
     }
 
@@ -584,7 +579,7 @@ mod tests {
     fn when_the_saved_choice_cannot_be_read_originals_are_kept() {
         let fallback = Settings::defaults_that_keep_originals();
         assert_eq!(fallback.export.original_policy, OriginalPolicy::Keep);
-        assert_eq!(fallback.scan, ScanSettings::default());
+        assert_eq!(fallback.detection.scan, ScanSettings::default());
     }
 
     #[test]
@@ -598,15 +593,15 @@ mod tests {
     #[test]
     fn impossible_values_are_refused() {
         let mut settings = Settings::default();
-        settings.scan.criteria.min_seconds = 0.0;
+        settings.detection.scan.criteria.min_seconds = 0.0;
         assert!(settings.validate().is_err());
 
         let mut settings = Settings::default();
-        settings.scan.criteria.min_dark_fraction = 1.5;
+        settings.detection.scan.criteria.min_dark_fraction = 1.5;
         assert!(settings.validate().is_err());
 
         let mut settings = Settings::default();
-        settings.hard_cuts.min_scene_seconds = -1.0;
+        settings.detection.hard_cuts.min_scene_seconds = -1.0;
         assert!(settings.validate().is_err());
     }
 
@@ -674,14 +669,14 @@ mod tests {
     #[test]
     fn remembering_for_a_folder_keeps_the_settings_in_force_now() {
         let mut settings = Settings::default();
-        settings.scan.criteria.min_seconds = 0.5;
+        settings.detection.scan.criteria.min_seconds = 0.5;
         settings.remember_detection_for_folder_of(&a_tape());
         let remembered = settings.detection_for(&a_tape());
         assert_eq!(remembered.scope, SettingsScope::Folder(tapes_folder()));
         assert_eq!(remembered.detection.scan.criteria.min_seconds, 0.5);
 
         // The general settings move on, the folder's stay.
-        settings.scan.criteria.min_seconds = 2.0;
+        settings.detection.scan.criteria.min_seconds = 2.0;
         assert_eq!(
             settings
                 .detection_for(&a_tape())
@@ -738,8 +733,8 @@ mod tests {
         // The film's folder has none, so the general ones change.
         settings.change_detection_for(&a_film(), changed);
         assert_eq!(settings.general_detection(), changed);
-        assert_eq!(settings.scan, changed.scan);
-        assert_eq!(settings.hard_cuts, changed.hard_cuts);
+        assert_eq!(settings.detection.scan, changed.scan);
+        assert_eq!(settings.detection.hard_cuts, changed.hard_cuts);
     }
 
     #[test]
@@ -770,8 +765,8 @@ mod tests {
         let loaded = Settings::load_from(&file.0).unwrap().unwrap();
 
         // What the file says is kept.
-        assert_eq!(loaded.scan.mode, ScanMode::EveryFrame);
-        assert_eq!(loaded.hard_cuts.min_scene_seconds, 300.0);
+        assert_eq!(loaded.detection.scan.mode, ScanMode::EveryFrame);
+        assert_eq!(loaded.detection.hard_cuts.min_scene_seconds, 300.0);
         assert_eq!(loaded.export.scene_location, SceneLocation::NewFolder);
         assert_eq!(loaded.export.original_policy, OriginalPolicy::Keep);
         assert!(!loaded.show_tips);
@@ -821,9 +816,9 @@ mod tests {
 
         let loaded = Settings::load_from(&file.0).unwrap().unwrap();
         assert!(loaded.folders.is_empty());
-        assert_eq!(loaded.scan.mode, ScanMode::EveryFrame);
-        assert_eq!(loaded.scan.criteria.max_dark_luma, 40);
-        assert_eq!(loaded.hard_cuts.min_scene_seconds, 300.0);
+        assert_eq!(loaded.detection.scan.mode, ScanMode::EveryFrame);
+        assert_eq!(loaded.detection.scan.criteria.max_dark_luma, 40);
+        assert_eq!(loaded.detection.hard_cuts.min_scene_seconds, 300.0);
         assert_eq!(
             loaded.detection_for(&a_tape()).scope,
             SettingsScope::General
@@ -850,5 +845,15 @@ mod tests {
     #[test]
     fn the_defaults_are_valid() {
         assert!(Settings::default().validate().is_ok());
+    }
+
+    #[test]
+    fn the_general_detection_settings_are_saved_where_they_always_were() {
+        // One value in the program, two entries of their own in the file,
+        // which is the layout every earlier version wrote and reads.
+        let saved = serde_json::to_value(Settings::default()).unwrap();
+        assert!(saved.get("scan").is_some(), "{saved}");
+        assert!(saved.get("hard_cuts").is_some(), "{saved}");
+        assert!(saved.get("detection").is_none(), "{saved}");
     }
 }

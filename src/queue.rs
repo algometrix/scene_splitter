@@ -837,7 +837,7 @@ mod tests {
                 decoded_frames: 0,
                 decoded_windows: 0,
                 hard_cut_candidates: None,
-                chapters: None,
+                chapters: crate::detect::ChapterMarks::NeverRead,
             },
             source: DetectionSource::FreshScan,
             undecoded: Vec::new(),
@@ -1700,7 +1700,7 @@ mod tests {
     fn earlier_files_in_the_way() -> Result<crate::review_session::EarlierSceneFiles, String> {
         Ok(crate::review_session::EarlierSceneFiles {
             scene_dir: test_sessions::scene_dir(),
-            file_count: 3,
+            file_names: crate::review_session::EarlierSceneFiles::numbered_names(3),
         })
     }
 

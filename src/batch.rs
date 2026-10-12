@@ -24,9 +24,69 @@ pub enum SplitOutcome {
     /// the person never agreed to replace those. The video is back in
     /// review with that question open.
     EarlierFilesInTheWay,
+    /// Splits were placed on exact pictures, and cuts are no longer exact,
+    /// so a copy cannot make them. The video is back in review with that
+    /// question open.
+    SplitsOnExactPictures,
+    /// The split could move the original to the Recycle Bin or Trash, and
+    /// the person was never asked about that. The video stays ready, and
+    /// the next run asks before it starts.
+    OriginalNotSettled,
     /// The person took the video back into review before its turn came.
     NoLongerReady,
 }
+
+/// What a run says about the videos whose turn ended one way: about one of
+/// them, and about several.
+struct Trouble {
+    outcome: SplitOutcome,
+    one_video: &'static str,
+    several_videos: &'static str,
+}
+
+/// Everything that can keep a turn from ending cleanly, each with what to do
+/// about it, in the order a summary says them.
+const TROUBLES: [Trouble; 6] = [
+    Trouble {
+        outcome: SplitOutcome::NeedsALook,
+        one_video: "1 was split, but the result needs a look. Open it to see why.",
+        several_videos: "were split, but the results need a look. Open each one to see why.",
+    },
+    Trouble {
+        outcome: SplitOutcome::Failed,
+        one_video: "1 was not split. Its original was not changed. \
+                    Open it to go back to its review.",
+        several_videos: "were not split. Their originals were not changed. \
+                         Open each one to go back to its review.",
+    },
+    Trouble {
+        outcome: SplitOutcome::EarlierFilesInTheWay,
+        one_video: "1 was not split, because scene files from an earlier split are in the way. \
+                    Open it to decide.",
+        several_videos: "were not split, because scene files from an earlier split are in \
+                         the way. Open each one to decide.",
+    },
+    Trouble {
+        outcome: SplitOutcome::SplitsOnExactPictures,
+        one_video: "1 was not split, because some of its splits are on exact pictures and \
+                    exact cuts are off. Open it to decide.",
+        several_videos: "were not split, because some of their splits are on exact pictures \
+                         and exact cuts are off. Open each one to decide.",
+    },
+    Trouble {
+        outcome: SplitOutcome::OriginalNotSettled,
+        one_video: "1 was not split, because you have not been asked yet what happens to its \
+                    original. It is still ready. Split the ready videos again to be asked.",
+        several_videos: "were not split, because you have not been asked yet what happens to \
+                         their originals. They are still ready. Split the ready videos again \
+                         to be asked.",
+    },
+    Trouble {
+        outcome: SplitOutcome::NoLongerReady,
+        one_video: "1 was skipped by this run, because it was taken back into review.",
+        several_videos: "were skipped by this run, because they were taken back into review.",
+    },
+];
 
 /// How far a run has come.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,30 +182,11 @@ impl SplitBatch {
                 counted_videos(self.video_count)
             )
         }];
-        let troubles = [
-            (
-                SplitOutcome::NeedsALook,
-                "split, but the result needs a look. Open it to see why.",
-            ),
-            (
-                SplitOutcome::Failed,
-                "not split. The original was not changed. Open it to go back to its review.",
-            ),
-            (
-                SplitOutcome::EarlierFilesInTheWay,
-                "not split, because scene files from an earlier split are in the way. \
-                 Open it to decide.",
-            ),
-            (
-                SplitOutcome::NoLongerReady,
-                "left out, because it was taken back into review.",
-            ),
-        ];
-        for (outcome, what_happened) in troubles {
-            match self.count(outcome) {
+        for trouble in &TROUBLES {
+            match self.count(trouble.outcome) {
                 0 => {}
-                1 => sentences.push(format!("1 was {what_happened}")),
-                several => sentences.push(format!("{several} were {what_happened}")),
+                1 => sentences.push(trouble.one_video.to_owned()),
+                several => sentences.push(format!("{several} {}", trouble.several_videos)),
             }
         }
         sentences.join(" ")
@@ -304,8 +345,8 @@ mod tests {
         assert_eq!(
             batch.summary(),
             "Split and checked: 2 of 5 videos. \
-             2 were not split. The original was not changed. \
-             Open it to go back to its review. \
+             2 were not split. Their originals were not changed. \
+             Open each one to go back to its review. \
              1 was not split, because scene files from an earlier split are in the way. \
              Open it to decide."
         );
@@ -317,21 +358,63 @@ mod tests {
             SplitOutcome::NeedsALook,
             SplitOutcome::Failed,
             SplitOutcome::EarlierFilesInTheWay,
+            SplitOutcome::SplitsOnExactPictures,
+            SplitOutcome::OriginalNotSettled,
             SplitOutcome::NoLongerReady,
         ]);
         let summary = batch.summary();
         assert!(
-            summary.starts_with("Split and checked: 0 of 4 videos."),
+            summary.starts_with("Split and checked: 0 of 6 videos."),
             "{summary}"
         );
         for said in [
             "the result needs a look",
-            "The original was not changed",
+            "Its original was not changed",
             "are in the way",
-            "taken back into review",
+            "on exact pictures",
+            "It is still ready",
+            "skipped by this run",
         ] {
             assert!(summary.contains(said), "{summary}");
         }
+    }
+
+    #[test]
+    fn a_sentence_about_several_videos_does_not_speak_of_one() {
+        for trouble in &TROUBLES {
+            let batch = run_ending(&[trouble.outcome, trouble.outcome]);
+            let summary = batch.summary();
+            let about_them = summary
+                .strip_prefix("Split and checked: 0 of 2 videos. ")
+                .unwrap_or_else(|| panic!("{summary}"));
+            assert!(about_them.starts_with("2 were "), "{about_them}");
+            for singular in [" it ", " it.", "Its ", "It is", "The original "] {
+                assert!(!about_them.contains(singular), "{about_them}");
+            }
+            // And the sentence about one video does not speak of several.
+            let about_one = trouble.one_video;
+            assert!(about_one.starts_with("1 was "), "{about_one}");
+            for plural in ["their", "Their", "They", "each one"] {
+                assert!(!about_one.contains(plural), "{about_one}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_outcome_but_a_clean_one_has_its_sentence() {
+        let with_a_sentence: Vec<SplitOutcome> =
+            TROUBLES.iter().map(|trouble| trouble.outcome).collect();
+        for outcome in [
+            SplitOutcome::NeedsALook,
+            SplitOutcome::Failed,
+            SplitOutcome::EarlierFilesInTheWay,
+            SplitOutcome::SplitsOnExactPictures,
+            SplitOutcome::OriginalNotSettled,
+            SplitOutcome::NoLongerReady,
+        ] {
+            assert!(with_a_sentence.contains(&outcome), "{outcome:?}");
+        }
+        assert!(!with_a_sentence.contains(&SplitOutcome::Clean));
     }
 
     #[test]
@@ -339,7 +422,7 @@ mod tests {
         assert_eq!(
             run_ending(&[SplitOutcome::Failed]).summary(),
             "Split and checked: 0 of 1 video. 1 was not split. \
-             The original was not changed. Open it to go back to its review."
+             Its original was not changed. Open it to go back to its review."
         );
     }
 }

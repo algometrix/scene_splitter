@@ -87,11 +87,72 @@ pub struct Detection {
     /// not look for hard cuts.
     #[serde(default)]
     pub hard_cut_candidates: Option<Vec<HardCutCandidate>>,
-    /// The chapter marks the file carries, or `None` for a scan stored
-    /// before chapters were read. Left out of a stored scan in that case, so
-    /// the file keeps the layout earlier versions wrote.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chapters: Option<Vec<Chapter>>,
+    /// The chapter marks the file carries, as far as they are known. Left
+    /// out of a stored scan unless they were read, so the file keeps the
+    /// layout earlier versions wrote, and marks that could not be read are
+    /// looked for again the next time.
+    #[serde(default, skip_serializing_if = "ChapterMarks::are_not_known")]
+    pub chapters: ChapterMarks,
+}
+
+/// What is known of the chapter marks of a video.
+///
+/// Chapter marks are an extra beside what the scan finds. Failing to read
+/// them is therefore no reason to fail a scan, or to throw away a stored
+/// one: the scan goes on without them and carries the reason.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(from = "Option<Vec<Chapter>>", into = "Option<Vec<Chapter>>")]
+pub enum ChapterMarks {
+    /// Nobody looked: the scan was stored before chapters were read.
+    #[default]
+    NeverRead,
+    /// What the file carries. Most videos have none, which is an empty
+    /// list here and not the same as never having looked.
+    Read(Vec<Chapter>),
+    /// Looking failed, for this reason. The video is treated as having no
+    /// chapter marks, and the person is told.
+    CouldNotRead(String),
+}
+
+impl ChapterMarks {
+    /// Reads the chapter marks of `video`. Never fails: a file whose marks
+    /// cannot be read is still a video that can be scanned and split.
+    pub fn read_from(video: &Path) -> Self {
+        match probe::read_chapters(video) {
+            Ok(chapters) => Self::Read(chapters),
+            Err(error) => Self::CouldNotRead(format!("{error:#}")),
+        }
+    }
+
+    fn are_not_known(&self) -> bool {
+        match self {
+            Self::NeverRead | Self::CouldNotRead(_) => true,
+            Self::Read(_) => false,
+        }
+    }
+
+    /// Why the marks could not be read, when that is so.
+    pub fn problem(&self) -> Option<&str> {
+        match self {
+            Self::CouldNotRead(reason) => Some(reason),
+            Self::NeverRead | Self::Read(_) => None,
+        }
+    }
+}
+
+impl From<Option<Vec<Chapter>>> for ChapterMarks {
+    fn from(stored: Option<Vec<Chapter>>) -> Self {
+        stored.map_or(Self::NeverRead, Self::Read)
+    }
+}
+
+impl From<ChapterMarks> for Option<Vec<Chapter>> {
+    fn from(marks: ChapterMarks) -> Self {
+        match marks {
+            ChapterMarks::Read(chapters) => Some(chapters),
+            ChapterMarks::NeverRead | ChapterMarks::CouldNotRead(_) => None,
+        }
+    }
 }
 
 impl Detection {
@@ -112,9 +173,17 @@ impl Detection {
     }
 
     /// The chapter marks of the file: none when it has none, or when they
-    /// were never read.
+    /// were never read or could not be.
     pub fn chapter_marks(&self) -> &[Chapter] {
-        self.chapters.as_deref().unwrap_or_default()
+        match &self.chapters {
+            ChapterMarks::Read(chapters) => chapters,
+            ChapterMarks::NeverRead | ChapterMarks::CouldNotRead(_) => &[],
+        }
+    }
+
+    /// How long one picture of the video is shown, on average.
+    pub fn frame_seconds(&self) -> f64 {
+        self.video.seconds() / self.frame_count.max(1) as f64
     }
 
     /// What the chapter marks add to `detected_cuts`, the cuts a review or a
@@ -211,7 +280,7 @@ pub fn scan_for_scene_changes(
     on_progress: OnScanProgress,
 ) -> Result<ScanOutcome> {
     let index = probe::read_packet_index(video)?;
-    let chapters = probe::read_chapters(video)?;
+    let chapters = ChapterMarks::read_from(video);
     let packets = &index.packets;
     let criteria = &settings.criteria;
 
@@ -286,10 +355,60 @@ pub fn scan_for_scene_changes(
             decoded_frames,
             decoded_windows: windows.len(),
             hard_cut_candidates,
-            chapters: Some(chapters),
+            chapters,
         },
         undecoded,
     })
+}
+
+#[cfg(test)]
+mod chapter_mark_tests {
+    use super::*;
+
+    fn stored(marks: &ChapterMarks) -> String {
+        serde_json::to_string(marks).unwrap()
+    }
+
+    #[test]
+    fn chapter_marks_that_were_read_are_stored_as_the_list_they_always_were() {
+        let read = ChapterMarks::Read(vec![Chapter {
+            start: 12.5,
+            title: Some("Opening".to_owned()),
+        }]);
+        assert_eq!(stored(&read), r#"[{"start":12.5,"title":"Opening"}]"#);
+        assert_eq!(
+            serde_json::from_str::<ChapterMarks>(&stored(&read)).unwrap(),
+            read
+        );
+        // A file without chapters is not one that was never looked at.
+        assert_eq!(
+            serde_json::from_str::<ChapterMarks>("[]").unwrap(),
+            ChapterMarks::Read(Vec::new())
+        );
+    }
+
+    #[test]
+    fn marks_that_could_not_be_read_are_looked_for_again_next_time() {
+        let failed = ChapterMarks::CouldNotRead("ffprobe ran out of time".to_owned());
+        assert_eq!(failed.problem(), Some("ffprobe ran out of time"));
+        assert!(failed.are_not_known());
+        assert!(ChapterMarks::NeverRead.are_not_known());
+        assert!(!ChapterMarks::Read(Vec::new()).are_not_known());
+        // What is not known is stored as nothing, which loads as never read.
+        assert_eq!(stored(&failed), "null");
+        assert_eq!(
+            serde_json::from_str::<ChapterMarks>("null").unwrap(),
+            ChapterMarks::NeverRead
+        );
+        assert_eq!(ChapterMarks::NeverRead.problem(), None);
+    }
+
+    #[test]
+    fn a_file_that_is_no_video_has_no_chapter_marks_and_a_reason() {
+        // The tools are not even needed to fail on a path that is not there.
+        let marks = ChapterMarks::read_from(Path::new("no_such_folder/no_such_video.mp4"));
+        assert!(marks.problem().is_some(), "{marks:?}");
+    }
 }
 
 #[cfg(test)]

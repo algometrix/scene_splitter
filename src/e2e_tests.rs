@@ -222,7 +222,10 @@ fn a_video_without_chapters_is_scanned_as_having_none() {
     let detection = scan(&video, ScanMode::Suspicious, ScanDepth::BlackScreens);
 
     // Looked for and not found, which is not the same as never looked for.
-    assert_eq!(detection.chapters, Some(Vec::new()));
+    assert_eq!(
+        detection.chapters,
+        crate::detect::ChapterMarks::Read(Vec::new())
+    );
     assert!(detection.chapter_splits(&detection.cuts).cuts.is_empty());
 }
 

@@ -29,13 +29,31 @@ use crate::settings::SettingsChange;
 use crate::thumbnails;
 use crate::timecode::{format_timestamp, parse_timestamp, TimeSpan};
 
+const CHAPTERS_NOT_READ: &str = "The chapter marks of this file could not be read.";
+
 /// What looking for the scene files of an earlier split found.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EarlierSceneFiles {
     /// The folder the scenes of this video would be written to now.
     pub scene_dir: PathBuf,
-    /// How many scene files of this video are in it already.
-    pub file_count: usize,
+    /// The names of the scene files of this video that are in it already,
+    /// in name order. The person is shown them before any is replaced.
+    pub file_names: Vec<String>,
+}
+
+impl EarlierSceneFiles {
+    pub fn file_count(&self) -> usize {
+        self.file_names.len()
+    }
+
+    /// `count` file names as the default pattern gives them, for a test
+    /// that only cares how many files are in the way.
+    #[cfg(test)]
+    pub fn numbered_names(count: usize) -> Vec<String> {
+        (1..=count)
+            .map(|number| format!("no_such_video_scene_{number:03}.mp4"))
+            .collect()
+    }
 }
 
 /// Why the split has not started after the person asked for it.
@@ -46,6 +64,15 @@ pub enum ExportObstacle {
     EarlierSceneFiles(EarlierSceneFiles),
     /// The folder the scenes go to could not be looked into.
     CouldNotCheck(String),
+    /// Splits at these times were placed or moved onto exact pictures, and
+    /// cuts are no longer exact. A copy cannot cut there: each scene would
+    /// start at the next point where the video can be cut, and not where it
+    /// was reviewed.
+    SplitsOffCutPoints(Vec<f64>),
+    /// The person asked for such splits to be moved, and those at these
+    /// times could not be: the nearest point where the video can be cut is
+    /// taken by, or lies beyond, the split beside them.
+    SplitsStuckOffCutPoints(Vec<f64>),
 }
 
 /// How asking for a new split, or for a split to be moved, went, for the
@@ -53,7 +80,7 @@ pub enum ExportObstacle {
 #[derive(Debug, PartialEq)]
 pub enum SplitFeedback {
     /// A split was added at this time of the video, the nearest point where
-    /// it can be cut without encoding.
+    /// it can be cut as it is.
     Added(f64),
     /// A split was added at the very time that was asked for.
     AddedExactly(f64),
@@ -79,11 +106,11 @@ impl SplitFeedback {
     pub fn in_words(&self) -> String {
         match self {
             Self::Added(cut_time) => format!(
-                "Split at {}, the nearest point where the video can be cut.",
+                "Added a split at {}, the nearest point where the video can be cut.",
                 format_timestamp(*cut_time)
             ),
             Self::AddedExactly(cut_time) => format!(
-                "Split at exactly {}. A few seconds around it are encoded again when you split.",
+                "Added a split at exactly {}. A few seconds around it are encoded again when you split.",
                 format_timestamp(*cut_time)
             ),
             Self::Refused(why) => why.to_string(),
@@ -164,6 +191,9 @@ pub enum ReviewRequest {
     /// Join the scenes on both sides of every split that comes from a
     /// chapter mark of the file.
     LeaveOutChapterSplits,
+    /// Move every split that stands on an exact picture to the nearest
+    /// point where the video can be cut as it is.
+    MoveSplitsToCutPoints,
     Split,
     /// The scenes are right, but split this video later, together with the
     /// other videos that are ready.
@@ -297,8 +327,7 @@ impl ReviewSession {
             source,
             undecoded,
         } = scan;
-        let video_length = detection.video.seconds();
-        let frame_seconds = video_length / detection.frame_count.max(1) as f64;
+        let frame_seconds = detection.frame_seconds();
         let black_screens = counted(detection.black_screens.len(), "black screen");
         let hard_cuts = cuts.len().saturating_sub(detection.cuts.len());
         let found = if hard_cuts > 0 {
@@ -320,17 +349,20 @@ impl ReviewSession {
             DetectionSource::StoredScan => format!("{found} Using the scan from last time."),
         };
         let decoded = format!(
-            "{} of {} frames were decoded to find them.",
+            "The scan looked at {} of {} pictures to find them.",
             detection.decoded_frames, detection.frame_count
         );
         let chapter_mark_count = detection.chapter_marks().len();
-        let scan_details = if chapter_mark_count > 0 {
-            format!(
-                "{decoded} The file has {}.",
-                counted(chapter_mark_count, "chapter mark")
-            )
-        } else {
-            decoded
+        let scan_details = match (detection.chapters.problem(), chapter_mark_count) {
+            (Some(problem), _) => format!("{decoded} {CHAPTERS_NOT_READ} ({problem})"),
+            (None, 0) => decoded,
+            (None, marks) => format!("{decoded} The file has {}.", counted(marks, "chapter mark")),
+        };
+        // Said where it is read without pointing: scenes the file marks
+        // may be missing from the list.
+        let scan_summary = match detection.chapters.problem() {
+            Some(_) => format!("{scan_summary} {CHAPTERS_NOT_READ}"),
+            None => scan_summary,
         };
         let mut plan = SplitPlan::from_detected_cuts(&cuts, detection.keyframe_times);
         plan.propose_chapter_cuts(&chapter_splits.cuts);
@@ -378,11 +410,34 @@ impl ReviewSession {
     pub fn may_split_over(&self, found: &Result<EarlierSceneFiles, String>) -> bool {
         match found {
             Ok(earlier_files) => {
-                earlier_files.file_count == 0
+                earlier_files.file_count() == 0
                     || self.replacing_agreed_in.as_deref() == Some(&earlier_files.scene_dir)
             }
             Err(_could_not_look) => false,
         }
+    }
+
+    /// The splits a split of this review cannot make where they stand when
+    /// it cuts with `precision`. None when cuts are exact. A copy can only
+    /// cut at certain points, and splits placed or moved while cuts were
+    /// exact may stand between them.
+    pub fn splits_off_cut_points_for(&self, precision: CutPrecision) -> Vec<f64> {
+        match precision {
+            CutPrecision::NearestKeyframe => self.plan.splits_off_cut_points(),
+            CutPrecision::ExactFrame => Vec::new(),
+        }
+    }
+
+    /// The turn of this video in the run over the ready videos came, and
+    /// `obstacle` stood in the way of its split. Nobody is asked in the
+    /// middle of a run, so the question is left open here, for the person
+    /// to find when they open the video. The video was to be split with the
+    /// ready ones, and that is where it goes back to once they have dealt
+    /// with the obstacle.
+    pub fn hold_back_from_the_ready_run(&mut self, obstacle: ExportObstacle) {
+        self.export_obstacle = Some(obstacle);
+        self.split_asked_for = SplitTiming::WithTheReadyVideos;
+        self.replacing_agreed_in = None;
     }
 
     /// Says where the splits the person adds from now on land: on the
@@ -529,7 +584,7 @@ impl ReviewSession {
         self.can_undo() || !self.plan.is_as_detected()
     }
 
-    /// Whether "Undo merge" has a merged scene to take apart.
+    /// Whether "Take merged scenes apart" has a merged scene to take apart.
     pub fn has_merged_scene_selected(&self) -> bool {
         self.layouts_to_take_apart()
             .iter()
@@ -622,6 +677,7 @@ impl ReviewSession {
             ReviewRequest::Undo => self.undo(),
             ReviewRequest::ResetScenes => self.edit_plan(SplitPlan::reset_to_detected),
             ReviewRequest::LeaveOutChapterSplits => self.edit_plan(SplitPlan::merge_chapter_cuts),
+            ReviewRequest::MoveSplitsToCutPoints => self.move_splits_to_cut_points(),
             ReviewRequest::Split => {
                 return self.ask_to_split(look_for_earlier_scene_files(), SplitTiming::Now);
             }
@@ -665,7 +721,8 @@ impl ReviewSession {
     }
 
     /// Splitting replaces files of the same name, so existing scene files
-    /// need a second, explicit confirmation.
+    /// need a second, explicit confirmation. And a split that cannot cut
+    /// where the person placed it does not start at all.
     fn ask_to_split(
         &mut self,
         found: Result<EarlierSceneFiles, String>,
@@ -674,14 +731,37 @@ impl ReviewSession {
         self.split_asked_for = timing;
         // Leave given earlier was for what was on disk then.
         self.replacing_agreed_in = None;
-        self.export_obstacle = match found {
-            Ok(nothing_in_the_way) if nothing_in_the_way.file_count == 0 => None,
-            Ok(earlier_files) => Some(ExportObstacle::EarlierSceneFiles(earlier_files)),
-            Err(problem) => Some(ExportObstacle::CouldNotCheck(problem)),
-        };
+        self.export_obstacle = self.obstacle_to_a_split(found);
         match self.export_obstacle {
             None => Some(timing.follow_up()),
             Some(_) => None,
+        }
+    }
+
+    fn obstacle_to_a_split(
+        &self,
+        found: Result<EarlierSceneFiles, String>,
+    ) -> Option<ExportObstacle> {
+        // Before the files: moving the splits changes the plan, and leave to
+        // replace files is given for one plan.
+        let off_cut_points = self.splits_off_cut_points_for(self.new_split_precision);
+        if !off_cut_points.is_empty() {
+            return Some(ExportObstacle::SplitsOffCutPoints(off_cut_points));
+        }
+        match found {
+            Ok(nothing_in_the_way) if nothing_in_the_way.file_count() == 0 => None,
+            Ok(earlier_files) => Some(ExportObstacle::EarlierSceneFiles(earlier_files)),
+            Err(problem) => Some(ExportObstacle::CouldNotCheck(problem)),
+        }
+    }
+
+    /// Moves the splits that stand on exact pictures to where a copy can
+    /// cut. It is an edit like any other, so Undo takes it back. Those that
+    /// cannot move are named, since the split still cannot start with them.
+    fn move_splits_to_cut_points(&mut self) {
+        let stuck = self.edit_plan(SplitPlan::move_splits_to_cut_points);
+        if !stuck.is_empty() {
+            self.export_obstacle = Some(ExportObstacle::SplitsStuckOffCutPoints(stuck));
         }
     }
 
@@ -992,7 +1072,7 @@ pub mod test_sessions {
             decoded_frames: 0,
             decoded_windows: 0,
             hard_cut_candidates: None,
-            chapters: None,
+            chapters: crate::detect::ChapterMarks::NeverRead,
         }
     }
 
@@ -1006,7 +1086,7 @@ pub mod test_sessions {
     pub fn nothing_in_the_way() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: scene_dir(),
-            file_count: 0,
+            file_names: EarlierSceneFiles::numbered_names(0),
         })
     }
 }
@@ -1042,7 +1122,7 @@ mod tests {
     fn three_earlier_files() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: test_sessions::scene_dir(),
-            file_count: 3,
+            file_names: EarlierSceneFiles::numbered_names(3),
         })
     }
 
@@ -1054,14 +1134,14 @@ mod tests {
     fn two_earlier_files_in_the_new_folder() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: new_folder(),
-            file_count: 2,
+            file_names: EarlierSceneFiles::numbered_names(2),
         })
     }
 
     fn an_empty_new_folder() -> Result<EarlierSceneFiles, String> {
         Ok(EarlierSceneFiles {
             scene_dir: new_folder(),
-            file_count: 0,
+            file_names: EarlierSceneFiles::numbered_names(0),
         })
     }
 
@@ -1114,7 +1194,7 @@ mod tests {
         assert!(session.undecoded().is_empty());
         assert_eq!(
             session.scan_details(),
-            "0 of 3000 frames were decoded to find them."
+            "The scan looked at 0 of 3000 pictures to find them."
         );
         assert_eq!(session.frame_seconds(), 100.0 / 3000.0);
     }
@@ -1528,7 +1608,7 @@ mod tests {
         assert!(!feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "Split at 00:00:50.000, the nearest point where the video can be cut."
+            "Added a split at 00:00:50.000, the nearest point where the video can be cut."
         );
         assert_eq!(
             session.scene_ends(),
@@ -1548,7 +1628,7 @@ mod tests {
         assert!(!feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "Split at exactly 00:00:47.360. A few seconds around it are encoded again when you split."
+            "Added a split at exactly 00:00:47.360. A few seconds around it are encoded again when you split."
         );
         assert_eq!(
             session.scene_ends(),
@@ -1585,6 +1665,156 @@ mod tests {
         assert_eq!(session.0.split_near(47.36), SplitFeedback::Added(50.0));
     }
 
+    /// Five scenes with one split added on an exact picture, at 47.36 s,
+    /// between the points at 40 and 50 s where the video can be cut. Cuts
+    /// have been turned off exact again since.
+    fn session_with_an_exact_split_and_exact_cuts_off() -> ReviewSession {
+        let mut session = test_sessions::five_scenes();
+        session.place_new_splits(CutPrecision::ExactFrame);
+        assert_eq!(
+            session.split_near(47.36),
+            SplitFeedback::AddedExactly(47.36)
+        );
+        session.place_new_splits(CutPrecision::NearestKeyframe);
+        session
+    }
+
+    #[test]
+    fn a_copy_does_not_start_over_a_split_placed_on_an_exact_picture() {
+        let mut session = session_with_an_exact_split_and_exact_cuts_off();
+
+        // The files are not even looked for: this comes first.
+        assert_eq!(session.apply(ReviewRequest::Split, &no_earlier_files), None);
+        assert_eq!(
+            session.export_obstacle(),
+            Some(&ExportObstacle::SplitsOffCutPoints(vec![47.36]))
+        );
+        assert_eq!(
+            session.apply(ReviewRequest::SplitLater, &no_earlier_files),
+            None
+        );
+        assert!(session.export_obstacle().is_some());
+    }
+
+    #[test]
+    fn with_exact_cuts_on_a_split_on_an_exact_picture_is_no_obstacle() {
+        let mut session = session_with_an_exact_split_and_exact_cuts_off();
+        session.place_new_splits(CutPrecision::ExactFrame);
+
+        assert_eq!(
+            session.apply(ReviewRequest::Split, &no_earlier_files),
+            Some(FollowUp::Export)
+        );
+        assert_eq!(session.export_obstacle(), None);
+    }
+
+    #[test]
+    fn moving_the_exact_splits_to_cut_points_lets_the_split_start_and_can_be_undone() {
+        let mut session = session_with_an_exact_split_and_exact_cuts_off();
+        session.apply(ReviewRequest::Split, &no_earlier_files);
+
+        session.apply(ReviewRequest::MoveSplitsToCutPoints, &no_disk);
+        assert_eq!(session.export_obstacle(), None);
+        assert_eq!(
+            session.accepted_cuts().as_slice(),
+            [20.0, 40.0, 50.0, 60.0, 80.0]
+        );
+        assert_eq!(
+            session.apply(ReviewRequest::Split, &no_earlier_files),
+            Some(FollowUp::Export)
+        );
+
+        session.apply(ReviewRequest::Undo, &no_disk);
+        assert_eq!(
+            session.accepted_cuts().as_slice(),
+            [20.0, 40.0, 47.36, 60.0, 80.0]
+        );
+    }
+
+    #[test]
+    fn an_exact_split_whose_cut_point_is_taken_stays_and_is_named() {
+        let mut session = test_sessions::five_scenes();
+        session.place_new_splits(CutPrecision::ExactFrame);
+        // The nearest point where the video can be cut is 40 s, where the
+        // scan's own split stands.
+        session.split_near(41.0);
+        session.place_new_splits(CutPrecision::NearestKeyframe);
+        session.apply(ReviewRequest::Split, &no_earlier_files);
+
+        session.apply(ReviewRequest::MoveSplitsToCutPoints, &no_disk);
+        assert_eq!(
+            session.export_obstacle(),
+            Some(&ExportObstacle::SplitsStuckOffCutPoints(vec![41.0]))
+        );
+        // And the split still does not start.
+        assert_eq!(session.apply(ReviewRequest::Split, &no_earlier_files), None);
+        assert_eq!(
+            session.export_obstacle(),
+            Some(&ExportObstacle::SplitsOffCutPoints(vec![41.0]))
+        );
+    }
+
+    #[test]
+    fn which_splits_a_copy_cannot_make_depends_on_how_the_split_cuts() {
+        let session = session_with_an_exact_split_and_exact_cuts_off();
+        assert_eq!(
+            session.splits_off_cut_points_for(CutPrecision::NearestKeyframe),
+            vec![47.36]
+        );
+        assert_eq!(
+            session.splits_off_cut_points_for(CutPrecision::ExactFrame),
+            Vec::<f64>::new()
+        );
+    }
+
+    #[test]
+    fn a_video_held_back_from_the_ready_run_goes_back_to_the_ready_ones_on_agreeing() {
+        let mut session = test_sessions::five_scenes();
+        // The person once asked for this video to be split at once, and
+        // then marked it ready after all.
+        session.apply(ReviewRequest::Split, &three_earlier_files);
+        let Ok(found) = three_earlier_files() else {
+            panic!("the fixture finds three files");
+        };
+        let scene_dir = found.scene_dir.clone();
+
+        session.hold_back_from_the_ready_run(ExportObstacle::EarlierSceneFiles(found));
+        assert!(matches!(
+            session.export_obstacle(),
+            Some(ExportObstacle::EarlierSceneFiles(_))
+        ));
+        // Agreeing does not split this one video by itself, beside a run
+        // that may still be going.
+        assert_eq!(
+            session.apply(
+                ReviewRequest::ReplaceEarlierFiles { scene_dir },
+                &three_earlier_files
+            ),
+            Some(FollowUp::MarkReady)
+        );
+    }
+
+    #[test]
+    fn chapter_marks_that_could_not_be_read_are_said_and_the_review_goes_on() {
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
+        detection.chapters =
+            crate::detect::ChapterMarks::CouldNotRead("ffprobe ran out of time".to_owned());
+        let session = test_sessions::fresh_scan_of(detection);
+
+        assert_eq!(session.scene_count(), 5);
+        assert_eq!(
+            session.scan_summary(),
+            "Found 0 black screens. The chapter marks of this file could not be read."
+        );
+        assert!(
+            session
+                .scan_details()
+                .ends_with("(ffprobe ran out of time)"),
+            "{}",
+            session.scan_details()
+        );
+    }
+
     #[test]
     fn an_exact_split_outside_the_video_is_refused() {
         let mut session = Session::five_scenes();
@@ -1610,7 +1840,7 @@ mod tests {
         assert!(feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "There is already a split point at 00:00:40.000."
+            "There is already a split at 00:00:40.000."
         );
         assert_eq!(session.0.scene_count(), 5);
     }
@@ -2030,7 +2260,7 @@ mod tests {
             session.export_obstacle(),
             Some(&ExportObstacle::EarlierSceneFiles(EarlierSceneFiles {
                 scene_dir: test_sessions::scene_dir(),
-                file_count: 3,
+                file_names: EarlierSceneFiles::numbered_names(3),
             }))
         );
 
@@ -2060,7 +2290,7 @@ mod tests {
             session.export_obstacle(),
             Some(&ExportObstacle::EarlierSceneFiles(EarlierSceneFiles {
                 scene_dir: new_folder(),
-                file_count: 2,
+                file_names: EarlierSceneFiles::numbered_names(2),
             }))
         );
 
@@ -2268,7 +2498,7 @@ mod tests {
     /// where the scan found nothing.
     fn five_scenes_with_chapters() -> ReviewSession {
         let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
-        detection.chapters = Some(vec![
+        detection.chapters = crate::detect::ChapterMarks::Read(vec![
             chapter(0.0, "Opening"),
             chapter(31.0, "The plan"),
             chapter(40.0, "The heist"),
@@ -2299,7 +2529,7 @@ mod tests {
         );
         assert_eq!(
             session.scan_details(),
-            "0 of 3000 frames were decoded to find them. The file has 4 chapter marks."
+            "The scan looked at 0 of 3000 pictures to find them. The file has 4 chapter marks."
         );
     }
 
@@ -2315,7 +2545,7 @@ mod tests {
     #[test]
     fn a_stored_scan_with_chapters_says_both_things() {
         let mut detection = test_sessions::scenes_of_twenty_seconds_detected(5);
-        detection.chapters = Some(vec![chapter(31.0, "The plan")]);
+        detection.chapters = crate::detect::ChapterMarks::Read(vec![chapter(31.0, "The plan")]);
         let session = test_sessions::review_of(SourcedDetection {
             detection,
             source: DetectionSource::StoredScan,

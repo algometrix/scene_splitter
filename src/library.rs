@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::split;
+use crate::scene_name;
 
 /// Files in a folder with one of these extensions count as videos.
 pub const VIDEO_EXTENSIONS: [&str; 12] = [
@@ -33,7 +33,7 @@ pub fn videos_at(path: &Path) -> Result<Vec<PathBuf>> {
             .path();
         if entry_path.is_file()
             && has_video_extension(&entry_path)
-            && !split::is_scene_file(&entry_path)
+            && !scene_name::is_default_scene_file(&entry_path)
         {
             videos.push(entry_path);
         }

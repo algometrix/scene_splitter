@@ -8,9 +8,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::fnv1a_64;
+use crate::export::TRASH_NAME;
 use crate::fates::{SceneFate, ScenesToWrite};
 use crate::ffmpeg::{Program, TimeLimit, COPY_SCENE_STREAMS};
-use crate::scene_name::{SceneNamePattern, SceneNaming};
+use crate::folder_settings::SYSTEM_PATH_CASE;
+use crate::scene_name::{self, SceneNamePattern, SceneNaming, FIRST_SCENE_NUMBER};
 use crate::scenes::CutTimes;
 use crate::timecode::TimeSpan;
 use crate::tools;
@@ -28,15 +30,12 @@ const CUT_MARGIN_SECONDS: f64 = 0.001;
 /// pauses.
 const COPY_STALL_LIMIT: TimeLimit = TimeLimit::Silence(Duration::from_secs(120));
 
-const FIRST_SCENE_NUMBER: usize = 1;
-const SCENE_NUMBER_DIGITS: usize = 3;
-/// Unless the person chose another name in Settings, scene files are named
-/// "<video name>_scene_001.<extension>".
-const SCENE_NAME_MARKER: &str = "_scene_";
 const NEW_FOLDER_SUFFIX: &str = "_scenes";
 /// Scenes are written into "unfinished_<number of the video's name>" inside
 /// the folder they go to, as "001.<extension>" and so on, and moved out of
-/// it when the split has worked.
+/// it when the split has worked. A split into a thousand scenes or more
+/// goes on with "1000.<extension>".
+const UNFINISHED_NUMBER_DIGITS: usize = 3;
 ///
 /// Both names are short on purpose. Windows refuses a path of more than
 /// about 260 characters, and a scene file of a video with a long name is
@@ -98,42 +97,36 @@ pub fn scene_files_from_earlier_splits(
     out_dir: &Path,
     pattern: SceneNamePattern,
 ) -> Result<Vec<PathBuf>> {
-    let name = SceneNaming::of(video, pattern)?;
+    let naming = SceneNaming::of(video, pattern)?;
     if !out_dir.is_dir() {
         return Ok(Vec::new());
     }
     let entries = std::fs::read_dir(out_dir)
         .with_context(|| format!("could not read {}", out_dir.display()))?;
-    let mut scene_files = Vec::new();
+    let mut files = Vec::new();
     for entry in entries {
         let path = entry
             .with_context(|| format!("could not read {}", out_dir.display()))?
             .path();
-        if path.is_file() && name.is_scene_of_this_video(&path) {
-            scene_files.push(path);
+        if path.is_file() {
+            files.push(path);
         }
     }
+    let mut scene_files = naming.scenes_of_earlier_splits(files);
     scene_files.sort();
     Ok(scene_files)
 }
 
-/// Whether a file is a scene written by an earlier split. Scenes sit next to
-/// the videos they came from, and a scene should not be split a second time
-/// just because its folder was added again.
-///
-/// This knows the default naming only. Which video a file with another name
-/// came from cannot be told from the name alone, and guessing would hide
-/// videos the person wants to add.
-pub fn is_scene_file(path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return false;
-    };
-    let Some((video_name, number)) = stem.rsplit_once(SCENE_NAME_MARKER) else {
-        return false;
-    };
-    !video_name.is_empty()
-        && number.len() == SCENE_NUMBER_DIGITS
-        && number.chars().all(|digit| digit.is_ascii_digit())
+/// The names of `files` without their folders, for a message that has
+/// named the folder already.
+pub fn file_names_of(files: &[PathBuf]) -> Vec<String> {
+    files
+        .iter()
+        .map(|file| match file.file_name() {
+            Some(name) => name.to_string_lossy().into_owned(),
+            None => file.display().to_string(),
+        })
+        .collect()
 }
 
 /// What a split made of one scene.
@@ -176,7 +169,7 @@ pub fn written_files<Record>(outcomes: &[SceneOutcome<Record>]) -> Vec<PathBuf> 
 /// Splits `input` at the cuts of `scenes` and says, for every scene in
 /// order, which file it is in or that it was dropped. Scene files of this
 /// video from an earlier split are replaced, and those with names the new
-/// split does not use are removed.
+/// split does not use are moved to the Recycle Bin or Trash.
 ///
 /// The scenes are written into a folder of their own first and only moved
 /// to their real names once all of them are there. A split that fails or is
@@ -196,7 +189,7 @@ pub fn split_scenes<Record>(
     pattern: SceneNamePattern,
     record_dropped_scene: impl Fn(&Path) -> Result<Record>,
 ) -> Result<Vec<SceneOutcome<Record>>> {
-    let name = SceneFileName::of(input)?;
+    let name = UnfinishedNames::of(&SceneNaming::of(input, pattern)?);
     write_then_move_into_place(
         input,
         scenes,
@@ -222,7 +215,7 @@ pub struct UnfinishedScenes {
 /// writes them. `write_scenes` writes every scene to the place it is given,
 /// the dropped ones too. Only when it succeeds is each dropped scene shown
 /// to `record_dropped_scene`, are the kept scenes moved to their real
-/// names, and the scene files of an earlier split replaced or removed.
+/// names, and the scene files of an earlier split replaced or recycled.
 pub fn write_then_move_into_place<Record>(
     input: &Path,
     scenes: &ScenesToWrite,
@@ -231,7 +224,7 @@ pub fn write_then_move_into_place<Record>(
     write_scenes: impl FnOnce(&UnfinishedScenes) -> Result<()>,
     record_dropped_scene: impl Fn(&Path) -> Result<Record>,
 ) -> Result<Vec<SceneOutcome<Record>>> {
-    let name = SceneFileName::of(input)?;
+    let name = UnfinishedNames::of(&SceneNaming::of(input, pattern)?);
     let earlier_scene_files = scene_files_from_earlier_splits(input, out_dir, pattern)?;
     let scene_files = scene_file_paths(input, out_dir, pattern, &scenes.kept_scenes())?;
     refuse_to_write_over_the_video(input, &scene_files)?;
@@ -259,17 +252,26 @@ pub fn write_then_move_into_place<Record>(
     let outcomes = settled?;
     tidied?;
 
-    remove_leftover_scenes(&earlier_scene_files, &scene_files)?;
+    remove_leftover_scenes(&earlier_scene_files, &scene_files, MOVE_LEFTOVER_AWAY)?;
     Ok(outcomes)
 }
 
 /// No pattern can name a scene like its video today, since every scene name
 /// holds the video's name and a number besides. Should that ever change,
 /// the split stops here instead of replacing the original with a scene.
+/// Names that differ only in capitals are one file on Windows and macOS.
 fn refuse_to_write_over_the_video(input: &Path, scene_files: &[PathBuf]) -> Result<()> {
-    let same_name_as_the_video = scene_files
-        .iter()
-        .find(|scene_file| scene_file.file_name() == input.file_name());
+    let same_name_as_the_video =
+        scene_files.iter().find(
+            |scene_file| match (scene_file.file_name(), input.file_name()) {
+                (Some(scene_name), Some(video_name)) => scene_name::is_same_file_name(
+                    &scene_name.to_string_lossy(),
+                    &video_name.to_string_lossy(),
+                    SYSTEM_PATH_CASE,
+                ),
+                _ => false,
+            },
+        );
     if let Some(scene_file) = same_name_as_the_video {
         bail!(
             "the scene file {} would have the name of the video itself",
@@ -316,7 +318,7 @@ fn write_scenes(
     input: &Path,
     cuts: &CutTimes,
     unfinished_dir: &Path,
-    name: &SceneFileName,
+    name: &UnfinishedNames,
 ) -> Result<Vec<PathBuf>> {
     let cut_times = cuts
         .as_slice()
@@ -381,44 +383,66 @@ fn remove_unfinished_scenes(unfinished_dir: &Path) -> Result<()> {
     }
 }
 
+/// How a scene file of an earlier split leaves the folder when the new
+/// split has no use for its name.
+type MoveLeftoverAway = fn(&Path) -> Result<()>;
+
+/// A leftover is only known by its name, and a name can fit a file that no
+/// split ever wrote. So nothing found by name is deleted for good: it goes
+/// to the Recycle Bin or Trash, where the person can get it back.
+#[cfg(not(test))]
+const MOVE_LEFTOVER_AWAY: MoveLeftoverAway = recycle_leftover;
+/// The tests split the videos they made over and over. Their leftovers are
+/// deleted, so that running the tests does not fill the Recycle Bin of
+/// whoever runs them.
+#[cfg(test)]
+const MOVE_LEFTOVER_AWAY: MoveLeftoverAway = delete_leftover_of_a_test;
+
+#[cfg_attr(test, allow(dead_code))]
+fn recycle_leftover(leftover: &Path) -> Result<()> {
+    trash::delete(leftover).with_context(|| {
+        format!(
+            "the new scene files are in place, but the outdated {} could not be moved to the \
+             {TRASH_NAME}. Remove it yourself, or it sits beside the new scenes",
+            leftover.display()
+        )
+    })
+}
+
+#[cfg(test)]
+fn delete_leftover_of_a_test(leftover: &Path) -> Result<()> {
+    std::fs::remove_file(leftover)
+        .with_context(|| format!("could not remove the outdated {}", leftover.display()))
+}
+
 /// An earlier split into more scenes leaves higher-numbered files that the
 /// new split did not overwrite. Left in place they would sit beside the new
 /// scenes and repeat part of the last one.
 fn remove_leftover_scenes(
     earlier_scene_files: &[PathBuf],
     new_scene_files: &[PathBuf],
+    move_away: MoveLeftoverAway,
 ) -> Result<()> {
-    for leftover in earlier_scene_files
+    earlier_scene_files
         .iter()
         .filter(|earlier| !new_scene_files.contains(earlier))
-    {
-        std::fs::remove_file(leftover)
-            .with_context(|| format!("could not remove the outdated {}", leftover.display()))?;
-    }
-    Ok(())
+        .try_for_each(|leftover| move_away(leftover))
 }
 
 /// The naming of one video's scene files while they are being written. What
-/// they are called once they are finished is `SceneNaming`'s to say.
-struct SceneFileName {
-    stem: String,
+/// they are called once they are finished is `SceneNaming`'s to say, which
+/// is also where the video's name is read.
+struct UnfinishedNames {
+    video_file_name: String,
     extension: String,
 }
 
-impl SceneFileName {
-    fn of(video: &Path) -> Result<Self> {
-        let stem = video
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .with_context(|| format!("{} has no usable file name", video.display()))?;
-        let extension = video
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .with_context(|| format!("{} has no file extension", video.display()))?;
-        Ok(Self {
-            stem: stem.to_owned(),
-            extension: extension.to_owned(),
-        })
+impl UnfinishedNames {
+    fn of(naming: &SceneNaming) -> Self {
+        Self {
+            video_file_name: naming.video_file_name(),
+            extension: naming.extension().to_owned(),
+        }
     }
 
     /// The folder the scenes of this video are written into until all of
@@ -426,16 +450,15 @@ impl SceneFileName {
     /// one folder can be split at the same time, but by a number made from
     /// the name and not the name itself, to keep the path short.
     fn unfinished_folder(&self) -> String {
-        let file_name = format!("{}.{}", self.stem, self.extension);
         format!(
             "{UNFINISHED_FOLDER_PREFIX}{:016x}",
-            fnv1a_64(file_name.as_bytes())
+            fnv1a_64(self.video_file_name.as_bytes())
         )
     }
 
     /// What a scene is called while it is in the unfinished folder.
     fn unfinished_name(&self, number: usize) -> String {
-        format!("{number:0SCENE_NUMBER_DIGITS$}.{}", self.extension)
+        format!("{number:0UNFINISHED_NUMBER_DIGITS$}.{}", self.extension)
     }
 
     /// The files a split into `scene_count` scenes writes into
@@ -451,7 +474,7 @@ impl SceneFileName {
     /// a literal percent sign has to be doubled.
     fn ffmpeg_pattern_in(&self, unfinished_dir: &Path) -> PathBuf {
         unfinished_dir.join(format!(
-            "%0{SCENE_NUMBER_DIGITS}d.{}",
+            "%0{UNFINISHED_NUMBER_DIGITS}d.{}",
             self.extension.replace('%', "%%")
         ))
     }
@@ -487,6 +510,11 @@ mod tests {
 
     fn pattern(typed: &str) -> SceneNamePattern {
         SceneNamePattern::new(typed).unwrap()
+    }
+
+    fn unfinished_names_of(video: &str) -> UnfinishedNames {
+        let naming = SceneNaming::of(Path::new(video), SceneNamePattern::default()).unwrap();
+        UnfinishedNames::of(&naming)
     }
 
     /// Scenes of ten seconds each, one after another.
@@ -544,7 +572,9 @@ mod tests {
             &scenes(3),
         )
         .unwrap();
-        assert!(files.iter().all(|file| is_scene_file(file)));
+        assert!(files
+            .iter()
+            .all(|file| scene_name::is_default_scene_file(file)));
     }
 
     #[test]
@@ -558,8 +588,20 @@ mod tests {
     }
 
     #[test]
+    fn a_scene_file_named_like_its_video_but_for_capitals_is_refused_where_those_are_one_file() {
+        let refused = refuse_to_write_over_the_video(
+            Path::new("Holiday.MP4"),
+            &[PathBuf::from("holiday.mp4")],
+        );
+        assert_eq!(
+            refused.is_err(),
+            SYSTEM_PATH_CASE == crate::folder_settings::PathCase::Ignored
+        );
+    }
+
+    #[test]
     fn the_ffmpeg_pattern_names_the_files_of_the_unfinished_folder() {
-        let name = SceneFileName::of(Path::new("100% fun.mkv")).unwrap();
+        let name = unfinished_names_of("100% fun.mkv");
         let unfinished_dir = Path::new("out").join(name.unfinished_folder());
 
         // The video's name, percent sign and all, is in neither.
@@ -579,9 +621,9 @@ mod tests {
     #[test]
     fn the_unfinished_folder_is_short_and_differs_from_video_to_video() {
         let long_name = format!("{}.mp4", "a very long name of a video ".repeat(6));
-        let long = SceneFileName::of(Path::new(&long_name)).unwrap();
-        let holiday = SceneFileName::of(Path::new("holiday.mp4")).unwrap();
-        let same_name_other_kind = SceneFileName::of(Path::new("holiday.mkv")).unwrap();
+        let long = unfinished_names_of(&long_name);
+        let holiday = unfinished_names_of("holiday.mp4");
+        let same_name_other_kind = unfinished_names_of("holiday.mkv");
 
         assert_eq!(long.unfinished_folder().len(), "unfinished_".len() + 16);
         assert_ne!(long.unfinished_folder(), holiday.unfinished_folder());
@@ -593,9 +635,7 @@ mod tests {
         // run left behind is found and removed by the next one.
         assert_eq!(
             holiday.unfinished_folder(),
-            SceneFileName::of(Path::new("elsewhere/holiday.mp4"))
-                .unwrap()
-                .unfinished_folder()
+            unfinished_names_of("elsewhere/holiday.mp4").unfinished_folder()
         );
     }
 
@@ -604,27 +644,13 @@ mod tests {
         // As long as the name of the clip that showed the problem: 64 characters.
         let video =
             Path::new("A long film name (2022)- with spaces and bracket - whole scene 1.mp4");
-        let name = SceneFileName::of(video).unwrap();
+        let name = unfinished_names_of(&video.display().to_string());
         let out_dir = Path::new("out");
 
         let finished =
             &scene_file_paths(video, out_dir, SceneNamePattern::default(), &scenes(1)).unwrap()[0];
         let unfinished = &name.unfinished_files_in(&out_dir.join(name.unfinished_folder()), 1)[0];
         assert!(unfinished.as_os_str().len() < finished.as_os_str().len());
-    }
-
-    #[test]
-    fn scenes_of_an_earlier_split_are_recognised() {
-        assert!(is_scene_file(Path::new("videos/holiday_scene_001.mp4")));
-        assert!(is_scene_file(Path::new("holiday_scene_123.mkv")));
-    }
-
-    #[test]
-    fn ordinary_videos_are_not_mistaken_for_scenes() {
-        assert!(!is_scene_file(Path::new("holiday.mp4")));
-        assert!(!is_scene_file(Path::new("crime_scene_investigation.mp4")));
-        assert!(!is_scene_file(Path::new("_scene_001.mp4")));
-        assert!(!is_scene_file(Path::new("holiday_scene_1.mp4")));
     }
 
     #[test]
@@ -811,7 +837,7 @@ mod tests {
             folder.0.join("holiday_scene_002.mp4"),
         ];
 
-        remove_leftover_scenes(&earlier, &new_scenes).unwrap();
+        remove_leftover_scenes(&earlier, &new_scenes, delete_leftover_of_a_test).unwrap();
         assert_eq!(
             folder.file_names(),
             vec![
@@ -820,6 +846,38 @@ mod tests {
                 "holiday_scene_002.mp4"
             ]
         );
+    }
+
+    #[test]
+    fn a_leftover_that_cannot_be_moved_away_stops_with_the_reason() {
+        let earlier = [PathBuf::from("out/holiday_scene_003.mp4")];
+        let no_bin: MoveLeftoverAway = |_leftover| bail!("there is no bin on this drive");
+
+        let error = remove_leftover_scenes(&earlier, &[], no_bin).unwrap_err();
+        assert_eq!(error.to_string(), "there is no bin on this drive");
+        // A scene the new split wrote under the same name is no leftover.
+        remove_leftover_scenes(&earlier, &earlier, no_bin).unwrap();
+    }
+
+    #[test]
+    fn another_video_beside_the_one_being_split_is_not_an_earlier_scene() {
+        let folder = Folder::with_files(
+            "neighbours",
+            &[
+                "Rocky.mp4",
+                "Rocky 2.mp4",
+                "Rocky 2049.mp4",
+                "Rocky 001.mp4",
+                "Rocky 002.mp4",
+            ],
+        );
+        let earlier = scene_files_from_earlier_splits(
+            &folder.0.join("Rocky.mp4"),
+            &folder.0,
+            pattern("{name} {number}"),
+        )
+        .unwrap();
+        assert_eq!(file_names_of(&earlier), ["Rocky 001.mp4", "Rocky 002.mp4"]);
     }
 
     #[test]

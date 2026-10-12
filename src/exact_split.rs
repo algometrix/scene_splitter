@@ -25,7 +25,7 @@ use anyhow::Result;
 
 use crate::exact_cut::{
     plan_exact_cuts, CopyStart, ExactCutPlan, FfmpegTime, FrameTable, PartKind, PlanError,
-    ScenePart, ScenePlan, StoredFrame,
+    ScenePart, ScenePlan, StoredFrame, EXACT_CUT_SETTING,
 };
 use crate::exact_verify::{self, ExactCutProof, VerifyError};
 use crate::fates::ScenesToWrite;
@@ -214,16 +214,22 @@ impl ExactCutError {
                 "The video could not be cut on the exact pictures."
             }
         };
-        format!("{what_happened} {ORIGINAL_UNTOUCHED} {NORMAL_CUT_OFFER}")
+        format!(
+            "{what_happened} {ORIGINAL_UNTOUCHED} {}",
+            normal_cut_offer()
+        )
     }
 }
 
 const ORIGINAL_UNTOUCHED: &str = "The original was not changed.";
 /// Where to go from a failed exact cut. The setting is named as the window
-/// names it.
-const NORMAL_CUT_OFFER: &str =
-    "To split this video at the nearest points where it can be cut without encoding, \
-     turn off \"Cut on the exact picture\" in Settings and split again.";
+/// labels it.
+fn normal_cut_offer() -> String {
+    format!(
+        "To split this video the normal way, turn off \"{EXACT_CUT_SETTING}\" in Settings \
+         and split again."
+    )
+}
 
 impl fmt::Display for ExactCutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1183,7 +1189,10 @@ mod tests {
         for failure in failures {
             let words = failure.in_plain_words();
             assert!(words.contains("The original was not changed."), "{words}");
-            assert!(words.contains("Cut on the exact picture"), "{words}");
+            assert!(
+                words.contains("turn off \"Cut on the exact picture (slower)\" in Settings"),
+                "{words}"
+            );
         }
     }
 

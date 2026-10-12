@@ -176,7 +176,7 @@ impl fmt::Display for AddCutError {
             }
             Self::AlreadyProposed { at } => write!(
                 formatter,
-                "There is already a split point at {}.",
+                "There is already a split at {}.",
                 crate::timecode::format_timestamp(*at)
             ),
         }
@@ -243,10 +243,10 @@ impl fmt::Display for NudgeCutError {
                 "The split cannot move further. The split at {} is in the way.",
                 format_timestamp(*at)
             ),
-            Self::MergedPartsInTheWay { at } => write!(
+            Self::MergedPartsInTheWay { .. } => write!(
                 formatter,
-                "The split cannot move further. Two merged parts meet at {}.",
-                format_timestamp(*at)
+                "The split cannot move into the merged scene beside it. \
+                 Take that scene apart first, or move one of its parts out."
             ),
         }
     }
@@ -360,6 +360,7 @@ impl SplitPlan {
                 cut.choice = CutChoice::Merge;
             }
         }
+        self.keep_scenes_with_a_kept_part();
     }
 
     pub fn whole_video(&self) -> TimeSpan {
@@ -584,6 +585,70 @@ impl SplitPlan {
         scenes::nearest_keyframe(&exact_moment, &self.keyframe_times)
             .filter(|&keyframe| self.whole_video.has_strictly_inside(keyframe))
             .ok_or(AddCutError::NoKeyframeToCutOn)
+    }
+
+    /// The splits a copy cannot make where they stand, in ascending order:
+    /// those the person placed or moved between two points where the video
+    /// can be cut, while cuts were exact. ffmpeg would start the scene at
+    /// the next such point instead, so the files would not be the scenes
+    /// that were reviewed.
+    ///
+    /// A split the review began with is taken as it is. Scans and chapter
+    /// marks only ever suggest points where the video can be cut.
+    pub fn splits_off_cut_points(&self) -> Vec<f64> {
+        self.cuts
+            .iter()
+            .filter(|cut| cut.choice == CutChoice::Split && self.is_off_cut_points(cut))
+            .map(|cut| cut.time)
+            .collect()
+    }
+
+    fn is_off_cut_points(&self, cut: &ProposedCut) -> bool {
+        !cut.source.is_untouched_suggestion() && !self.is_cut_point(cut.time)
+    }
+
+    fn is_cut_point(&self, time: f64) -> bool {
+        self.keyframe_times
+            .binary_search_by(|keyframe| keyframe.total_cmp(&time))
+            .is_ok()
+    }
+
+    /// Moves every split of `splits_off_cut_points` to the nearest point
+    /// where the video can be cut, and returns the times of those that
+    /// could not move: the nearest point is at or beyond the cut beside
+    /// them, or the video has none. Those stay where they are.
+    pub fn move_splits_to_cut_points(&mut self) -> Vec<f64> {
+        let mut stuck = Vec::new();
+        for position in 0..self.cuts.len() {
+            let cut = self.cuts[position];
+            if cut.choice != CutChoice::Split || !self.is_off_cut_points(&cut) {
+                continue;
+            }
+            match self.cut_point_between_the_neighbours(position) {
+                Some(cut_point) => {
+                    let moved = &mut self.cuts[position];
+                    moved.source = moved.source.after_a_move(cut.time, cut_point);
+                    moved.time = cut_point;
+                }
+                None => stuck.push(cut.time),
+            }
+        }
+        stuck
+    }
+
+    /// The point nearest to the cut at `position` where the video can be
+    /// cut, if it lies strictly between the cuts on either side, merged
+    /// ones included. Cuts must stay in order and never share a time.
+    fn cut_point_between_the_neighbours(&self, position: usize) -> Option<f64> {
+        let cut_point = self.cut_time_near(self.cuts[position].time).ok()?;
+        let after_the_cut_before = position
+            .checked_sub(1)
+            .is_none_or(|before| self.cuts[before].time < cut_point);
+        let before_the_cut_after = self
+            .cuts
+            .get(position + 1)
+            .is_none_or(|after| cut_point < after.time);
+        (after_the_cut_before && before_the_cut_after).then_some(cut_point)
     }
 
     /// Where a cut asked for at `requested_time` would land with the given
@@ -1249,7 +1314,7 @@ mod tests {
     fn a_repeated_cut_is_explained_with_the_time_it_is_already_at() {
         assert_eq!(
             AddCutError::AlreadyProposed { at: 4.0 }.to_string(),
-            "There is already a split point at 00:00:04.000."
+            "There is already a split at 00:00:04.000."
         );
     }
 
@@ -1570,7 +1635,8 @@ mod tests {
         );
         assert_eq!(
             NudgeCutError::MergedPartsInTheWay { at: 6.0 }.to_string(),
-            "The split cannot move further. Two merged parts meet at 00:00:06.000."
+            "The split cannot move into the merged scene beside it. \
+             Take that scene apart first, or move one of its parts out."
         );
     }
 
@@ -1931,5 +1997,177 @@ mod tests {
     #[test]
     fn the_plan_covers_the_video_its_detected_cuts_belong_to() {
         assert_eq!(plan_with_cuts(&[2.0]).whole_video(), WHOLE_VIDEO);
+    }
+
+    #[test]
+    fn leaving_out_a_chapter_cut_between_a_dropped_and_a_kept_scene_keeps_both() {
+        // The chapter cut is the only one, so its two scenes are the video.
+        let mut plan = plan_with_cuts(&[]);
+        plan.propose_chapter_cuts(&[4.0]);
+        plan.set_scene_fate(SceneIndex::new(0), SceneFate::Drop)
+            .unwrap();
+
+        plan.merge_chapter_cuts();
+        assert_eq!(plan.scene_fates(), vec![SceneFate::Keep]);
+        assert_eq!(plan.scenes_to_write().dropped_count(), 0);
+    }
+
+    #[test]
+    fn leaving_out_chapter_cuts_never_drops_a_scene_the_person_kept() {
+        let mut plan = plan_with_cuts(&[8.0]);
+        plan.propose_chapter_cuts(&[4.0]);
+        // Dropped, then kept across the chapter cut, then one more scene.
+        plan.set_scene_fate(SceneIndex::new(0), SceneFate::Drop)
+            .unwrap();
+
+        plan.merge_chapter_cuts();
+        assert_eq!(plan.scenes(), vec![span(0.0, 8.0), span(8.0, 10.0)]);
+        assert_eq!(plan.scene_fates(), vec![SceneFate::Keep, SceneFate::Keep]);
+    }
+
+    #[test]
+    fn leaving_out_a_chapter_cut_between_two_dropped_scenes_leaves_them_dropped() {
+        let mut plan = plan_with_cuts(&[8.0]);
+        plan.propose_chapter_cuts(&[4.0]);
+        plan.set_scene_fate(SceneIndex::new(0), SceneFate::Drop)
+            .unwrap();
+        plan.set_scene_fate(SceneIndex::new(1), SceneFate::Drop)
+            .unwrap();
+
+        plan.merge_chapter_cuts();
+        assert_eq!(plan.scene_fates(), vec![SceneFate::Drop, SceneFate::Keep]);
+    }
+
+    /// The next number of a fixed sequence that looks random, so the test
+    /// below tries the same edits on every run.
+    fn next_pick(state: &mut u64) -> usize {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*state >> 33) as usize
+    }
+
+    #[test]
+    fn whatever_is_edited_every_scene_has_one_fate_and_one_scene_is_written() {
+        const EDITS_PER_PLAN: usize = 400;
+        const KINDS_OF_EDIT: usize = 12;
+        let mut state = 7;
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_chapter_cuts(&[2.0, 8.0]);
+        let mut snapshots = Vec::new();
+
+        for _ in 0..EDITS_PER_PLAN {
+            let scene_count = plan.scenes().len();
+            let scene = SceneIndex::new(next_pick(&mut state) % scene_count);
+            let cut_count = plan.cuts.len();
+            let time = (next_pick(&mut state) % 99 + 1) as f64 / 10.0;
+            match next_pick(&mut state) % KINDS_OF_EDIT {
+                0 => plan.merge_scenes(scene..=scene.next()),
+                1 => plan.isolate_segment(SegmentIndex(next_pick(&mut state) % (cut_count + 1))),
+                2 if cut_count > 0 => {
+                    let cut = CutIndex(next_pick(&mut state) % cut_count);
+                    plan.set_choice(cut, CutChoice::Merge);
+                }
+                3 if cut_count > 0 => {
+                    let cut = CutIndex(next_pick(&mut state) % cut_count);
+                    plan.set_choice(cut, CutChoice::Split);
+                }
+                4 => drop(plan.add_cut_near(time)),
+                5 => drop(plan.add_cut_exactly_at(time)),
+                6 => drop(plan.nudge_cut_before(
+                    scene,
+                    NudgeDirection::Later,
+                    NudgeStep::OnePicture { seconds: 0.04 },
+                )),
+                7 => drop(plan.set_scene_fate(scene, SceneFate::Drop)),
+                8 => drop(plan.set_scene_fate(scene, SceneFate::Keep)),
+                9 => plan.merge_chapter_cuts(),
+                10 => drop(plan.move_splits_to_cut_points()),
+                _ if next_pick(&mut state) % 8 == 0 => plan.reset_to_detected(),
+                _ if next_pick(&mut state) % 2 == 0 => snapshots.push(plan.snapshot()),
+                _ => {
+                    if let Some(snapshot) = snapshots.pop() {
+                        plan.restore(snapshot);
+                    }
+                }
+            }
+
+            for layout in plan.scene_layouts() {
+                let first = layout.first_segment.0;
+                let fates = &plan.fates[first..first + layout.segments.len()];
+                assert!(
+                    fates.iter().all(|fate| *fate == fates[0]),
+                    "a scene is half dropped: {plan:?}"
+                );
+            }
+            assert_eq!(plan.fates.len(), plan.cuts.len() + 1);
+            assert!(
+                ScenesToWrite::new(plan.accepted_cuts(), plan.scene_fates()).is_ok(),
+                "{plan:?}"
+            );
+            let times: Vec<f64> = plan.cuts.iter().map(|cut| cut.time).collect();
+            assert!(times.windows(2).all(|pair| pair[0] < pair[1]), "{times:?}");
+        }
+    }
+
+    #[test]
+    fn splits_the_review_began_with_or_placed_on_cut_points_can_be_copied() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.add_cut_near(6.3).unwrap();
+        plan.nudge_cut_before(
+            SceneIndex::new(1),
+            NudgeDirection::Earlier,
+            NudgeStep::ToNextCutPoint,
+        )
+        .unwrap();
+        assert_eq!(plan.splits_off_cut_points(), Vec::<f64>::new());
+        assert_eq!(plan.move_splits_to_cut_points(), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn a_split_on_an_exact_picture_or_moved_by_one_is_off_the_cut_points() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.add_cut_exactly_at(6.7).unwrap();
+        plan.nudge_cut_before(
+            SceneIndex::new(1),
+            NudgeDirection::Later,
+            NudgeStep::OnePicture { seconds: 0.5 },
+        )
+        .unwrap();
+        assert_eq!(plan.splits_off_cut_points(), vec![4.5, 6.7]);
+
+        // A split that is merged away is not cut at all.
+        plan.set_choice(CutIndex(1), CutChoice::Merge);
+        assert_eq!(plan.splits_off_cut_points(), vec![4.5]);
+    }
+
+    #[test]
+    fn splits_off_the_cut_points_move_to_the_nearest_one() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.add_cut_exactly_at(6.7).unwrap();
+        plan.nudge_cut_before(
+            SceneIndex::new(1),
+            NudgeDirection::Later,
+            NudgeStep::OnePicture { seconds: 0.5 },
+        )
+        .unwrap();
+
+        assert_eq!(plan.move_splits_to_cut_points(), Vec::<f64>::new());
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 6.0]);
+        assert_eq!(plan.splits_off_cut_points(), Vec::<f64>::new());
+        // The detected split is back where the scan found it.
+        plan.reset_to_detected();
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0]);
+    }
+
+    #[test]
+    fn a_split_whose_nearest_cut_point_is_taken_stays_and_is_reported() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.add_cut_exactly_at(4.4).unwrap();
+        plan.add_cut_exactly_at(4.8).unwrap();
+
+        // Both would land on 4.0, where the detected split stands.
+        assert_eq!(plan.move_splits_to_cut_points(), vec![4.4, 4.8]);
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 4.4, 4.8]);
     }
 }

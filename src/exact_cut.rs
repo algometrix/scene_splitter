@@ -21,6 +21,11 @@ use crate::scenes::{self, CutTimes};
 const SAME_PICTURE_SECONDS: f64 = 0.0005;
 const MICROSECONDS_PER_SECOND: f64 = 1_000_000.0;
 
+/// The setting for cutting on the exact picture, as the window labels it.
+/// Every message that sends the person to that setting quotes this, so the
+/// words they look for are the words on the checkbox.
+pub const EXACT_CUT_SETTING: &str = "Cut on the exact picture (slower)";
+
 /// Where a split may cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CutPrecision {
@@ -981,7 +986,7 @@ mod tests {
                 time: 64.36,
                 strength: 255,
             }]),
-            chapters: None,
+            chapters: crate::detect::ChapterMarks::NeverRead,
         }
     }
 

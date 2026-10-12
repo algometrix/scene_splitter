@@ -125,15 +125,16 @@ struct Arguments {
     #[arg(long, requires = "video", value_name = "PATTERN")]
     scene_name: Option<SceneNamePattern>,
 
-    /// Write the list of scenes to this file: their numbers, times and the
-    /// names their files get. Works with --list-only, which then writes
-    /// the list and no scene files.
+    /// Write the list of scenes to this file: their numbers, times, the
+    /// names their files get and their chapter titles. Works with
+    /// --list-only, which then writes the list and no scene files.
     #[arg(long, requires = "video", value_name = "FILE")]
     save_list: Option<PathBuf>,
 
-    /// The format of the scene list: a table (csv), chapter marks for
-    /// ffmpeg (chapters) or a CMX3600 edit list (edl). Left out, it is
-    /// taken from the ending of the file's name: .csv, .txt or .edl.
+    /// The format of the scene list: a table (csv), chapter marks to add
+    /// to a video with ffmpeg (chapters) or a CMX3600 edit list (edl). Left
+    /// out, it is taken from the ending of the file's name: .csv, .txt (or
+    /// .ffmetadata) or .edl.
     #[arg(long, value_enum, requires = "save_list", value_name = "FORMAT")]
     list_format: Option<SceneListFormat>,
 
@@ -145,8 +146,9 @@ struct Arguments {
     keep_original: bool,
 
     /// Cut on the exact picture where each scene changes, and not on the
-    /// nearest keyframe. A few seconds around each cut are encoded again,
-    /// so this is slower. The original video is always kept.
+    /// nearest point where the video can be cut as it is. A few seconds
+    /// around each cut are encoded again, so this is slower. The original
+    /// video is always kept.
     #[arg(long, requires = "video", conflicts_with_all = ["scan_only", "review"])]
     exact_cuts: bool,
 
@@ -216,7 +218,7 @@ fn main() -> Result<()> {
     }
     if let SettingsScope::Folder(folder) = &detection.scope {
         println!(
-            "Using the detection settings remembered for {}.",
+            "Using the scan settings remembered for {}.",
             folder.display()
         );
     }
@@ -322,19 +324,18 @@ fn settings_for_this_run(
     saved_detection: &DetectionInUse,
     arguments: &Arguments,
 ) -> Result<Settings> {
-    settings.scan = saved_detection.detection.scan;
-    settings.hard_cuts = saved_detection.detection.hard_cuts;
+    settings.detection = saved_detection.detection;
     if let Some(mode) = arguments.scan {
-        settings.scan.mode = mode;
+        settings.detection.scan.mode = mode;
     }
     if let Some(min_black) = arguments.min_black {
-        settings.scan.criteria.min_seconds = min_black;
+        settings.detection.scan.criteria.min_seconds = min_black;
     }
     if let Some(max_luma) = arguments.max_luma {
-        settings.scan.criteria.max_dark_luma = max_luma;
+        settings.detection.scan.criteria.max_dark_luma = max_luma;
     }
     if let Some(black_fraction) = arguments.black_fraction {
-        settings.scan.criteria.min_dark_fraction = black_fraction;
+        settings.detection.scan.criteria.min_dark_fraction = black_fraction;
     }
     if arguments.keep_original {
         settings.export.original_policy = OriginalPolicy::Keep;
@@ -362,12 +363,12 @@ fn scan_kind(arguments: &Arguments, hard_cuts: HardCutSettings) -> ScanKind {
 }
 
 fn scan_depth(arguments: &Arguments, settings: &Settings) -> ScanDepth {
-    scan_kind(arguments, settings.hard_cuts).depth()
+    scan_kind(arguments, settings.detection.hard_cuts).depth()
 }
 
 fn scan_ahead(path: &Path, arguments: &Arguments, settings: &Settings) -> Result<()> {
     let depth = scan_depth(arguments, settings);
-    let summary = prescan::scan_ahead(path, &settings.scan, depth, |video_done| {
+    let summary = prescan::scan_ahead(path, &settings.detection.scan, depth, |video_done| {
         println!("{video_done}");
         for stretch in &video_done.undecoded {
             eprintln!("Warning: in {}, {stretch}", video_done.video.display());
@@ -397,7 +398,7 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     // A run from the command line shows no progress bar.
     let scan = detect::scan_for_scene_changes(
         video,
-        &settings.scan,
+        &settings.detection.scan,
         scan_depth(arguments, settings),
         &detect::no_scan_progress,
     )?;
@@ -407,7 +408,7 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     }
     let detection = scan.detection;
     let method = settings.export.split_method();
-    let scan_kind = scan_kind(arguments, settings.hard_cuts);
+    let scan_kind = scan_kind(arguments, settings.detection.hard_cuts);
     let detected_cuts = match settings.export.cut_precision {
         CutPrecision::NearestKeyframe => detection.cuts_for(scan_kind),
         // Nobody reviews a split from the command line, so the cuts go
@@ -480,11 +481,7 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     let scene_name = settings.export.scene_name;
     let existing_scenes = split::scene_files_from_earlier_splits(video, &out_dir, scene_name)?;
     if !arguments.overwrite && !existing_scenes.is_empty() {
-        bail!(
-            "{} scene files from an earlier split are in {}. Pass --overwrite to replace them, or choose another --out-dir.",
-            existing_scenes.len(),
-            out_dir.display()
-        );
+        bail!(earlier_scenes_in_the_way(&existing_scenes, &out_dir));
     }
 
     let started = Instant::now();
@@ -540,11 +537,11 @@ fn save_scene_list(
         .with_context(|| {
             format!(
                 "the name {} does not say which format the scene list should have. \
-                 End it in .csv, .txt or .edl, or pass --list-format",
+                 End it in .csv, .txt (or .ffmetadata) or .edl, or pass --list-format",
                 list_file.display()
             )
         })?;
-    let frame_seconds = detection.video.seconds() / detection.frame_count.max(1) as f64;
+    let frame_seconds = detection.frame_seconds();
     let frame_rate = FrameRate::from_frame_seconds(frame_seconds).map_err(|not_a_rate| {
         anyhow::anyhow!(
             "the frame rate of {} is not known: {not_a_rate}",
@@ -565,6 +562,28 @@ fn save_scene_list(
     export::save_scene_list(&list, format, list_file, if_exists)
 }
 
+/// Why the split does not start over the scene files of an earlier one.
+/// Every file is named: a file is taken for an earlier scene by its name
+/// alone, and the person should see each one before --overwrite replaces it
+/// or moves it to the Recycle Bin or Trash.
+fn earlier_scenes_in_the_way(existing_scenes: &[PathBuf], out_dir: &Path) -> String {
+    let count = match existing_scenes.len() {
+        1 => "1 scene file from an earlier split is".to_owned(),
+        several => format!("{several} scene files from an earlier split are"),
+    };
+    let names: Vec<String> = split::file_names_of(existing_scenes)
+        .into_iter()
+        .map(|name| format!("  {name}"))
+        .collect();
+    format!(
+        "{count} in {}:\n{}\nPass --overwrite to replace them, or choose another --out-dir. \
+         With --overwrite, those the new split has no use for go to the {}.",
+        out_dir.display(),
+        names.join("\n"),
+        export::TRASH_NAME
+    )
+}
+
 /// Said before an exact split starts, since it takes longer than a copy and
 /// does not do what the saved setting for originals may say.
 const EXACT_CUT_NOTICE: &str =
@@ -578,7 +597,7 @@ fn with_the_way_back_to_a_normal_cut(error: anyhow::Error) -> anyhow::Error {
     }
     error.context(
         "the exact cut did not work. The original was not changed. \
-         Run again without --exact-cuts to cut at the nearest keyframes instead",
+         Run again without --exact-cuts to split the normal way",
     )
 }
 
@@ -608,6 +627,36 @@ fn print_scenes(scenes: &[TimeSpan], chapter_splits: &ChapterSplits) {
             number + 1,
             format_timestamp(scene.start),
             format_timestamp(scene.end)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_refusal_to_replace_earlier_scenes_names_every_one_of_them() {
+        let out_dir = Path::new("videos");
+        let refusal = earlier_scenes_in_the_way(
+            &[out_dir.join("Rocky 001.mp4"), out_dir.join("Rocky 002.mp4")],
+            out_dir,
+        );
+        assert!(
+            refusal.starts_with("2 scene files from an earlier split are in videos:"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("\n  Rocky 001.mp4\n  Rocky 002.mp4\n"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("--overwrite"), "{refusal}");
+        assert!(refusal.contains(export::TRASH_NAME), "{refusal}");
+
+        let one = earlier_scenes_in_the_way(&[out_dir.join("Rocky 2.mp4")], out_dir);
+        assert!(
+            one.starts_with("1 scene file from an earlier split is in videos:"),
+            "{one}"
         );
     }
 }

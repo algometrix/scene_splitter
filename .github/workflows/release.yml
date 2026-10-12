@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+# Every action is named by the commit it was at when it was last looked at,
+# with its version beside it. A tag can be moved to other code later, and the
+# last job here may write to the repository.
+
 # Two runs for one tag would both try to create the same release.
 concurrency:
   group: release-${{ github.ref }}
@@ -24,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # A release named v0.2.0 whose program says 0.1.0 would mislead
       # everyone who downloads it, so stop before anything is built.
@@ -41,9 +45,42 @@ jobs:
           fi
           echo "The tag $TAG matches version $crate_version in Cargo.toml."
 
+  # The same checks the CI workflow runs on every push, run again on the
+  # tagged commit itself. A tag can be put on a commit CI never saw, or one
+  # it failed on, and nothing is built for release from such a commit.
+  test:
+    name: Lint and test the tagged commit
+    needs: check-version
+    runs-on: ubuntu-latest
+    # The tests wait on ffmpeg, so a hung child must not hold a runner.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # The headers the build needs on Linux, and ffmpeg for the end-to-end
+      # tests, which split a generated video.
+      - name: Install Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev ffmpeg
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # the stable branch
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Test, including the end-to-end tests that run ffmpeg
+        run: cargo test --locked --release -- --include-ignored
+
   build:
     name: Build for ${{ matrix.platform }}
-    needs: check-version
+    needs: test
     runs-on: ${{ matrix.os }}
     # A clean build with link-time optimisation takes a while, but a hung
     # one must not hold a runner for the six hours GitHub would allow.
@@ -92,7 +129,7 @@ jobs:
       ARCHIVE: ${{ matrix.archive }}
       PACKAGE: scene_splitter-${{ github.ref_name }}-${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Sound output, the window and the file picker need these headers to
       # build on Linux, as in the CI workflow.
@@ -102,8 +139,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # the stable branch
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # No build cache: a release is built from nothing but the tagged
@@ -133,7 +171,7 @@ jobs:
             tar -czf "$PACKAGE.tar.gz" "$PACKAGE"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.platform }}
           path: dist/${{ env.PACKAGE }}.${{ matrix.archive }}
@@ -150,7 +188,7 @@ jobs:
       # Creating a release and attaching files to it.
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

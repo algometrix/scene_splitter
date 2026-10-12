@@ -20,6 +20,7 @@ use eframe::egui;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 
+use crate::exact_cut::CutPrecision;
 use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::SceneIndex;
 use crate::review_session::SplitFeedback;
@@ -76,6 +77,17 @@ const PLAYER_CORNER_GAP: f32 = 16.0;
 const SCROLL_POINTS_PER_FRAME: f32 = 50.0;
 /// A split lands "exactly here" when the keyframe is closer than this.
 const SAME_MOMENT_SECONDS: f64 = 0.0005;
+/// The split button says where its split lands: near the picture on show
+/// while the video is copied, on it while cuts are exact.
+const SPLIT_NEAR_LABEL: &str = "Split near here (S)";
+const SPLIT_NEAR_HINT: &str =
+    "Cuts the scene playing now in two, at the closest point where the video can be cut.";
+const SPLIT_EXACTLY_LABEL: &str = "Split here (S)";
+const SPLIT_EXACTLY_HINT: &str = "Cuts the scene playing now in two, on this picture.";
+const ONE_PICTURE_BACK_LABEL: &str = "-1 picture";
+const ONE_PICTURE_FORWARD_LABEL: &str = "+1 picture";
+const PLAYER_HINT: &str =
+    "Esc closes the player. Pause, then step one picture at a time to find the exact one.";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackSpeed {
@@ -380,6 +392,33 @@ fn landing_description(position: f64, split_point: f64) -> String {
     )
 }
 
+/// What the player's split button would do where the video stands now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplitHere {
+    /// Whether a split lands on the very picture or on the nearest point
+    /// where the video can be cut. The button says which.
+    pub precision: CutPrecision,
+    /// The time a split at the current position would be cut at, if a
+    /// split is possible there.
+    pub would_land_at: Option<f64>,
+}
+
+impl SplitHere {
+    fn button_label(self) -> &'static str {
+        match self.precision {
+            CutPrecision::NearestKeyframe => SPLIT_NEAR_LABEL,
+            CutPrecision::ExactFrame => SPLIT_EXACTLY_LABEL,
+        }
+    }
+
+    fn button_hint(self) -> &'static str {
+        match self.precision {
+            CutPrecision::NearestKeyframe => SPLIT_NEAR_HINT,
+            CutPrecision::ExactFrame => SPLIT_EXACTLY_HINT,
+        }
+    }
+}
+
 enum PlayState {
     Playing(Playback),
     Paused {
@@ -670,15 +709,14 @@ impl Player {
     /// Draws the player window and handles its buttons. Its keys are taken
     /// by `take_keys`, which the app calls earlier in the frame.
     ///
-    /// `split_would_land_at` is the keyframe a split at the current position
-    /// would be cut on, if a split is possible there.
+    /// `split_here` says what a split at the current position would do.
     /// `scenes` are the scenes of the video as the review has them now, in
     /// order. The player shows which one is on screen.
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         scenes: &[TimeSpan],
-        split_would_land_at: Option<f64>,
+        split_here: SplitHere,
     ) -> PlayerEvent {
         self.take_newest_frame(ctx);
         self.take_newest_still(ctx);
@@ -708,7 +746,7 @@ impl Player {
                     self.step_frames_with_the_wheel(ui.ctx());
                 }
                 self.show_scene_bar(ui, scenes, scene);
-                self.show_controls(ui, scenes, scene, split_would_land_at);
+                self.show_controls(ui, scenes, scene, split_here);
             })
             .map_or(screen, |shown| shown.response.rect);
         self.ask_before_turning_sound_on(ctx, player_window);
@@ -1030,7 +1068,7 @@ impl Player {
         ui: &mut egui::Ui,
         scenes: &[TimeSpan],
         scene: Option<SceneIndex>,
-        split_would_land_at: Option<f64>,
+        split_here: SplitHere,
     ) {
         let palette = theme::palette(ui.ctx());
         ui.set_max_width(self.picture_size.x);
@@ -1059,14 +1097,14 @@ impl Player {
             // The same step the mouse wheel makes, for those who do not
             // think to turn it.
             if ui
-                .button("-1 frame")
+                .button(ONE_PICTURE_BACK_LABEL)
                 .on_hover_text("One picture back. The mouse wheel over the picture does the same.")
                 .clicked()
             {
                 self.step_frames(-1, ui.ctx());
             }
             if ui
-                .button("+1 frame")
+                .button(ONE_PICTURE_FORWARD_LABEL)
                 .on_hover_text(
                     "One picture forward. The mouse wheel over the picture does the same.",
                 )
@@ -1100,10 +1138,8 @@ impl Player {
 
         ui.horizontal_wrapped(|ui| {
             let split_button = ui
-                .add(theme::primary_button(ui, "Split near here (S)"))
-                .on_hover_text(
-                    "Cuts the scene playing now in two, at the closest point where the video can be split.",
-                );
+                .add(theme::primary_button(ui, split_here.button_label()))
+                .on_hover_text(split_here.button_hint());
             if split_button.clicked() {
                 self.split_requested = true;
             }
@@ -1112,8 +1148,7 @@ impl Player {
             {
                 theme::pill(
                     ui,
-                    theme::semibold(scene_name(scene, scenes.len()), 14.0)
-                        .color(palette.on_fill),
+                    theme::semibold(scene_name(scene, scenes.len()), 14.0).color(palette.on_fill),
                     palette.scene_color(scene.position()),
                 )
                 .on_hover_text(scene_times(span));
@@ -1148,7 +1183,7 @@ impl Player {
         }
         // While playing the answer would change many times a second, so it
         // is shown once the person has stopped on a picture.
-        if let (true, Some(split_point)) = (paused, split_would_land_at) {
+        if let (true, Some(split_point)) = (paused, split_here.would_land_at) {
             ui.add(
                 egui::Label::new(theme::caption(
                     ui,
@@ -1157,13 +1192,7 @@ impl Player {
                 .wrap(),
             );
         }
-        ui.add(
-            egui::Label::new(theme::caption(
-                ui,
-                "Esc closes the player. Pause, then step by frames to find the exact picture.",
-            ))
-            .wrap(),
-        );
+        ui.add(egui::Label::new(theme::caption(ui, PLAYER_HINT)).wrap());
     }
 }
 
@@ -1281,6 +1310,24 @@ mod tests {
         keyboard: KeyboardOwner,
     }
 
+    /// What the split button does in a test that is not about it.
+    const SPLIT_NEAR_NOWHERE: SplitHere = SplitHere {
+        precision: CutPrecision::NearestKeyframe,
+        would_land_at: None,
+    };
+
+    #[test]
+    fn the_split_button_says_whether_the_split_lands_on_the_picture_or_near_it() {
+        let exactly = SplitHere {
+            precision: CutPrecision::ExactFrame,
+            would_land_at: Some(10.0),
+        };
+        assert_eq!(SPLIT_NEAR_NOWHERE.button_label(), "Split near here (S)");
+        assert!(SPLIT_NEAR_NOWHERE.button_hint().contains("closest point"));
+        assert_eq!(exactly.button_label(), "Split here (S)");
+        assert!(exactly.button_hint().contains("on this picture"));
+    }
+
     impl PausedPlayer {
         fn new() -> Self {
             let ctx = egui::Context::default();
@@ -1306,7 +1353,7 @@ mod tests {
             let mut event = PlayerEvent::StillOpen;
             let _ = self.ctx.run(input, |ctx| {
                 self.player.take_keys(ctx, self.keyboard);
-                event = self.player.show(ctx, &three_scenes(), None);
+                event = self.player.show(ctx, &three_scenes(), SPLIT_NEAR_NOWHERE);
             });
             event
         }
