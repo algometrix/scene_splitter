@@ -11,22 +11,32 @@
 //!   the picture that was chosen,
 //! - every picture that was copied decodes to the very same picture as in
 //!   the original,
+//! - every picture that was encoded again looks like its picture in the
+//!   original, and not like the one before or after it, as far as small
+//!   grey copies of them can tell,
+//! - each scene is to be shown the way the original is: the same size,
+//!   shape, turn and colours,
 //! - the pictures of each scene are shown at the same pace as in the
 //!   original, also across the joins,
 //! - the scenes, one after another, hold every packet of the original's
 //!   sound, unchanged and in order, each in the scene in which it starts,
 //! - the sound of each scene is in step with its pictures as in the original.
 //!
-//! What it cannot prove is how the pictures that were encoded again look.
+//! What it cannot prove is that the pictures that were encoded again look
+//! the same as the original's down to the detail. The small copies tell a
+//! wrong picture from the right one, not a slightly worse one from a good
+//! one. Two pictures in a row that show the same thing cannot be told apart
+//! either, which then does not matter to the eye.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::exact_cut::ExactCutPlan;
-use crate::ffmpeg::{FfmpegError, NotUnderstood, Program, STEADY_OUTPUT_LIMIT};
+use crate::exact_cut::{ExactCutPlan, ScenePlan};
+use crate::ffmpeg::{FfmpegError, NotUnderstood, Program, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT};
 use crate::tools;
 
 /// How far the time of a picture, measured from its scene's first picture,
@@ -41,6 +51,42 @@ const SOUND_STEP_TOLERANCE_SECONDS: f64 = 0.002;
 /// The first output stream of a read-back is the decoded picture, the rest
 /// are the sound streams.
 const PICTURE_STREAM: u32 = 0;
+
+/// A small copy has this many cells along each side.
+const SMALL_COPY_SIDE: usize = 16;
+const SMALL_COPY_CELLS: usize = SMALL_COPY_SIDE * SMALL_COPY_SIDE;
+/// How far a picture that was encoded again may be from its picture in the
+/// original, as the average difference between the cells of their small
+/// copies, in steps of brightness out of 255. Encoding the test videos again
+/// gives 0.2. A picture with its range of brightness read wrongly, or
+/// another picture altogether, is several steps away.
+const LARGEST_DIFFERENCE_FROM_ITS_OWN_PICTURE: f64 = 3.0;
+/// A picture that is this much more like the one before or after its own in
+/// the original was taken from the wrong place. In the test videos the
+/// picture next to the right one is 0.9 further away than the right one.
+const CLEARLY_MORE_LIKE_A_NEIGHBOUR: f64 = 0.5;
+/// What ffprobe says about how the pictures of a file are to be shown. The
+/// lines that begin with one of these have to be the same for a scene and
+/// the original.
+const SHOWN_AS_PROPERTIES: [&str; 9] = [
+    "width=",
+    "height=",
+    "sample_aspect_ratio=",
+    "color_range=",
+    "color_space=",
+    "color_transfer=",
+    "color_primaries=",
+    // How far to turn the pictures for showing, as older and newer versions
+    // of ffprobe print it.
+    "TAG:rotate=",
+    "rotation=",
+];
+const SMALL_COPIES_OF_THE_ORIGINAL_FILE: &str = "small_copies_original.gray";
+/// The longest condition that names the pictures to make small copies of.
+/// Every cut adds about 30 characters to it, and Windows takes a command
+/// line of some 32,000 characters at most. A video with more cuts than fit
+/// has all its pictures copied small instead, at 256 bytes a picture.
+const LONGEST_SELECT_CONDITION: usize = 8_000;
 
 /// One decoded picture.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,12 +111,70 @@ impl SoundPacket {
     }
 }
 
+/// A picture shrunk to a few grey cells, each the average brightness of its
+/// part of the picture. Two pictures that show the same thing have nearly
+/// the same small copy, however they were encoded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SmallCopy(Vec<u8>);
+
+impl SmallCopy {
+    /// The average difference between the cells of two small copies, in
+    /// steps of brightness out of 255.
+    fn difference_from(&self, other: &Self) -> f64 {
+        let total: u32 = self
+            .0
+            .iter()
+            .zip(&other.0)
+            .map(|(&cell, &other_cell)| u32::from(cell.abs_diff(other_cell)))
+            .sum();
+        f64::from(total) / SMALL_COPY_CELLS as f64
+    }
+}
+
+/// How the pictures of a file are to be shown: their size, shape, turn and
+/// colours, as ffprobe states them, one property to a line.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ShownAs(Vec<String>);
+
+impl ShownAs {
+    /// The lines of ffprobe's description of a video stream that say how
+    /// its pictures are to be shown.
+    fn from_stream_description(description: &str) -> Self {
+        let properties = description
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                SHOWN_AS_PROPERTIES
+                    .iter()
+                    .any(|property| line.starts_with(property))
+            })
+            .map(str::to_owned)
+            .collect();
+        Self(properties)
+    }
+
+    /// The first property stated here that `other` does not state the same
+    /// way, or else the first that only `other` states.
+    fn first_difference_from<'properties>(
+        &'properties self,
+        other: &'properties Self,
+    ) -> Option<&'properties str> {
+        let only_here = self.0.iter().find(|property| !other.0.contains(property));
+        let only_there = other.0.iter().find(|property| !self.0.contains(property));
+        only_here.or(only_there).map(String::as_str)
+    }
+}
+
 /// What reading a video from start to end gave: every picture decoded, and
 /// every packet of every sound stream.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReadBack {
     pub pictures: Vec<DecodedPicture>,
     pub sound: BTreeMap<u32, Vec<SoundPacket>>,
+    /// Small copies of the pictures that were asked for, by their place
+    /// among the pictures of the file, counted from zero.
+    pub small_copies: BTreeMap<usize, SmallCopy>,
+    pub shown_as: ShownAs,
 }
 
 /// Where one cut was asked for and where the scene after it starts.
@@ -86,6 +190,12 @@ pub struct ExactCutProof {
     /// Pictures in the original, and in the scenes together.
     pub pictures: usize,
     pub pictures_encoded_again: usize,
+    /// How many scenes have no stretch that could be copied and so were
+    /// encoded again from their first picture to their last.
+    pub scenes_encoded_as_a_whole: usize,
+    /// The most a picture that was encoded again differs from its picture
+    /// in the original, as their small copies measure it.
+    pub largest_picture_difference: f64,
     /// Packets of sound in the original, and in the scenes together.
     pub sound_packets: usize,
     pub cut_landings: Vec<CutLanding>,
@@ -114,6 +224,27 @@ pub enum NotProven {
     CopiedPictureDiffers {
         scene: usize,
         picture: usize,
+    },
+    /// A picture that was encoded again was not among those the read-back
+    /// made small copies of, so it could not be compared.
+    EncodedPictureNotCompared {
+        scene: usize,
+        picture: usize,
+    },
+    EncodedPictureDiffers {
+        scene: usize,
+        picture: usize,
+        difference: f64,
+    },
+    /// A picture that was encoded again is more like the picture before or
+    /// after its own in the original than like its own.
+    EncodedPictureIsAnother {
+        scene: usize,
+        picture: usize,
+    },
+    ShownDifferently {
+        scene: usize,
+        property: String,
     },
     PictureTiming {
         scene: usize,
@@ -172,6 +303,26 @@ impl fmt::Display for NotProven {
                 formatter,
                 "picture {picture} of scene {scene} was copied but does not decode to the same picture as in the original"
             ),
+            Self::EncodedPictureNotCompared { scene, picture } => write!(
+                formatter,
+                "picture {picture} of scene {scene} was encoded again but could not be compared with the original"
+            ),
+            Self::EncodedPictureDiffers {
+                scene,
+                picture,
+                difference,
+            } => write!(
+                formatter,
+                "picture {picture} of scene {scene} was encoded again and does not look like its picture in the original (they differ by {difference:.1} of 255 steps of brightness)"
+            ),
+            Self::EncodedPictureIsAnother { scene, picture } => write!(
+                formatter,
+                "picture {picture} of scene {scene} was encoded again and looks like the picture next to its own in the original"
+            ),
+            Self::ShownDifferently { scene, property } => write!(
+                formatter,
+                "scene {scene} is not to be shown the way the original is ({property} is not the same in both)"
+            ),
             Self::PictureTiming {
                 scene,
                 picture,
@@ -223,10 +374,15 @@ impl fmt::Display for NotProven {
 /// Why an exact split could not be checked, or did not pass.
 #[derive(Debug)]
 pub enum VerifyError {
-    /// The file could not be decoded from start to end.
+    /// The file could not be decoded from start to end, or not described.
     DoesNotDecode {
         file: PathBuf,
         source: FfmpegError,
+    },
+    /// The small copies the read-back wrote could not be read from disk.
+    SmallCopiesUnreadable {
+        file: PathBuf,
+        source: io::Error,
     },
     NotProven(NotProven),
 }
@@ -237,9 +393,12 @@ impl fmt::Display for VerifyError {
             Self::DoesNotDecode { file, source } => {
                 write!(
                     formatter,
-                    "{} does not decode to its end: {source}",
+                    "{} could not be read back from start to end: {source}",
                     file.display()
                 )
+            }
+            Self::SmallCopiesUnreadable { file, source } => {
+                write!(formatter, "could not read {}: {source}", file.display())
             }
             Self::NotProven(what) => write!(formatter, "{what}"),
         }
@@ -247,6 +406,15 @@ impl fmt::Display for VerifyError {
 }
 
 impl std::error::Error for VerifyError {}
+
+/// The scene files of an exact split, while they wait to be checked.
+#[derive(Debug, Clone, Copy)]
+pub struct WrittenScenes<'split> {
+    /// One file for every scene of the video, in scene order.
+    pub files: &'split [PathBuf],
+    /// A folder the check may write into. Whoever made it removes it.
+    pub scratch_folder: &'split Path,
+}
 
 /// Whether a picture that decodes with an error ends the reading.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -263,50 +431,222 @@ enum DecodeErrors {
 /// the cuts were asked for, one per scene after the first.
 pub fn verify_exact_split(
     original: &Path,
-    scene_files: &[PathBuf],
+    written: WrittenScenes,
     plan: &ExactCutPlan,
     cut_times: &[f64],
 ) -> Result<ExactCutProof, VerifyError> {
-    let read = |file: &Path, decode_errors| {
-        read_back(file, decode_errors).map_err(|source| VerifyError::DoesNotDecode {
-            file: file.to_path_buf(),
-            source,
-        })
-    };
-    let original_read = read(original, DecodeErrors::ReadOn)?;
-    let scenes_read = scene_files
+    // Checked before anything is read: a scene file without a plan could not
+    // be read back by one.
+    if written.files.len() != plan.scenes().len() {
+        return Err(VerifyError::NotProven(NotProven::SceneCount {
+            planned: plan.scenes().len(),
+            written: written.files.len(),
+        }));
+    }
+    let original_read = read_back(&FileToReadBack {
+        video: original,
+        decode_errors: DecodeErrors::ReadOn,
+        to_compare: PicturesToCompare::in_the_original(plan),
+        small_copies_file: written
+            .scratch_folder
+            .join(SMALL_COPIES_OF_THE_ORIGINAL_FILE),
+    })?;
+    let scenes_read = written
+        .files
         .par_iter()
-        .map(|scene| read(scene, DecodeErrors::Fail))
+        .zip(plan.scenes())
+        .map(|(scene_file, scene_plan)| {
+            read_back(&FileToReadBack {
+                video: scene_file,
+                decode_errors: DecodeErrors::Fail,
+                to_compare: PicturesToCompare::in_a_scene(scene_plan),
+                small_copies_file: scene_file.with_extension(SMALL_COPIES_EXTENSION),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     prove(plan, cut_times, &original_read, &scenes_read).map_err(VerifyError::NotProven)
 }
 
+/// The pictures of one file that a read-back makes small copies of, by
+/// their place among the pictures of that file, counted from zero.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct PicturesToCompare(BTreeSet<usize>);
+
+impl PicturesToCompare {
+    /// Every picture of the video that the plan encodes again, and the one
+    /// before and after each, to tell a picture from its neighbours.
+    fn in_the_original(plan: &ExactCutPlan) -> Self {
+        let last_picture = plan.frame_count().saturating_sub(1);
+        let pictures = plan
+            .scenes()
+            .iter()
+            .flat_map(pictures_encoded_again)
+            .flat_map(|picture| picture.saturating_sub(1)..=(picture + 1).min(last_picture))
+            .collect();
+        let around_the_cuts = Self(pictures);
+        let fits_a_command_line = around_the_cuts
+            .as_select_condition()
+            .is_none_or(|condition| condition.len() <= LONGEST_SELECT_CONDITION);
+        if fits_a_command_line {
+            around_the_cuts
+        } else {
+            // Every picture is one run, which takes one short condition.
+            Self((0..plan.frame_count()).collect())
+        }
+    }
+
+    /// The pictures of one scene that were encoded again, counted from the
+    /// first picture of the scene.
+    fn in_a_scene(scene: &ScenePlan) -> Self {
+        let first_of_scene = scene.frames.first();
+        let pictures = pictures_encoded_again(scene)
+            .map(|picture| picture - first_of_scene)
+            .collect();
+        Self(pictures)
+    }
+
+    /// The condition by which ffmpeg's `select` filter keeps exactly these
+    /// pictures, as one `between` for every run of them. `None` when there
+    /// is nothing to keep.
+    fn as_select_condition(&self) -> Option<String> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &picture in &self.0 {
+            match runs.last_mut() {
+                Some((_, last)) if *last + 1 == picture => *last = picture,
+                _ => runs.push((picture, picture)),
+            }
+        }
+        let conditions: Vec<String> = runs
+            .iter()
+            .map(|(first, last)| format!("between(n,{first},{last})"))
+            .collect();
+        (!conditions.is_empty()).then(|| conditions.join("+"))
+    }
+}
+
+/// The pictures of the video that a scene has encoded again, by their place
+/// among the pictures of the whole video.
+fn pictures_encoded_again(scene: &ScenePlan) -> impl Iterator<Item = usize> + '_ {
+    scene
+        .parts
+        .iter()
+        .filter(|part| !part.is_copied())
+        .flat_map(|part| part.frames.frames())
+}
+
+const SMALL_COPIES_EXTENSION: &str = "gray";
+
+/// One file to read back, and what to bring back from it.
+struct FileToReadBack<'check> {
+    video: &'check Path,
+    decode_errors: DecodeErrors,
+    to_compare: PicturesToCompare,
+    /// Where ffmpeg writes the small copies before they are read in.
+    small_copies_file: PathBuf,
+}
+
 /// Has ffmpeg decode every picture and list a checksum of it, and list a
-/// checksum of every packet of sound without decoding it.
-fn read_back(video: &Path, decode_errors: DecodeErrors) -> Result<ReadBack, FfmpegError> {
-    let mut ffmpeg = tools::command(Program::Ffmpeg).args(["-nostdin", "-v", "error"]);
-    if decode_errors == DecodeErrors::Fail {
+/// checksum of every packet of sound without decoding it. In the same run
+/// it writes small copies of the pictures that are to be compared by eye,
+/// so to speak, since the video is decoded only once.
+fn read_back(file: &FileToReadBack) -> Result<ReadBack, VerifyError> {
+    let could_not_read = |source| VerifyError::DoesNotDecode {
+        file: file.video.to_path_buf(),
+        source,
+    };
+    let mut ffmpeg = tools::command(Program::Ffmpeg).args(["-nostdin", "-v", "error", "-y"]);
+    if file.decode_errors == DecodeErrors::Fail {
         // ffmpeg is told to stop at the first error. It still carries on
         // after some pictures it could not decode properly and only writes
         // about them, so anything it writes counts as a failure too.
         ffmpeg = ffmpeg.arg("-xerror").failing_on_complaints();
     }
+    // Every decoded picture is listed once, with the time the file gives
+    // it. Without these ffmpeg drops or repeats pictures to even out their
+    // times, and rounds the times to whole pictures.
+    let picture_times = tools::picture_times_option().arguments();
+    ffmpeg = ffmpeg
+        .arg("-i")
+        .arg(file.video)
+        .args(["-map", "0:v:0", "-map", "0:a?", "-c:a", "copy"])
+        .args(picture_times)
+        .args(["-f", "framecrc", "-"]);
+    let select_condition = file.to_compare.as_select_condition();
+    if let Some(condition) = &select_condition {
+        ffmpeg = ffmpeg
+            .args(["-map", "0:v:0", "-vf", &small_copy_filters(condition)])
+            .args(picture_times)
+            .args(["-f", "rawvideo"])
+            .arg(&file.small_copies_file);
+    }
+
     let mut listing = ReadBackListing::default();
     ffmpeg
-        .arg("-i")
-        .arg(video)
-        .args(["-map", "0:v:0", "-map", "0:a?", "-c:a", "copy"])
-        // Every decoded picture is listed once, with the time the file gives
-        // it. Without these ffmpeg drops or repeats pictures to even out
-        // their times, and rounds the times to whole pictures.
-        .args(tools::picture_times_option().arguments())
-        .args(["-f", "framecrc", "-"])
         .stream_lines(STEADY_OUTPUT_LIMIT, |line| {
             listing
                 .take_line(line)
                 .map_err(|problem| NotUnderstood(format!("checksum line {line:?}, {problem}")))
+        })
+        .map_err(could_not_read)?;
+    let mut read = listing.read;
+
+    if select_condition.is_some() {
+        let cells = std::fs::read(&file.small_copies_file).map_err(|source| {
+            VerifyError::SmallCopiesUnreadable {
+                file: file.small_copies_file.clone(),
+                source,
+            }
         })?;
-    Ok(listing.read)
+        read.small_copies = small_copies_from(&file.to_compare, &cells).map_err(|detail| {
+            could_not_read(FfmpegError::OutputNotUnderstood {
+                program: Program::Ffmpeg,
+                detail,
+            })
+        })?;
+    }
+    read.shown_as = read_shown_as(file.video).map_err(could_not_read)?;
+    Ok(read)
+}
+
+/// The filters that turn the pictures `select_condition` keeps into small
+/// copies: shrunk by averaging, and grey.
+fn small_copy_filters(select_condition: &str) -> String {
+    format!(
+        "select='{select_condition}',scale={SMALL_COPY_SIDE}:{SMALL_COPY_SIDE}:flags=area,format=gray"
+    )
+}
+
+/// Gives each picture that was to be compared its small copy. ffmpeg wrote
+/// them one after another, in the order the pictures are shown.
+fn small_copies_from(
+    compared: &PicturesToCompare,
+    cells: &[u8],
+) -> Result<BTreeMap<usize, SmallCopy>, String> {
+    if cells.len() != compared.0.len() * SMALL_COPY_CELLS {
+        return Err(format!(
+            "expected small copies of {} pictures, which is {} bytes, and got {} bytes",
+            compared.0.len(),
+            compared.0.len() * SMALL_COPY_CELLS,
+            cells.len()
+        ));
+    }
+    // The length was just checked, so nothing is left over.
+    let (small_copies, _left_over) = cells.as_chunks::<SMALL_COPY_CELLS>();
+    Ok(compared
+        .0
+        .iter()
+        .zip(small_copies)
+        .map(|(&picture, cells)| (picture, SmallCopy(cells.to_vec())))
+        .collect())
+}
+
+/// Asks ffprobe how the pictures of the video are to be shown.
+fn read_shown_as(video: &Path) -> Result<ShownAs, FfmpegError> {
+    let description = tools::command(Program::Ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_streams"])
+        .arg(video)
+        .run_for_text(QUICK_ANSWER_LIMIT)?;
+    Ok(ShownAs::from_stream_description(&description))
 }
 
 /// Collects the lines of a checksum listing. Header lines say how long one
@@ -407,11 +747,15 @@ pub fn prove(
         });
     }
     prove_pictures(plan, original, scenes)?;
+    let largest_picture_difference = prove_encoded_pictures(plan, original, scenes)?;
+    prove_shown_alike(original, scenes)?;
     let cut_landings = prove_cut_landings(plan, cut_times, original)?;
     let largest_sound_shift_seconds = prove_sound(plan, original, scenes)?;
     Ok(ExactCutProof {
         pictures: original.pictures.len(),
         pictures_encoded_again: plan.frames_encoded_again(),
+        scenes_encoded_as_a_whole: plan.scenes_encoded_as_a_whole(),
+        largest_picture_difference,
         sound_packets: original.sound.values().map(Vec::len).sum(),
         cut_landings,
         largest_sound_shift_seconds,
@@ -464,6 +808,78 @@ fn prove_pictures(
                     picture: frame - planned.first() + 1,
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Each picture that was encoded again looks like its picture in the
+/// original, and not more like the one before or after that. Returns the
+/// largest difference from its own picture that was found.
+///
+/// The count of pictures alone would not show an encoding that began one
+/// picture early or late: it would still have as many pictures, shown at the
+/// same pace. This is what shows it, wherever two pictures in a row differ,
+/// as they do where a scene changes.
+fn prove_encoded_pictures(
+    plan: &ExactCutPlan,
+    original: &ReadBack,
+    scenes: &[ReadBack],
+) -> Result<f64, NotProven> {
+    let mut largest_difference: f64 = 0.0;
+    for (position, (scene_plan, scene)) in plan.scenes().iter().zip(scenes).enumerate() {
+        let scene_number = position + 1;
+        let first_of_scene = scene_plan.frames.first();
+        for picture in pictures_encoded_again(scene_plan) {
+            let place_in_scene = picture - first_of_scene;
+            let picture_number = place_in_scene + 1;
+            let (Some(encoded), Some(its_own)) = (
+                scene.small_copies.get(&place_in_scene),
+                original.small_copies.get(&picture),
+            ) else {
+                return Err(NotProven::EncodedPictureNotCompared {
+                    scene: scene_number,
+                    picture: picture_number,
+                });
+            };
+            let difference = encoded.difference_from(its_own);
+            if difference > LARGEST_DIFFERENCE_FROM_ITS_OWN_PICTURE {
+                return Err(NotProven::EncodedPictureDiffers {
+                    scene: scene_number,
+                    picture: picture_number,
+                    difference,
+                });
+            }
+            let neighbours = [picture.checked_sub(1), picture.checked_add(1)];
+            let is_more_like_a_neighbour = neighbours
+                .into_iter()
+                .flatten()
+                .filter_map(|neighbour| original.small_copies.get(&neighbour))
+                .any(|neighbour| {
+                    encoded.difference_from(neighbour) + CLEARLY_MORE_LIKE_A_NEIGHBOUR < difference
+                });
+            if is_more_like_a_neighbour {
+                return Err(NotProven::EncodedPictureIsAnother {
+                    scene: scene_number,
+                    picture: picture_number,
+                });
+            }
+            largest_difference = largest_difference.max(difference);
+        }
+    }
+    Ok(largest_difference)
+}
+
+/// Each scene is to be shown the way the original is. A scene that begins
+/// with pictures that were encoded again takes these properties from the
+/// encoder, which is where they could come out differently.
+fn prove_shown_alike(original: &ReadBack, scenes: &[ReadBack]) -> Result<(), NotProven> {
+    for (position, scene) in scenes.iter().enumerate() {
+        if let Some(property) = original.shown_as.first_difference_from(&scene.shown_as) {
+            return Err(NotProven::ShownDifferently {
+                scene: position + 1,
+                property: property.to_owned(),
+            });
         }
     }
     Ok(())
@@ -569,12 +985,14 @@ fn prove_sound(
                 });
             }
 
+            // Every packet, not only the first and the last: sound that
+            // drifted and came back by the end of the scene is out of step
+            // all the same.
             let scene_start = scene.pictures[0].shown_at;
             let original_start = original.pictures[scene_plan.frames.first()].shown_at;
-            let ends = [0, in_scene.len() - 1];
-            for place in ends {
-                let seconds_off = (in_scene[place].starts_at - scene_start)
-                    - (in_original[place].starts_at - original_start);
+            for (packet_in_scene, packet_in_original) in in_scene.iter().zip(in_original) {
+                let seconds_off = (packet_in_scene.starts_at - scene_start)
+                    - (packet_in_original.starts_at - original_start);
                 if seconds_off.abs() > SOUND_STEP_TOLERANCE_SECONDS {
                     return Err(NotProven::SoundOutOfStep {
                         scene: scene_number,
@@ -605,6 +1023,32 @@ mod tests {
     /// The sound of the test video starts a little before its pictures, as
     /// the sound of real files often does.
     const SOUND_LEAD_SECONDS: f64 = 0.01;
+    /// The small copy of each picture of the test video is evenly grey but
+    /// for one bright cell, which is another cell in every picture.
+    const GREY: u8 = 100;
+    const BRIGHT: u8 = 200;
+    /// How far encoding again moves every cell of a small copy. With this,
+    /// a picture is 1.0 from its own in the original and 1.8 from the one
+    /// next to that.
+    const ENCODING_LOSS: u8 = 1;
+    const SHOWN_AS_IN_THE_ORIGINAL: &str = "width=320\nheight=180\nsample_aspect_ratio=1:1\n\
+        color_range=tv\ncolor_space=bt709\n";
+
+    fn small_copy_of(frame: usize) -> SmallCopy {
+        let mut cells = vec![GREY; SMALL_COPY_CELLS];
+        cells[frame] = BRIGHT;
+        SmallCopy(cells)
+    }
+
+    fn after_encoding_again(small_copy: &SmallCopy) -> SmallCopy {
+        SmallCopy(
+            small_copy
+                .0
+                .iter()
+                .map(|cell| cell + ENCODING_LOSS)
+                .collect(),
+        )
+    }
 
     fn time_of(frame: usize) -> f64 {
         frame as f64 * FRAME_SECONDS
@@ -648,9 +1092,14 @@ mod tests {
                 checksum: 1000 + packet as u32,
             })
             .collect();
+        let small_copies = (0..FRAME_COUNT)
+            .map(|frame| (frame, small_copy_of(frame)))
+            .collect();
         ReadBack {
             pictures,
             sound: BTreeMap::from([(SOUND_STREAM, packets)]),
+            small_copies,
+            shown_as: ShownAs::from_stream_description(SHOWN_AS_IN_THE_ORIGINAL),
         }
     }
 
@@ -689,9 +1138,15 @@ mod tests {
                         ..*packet
                     })
                     .collect();
+                let small_copies = (first..end)
+                    .filter(|frame| encoded_again.contains(frame))
+                    .map(|frame| (frame - first, after_encoding_again(&small_copy_of(frame))))
+                    .collect();
                 ReadBack {
                     pictures,
                     sound: BTreeMap::from([(SOUND_STREAM, packets)]),
+                    small_copies,
+                    shown_as: original.shown_as.clone(),
                 }
             })
             .collect()
@@ -918,6 +1373,240 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sound_that_drifts_in_the_middle_of_a_scene_is_not_proven() {
+        // The first and the last packet of the scene are where they belong.
+        let mut scenes = correct_scenes(&original());
+        let packets = scenes[1].sound.get_mut(&SOUND_STREAM).unwrap();
+        let in_the_middle = packets.len() / 2;
+        packets[in_the_middle].starts_at += 0.010;
+        assert!(matches!(
+            proof_of(&scenes),
+            Err(NotProven::SoundOutOfStep {
+                scene: 2,
+                stream: SOUND_STREAM,
+                ..
+            })
+        ));
+    }
+
+    /// The place, in the second scene, of a picture of the video that was
+    /// encoded again there.
+    const ENCODED_IN_SECOND_SCENE: usize = 80 - CUT_FRAME;
+
+    #[test]
+    fn an_encoded_picture_that_looks_like_its_own_is_proven_with_how_far_it_is() {
+        let proof = proof_of(&correct_scenes(&original())).unwrap();
+        assert!((proof.largest_picture_difference - f64::from(ENCODING_LOSS)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_encoded_picture_that_looks_like_nothing_in_the_original_is_not_proven() {
+        let mut scenes = correct_scenes(&original());
+        let white = SmallCopy(vec![u8::MAX; SMALL_COPY_CELLS]);
+        scenes[1]
+            .small_copies
+            .insert(ENCODED_IN_SECOND_SCENE, white);
+        assert!(matches!(
+            proof_of(&scenes),
+            Err(NotProven::EncodedPictureDiffers { scene: 2, picture, .. })
+                if picture == ENCODED_IN_SECOND_SCENE + 1
+        ));
+    }
+
+    #[test]
+    fn pictures_encoded_from_one_picture_too_late_are_not_proven() {
+        // The scene has as many pictures as planned, shown at the right
+        // pace. Only what they show is the picture after their own.
+        let mut scenes = correct_scenes(&original());
+        let encoded_places: Vec<usize> = scenes[1].small_copies.keys().copied().collect();
+        for place in encoded_places {
+            let one_too_late = after_encoding_again(&small_copy_of(CUT_FRAME + place + 1));
+            scenes[1].small_copies.insert(place, one_too_late);
+        }
+        assert_eq!(
+            proof_of(&scenes),
+            Err(NotProven::EncodedPictureIsAnother {
+                scene: 2,
+                picture: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn pictures_that_all_show_the_same_thing_are_proven_wherever_they_were_taken_from() {
+        // Nothing moves in the video, so a picture is no more like its own
+        // than like the next one. That is no reason to throw the scenes away.
+        let still = SmallCopy(vec![GREY; SMALL_COPY_CELLS]);
+        let mut original = original();
+        for small_copy in original.small_copies.values_mut() {
+            *small_copy = still.clone();
+        }
+        let mut scenes = correct_scenes(&original);
+        for scene in &mut scenes {
+            for small_copy in scene.small_copies.values_mut() {
+                *small_copy = after_encoding_again(&still);
+            }
+        }
+        assert!(prove(&plan(), &[cut_time()], &original, &scenes).is_ok());
+    }
+
+    #[test]
+    fn an_encoded_picture_without_a_small_copy_is_not_proven() {
+        let mut scenes = correct_scenes(&original());
+        scenes[0].small_copies.clear();
+        assert_eq!(
+            proof_of(&scenes),
+            Err(NotProven::EncodedPictureNotCompared {
+                scene: 1,
+                picture: KEYFRAME_EVERY + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_scene_that_is_to_be_shown_another_way_is_not_proven() {
+        let mut scenes = correct_scenes(&original());
+        scenes[1].shown_as = ShownAs::from_stream_description(
+            "width=320\nheight=180\nsample_aspect_ratio=1:1\ncolor_range=pc\ncolor_space=bt709\n",
+        );
+        assert_eq!(
+            proof_of(&scenes),
+            Err(NotProven::ShownDifferently {
+                scene: 2,
+                property: "color_range=tv".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_scene_that_is_turned_and_the_original_is_not_is_not_proven() {
+        let mut scenes = correct_scenes(&original());
+        scenes[0].shown_as = ShownAs::from_stream_description(&format!(
+            "{SHOWN_AS_IN_THE_ORIGINAL}[SIDE_DATA]\nrotation=-90\n[/SIDE_DATA]\n"
+        ));
+        assert_eq!(
+            proof_of(&scenes),
+            Err(NotProven::ShownDifferently {
+                scene: 1,
+                property: "rotation=-90".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn how_a_video_is_shown_is_read_from_the_lines_that_say_so() {
+        let description = "[STREAM]\nindex=0\ncodec_name=h264\nwidth=1920\nheight=1080\n\
+            sample_aspect_ratio=1:1\ndisplay_aspect_ratio=16:9\npix_fmt=yuv420p\n\
+            color_range=tv\ncolor_space=bt709\ncolor_transfer=bt709\ncolor_primaries=bt709\n\
+            bit_rate=5000000\nTAG:rotate=90\nTAG:handler_name=VideoHandler\n\
+            [SIDE_DATA]\nside_data_type=Display Matrix\nrotation=-90\n[/SIDE_DATA]\n[/STREAM]\n";
+        assert_eq!(
+            ShownAs::from_stream_description(description),
+            ShownAs(
+                [
+                    "width=1920",
+                    "height=1080",
+                    "sample_aspect_ratio=1:1",
+                    "color_range=tv",
+                    "color_space=bt709",
+                    "color_transfer=bt709",
+                    "color_primaries=bt709",
+                    "TAG:rotate=90",
+                    "rotation=-90",
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn small_copies_are_asked_for_of_the_encoded_pictures_and_those_beside_them() {
+        let plan = plan();
+        // Pictures 50 to 99 are encoded again, 50 to 72 in the first scene.
+        assert_eq!(
+            PicturesToCompare::in_the_original(&plan)
+                .as_select_condition()
+                .as_deref(),
+            Some("between(n,49,100)")
+        );
+        assert_eq!(
+            PicturesToCompare::in_a_scene(&plan.scenes()[0])
+                .as_select_condition()
+                .as_deref(),
+            Some("between(n,50,72)")
+        );
+        assert_eq!(
+            PicturesToCompare::in_a_scene(&plan.scenes()[1])
+                .as_select_condition()
+                .as_deref(),
+            Some("between(n,0,26)")
+        );
+    }
+
+    #[test]
+    fn with_more_cuts_than_a_command_line_holds_every_picture_is_copied_small() {
+        // A keyframe every 50 pictures and a cut 23 pictures after every
+        // third of them, so the pictures around each cut are a run of their
+        // own with copied pictures before and after.
+        const CUTS: usize = 600;
+        const KEYFRAMES_PER_CUT: usize = 3;
+        let frame_count = (CUTS + 1) * KEYFRAMES_PER_CUT * KEYFRAME_EVERY;
+        let stored = (0..frame_count)
+            .map(|frame| StoredFrame {
+                shown_at: time_of(frame),
+                decoded_at: Some(time_of(frame) - 2.0 * FRAME_SECONDS),
+                reorder_ticks: Some(1024),
+                is_keyframe: frame % KEYFRAME_EVERY == 0,
+            })
+            .collect();
+        let table = FrameTable::from_stored_order(stored).unwrap();
+        let whole_video = TimeSpan {
+            start: 0.0,
+            end: time_of(frame_count),
+        };
+        let cut_times = (1..=CUTS)
+            .map(|cut| time_of(cut * KEYFRAMES_PER_CUT * KEYFRAME_EVERY + 23))
+            .collect();
+        let cuts = CutTimes::inside(whole_video, cut_times).unwrap();
+        let plan = plan_exact_cuts(&table, &cuts).unwrap();
+
+        let condition = PicturesToCompare::in_the_original(&plan)
+            .as_select_condition()
+            .unwrap();
+        assert_eq!(condition, format!("between(n,0,{})", frame_count - 1));
+    }
+
+    #[test]
+    fn pictures_apart_from_each_other_are_asked_for_run_by_run() {
+        let apart = PicturesToCompare(BTreeSet::from([0, 1, 2, 7, 9, 10]));
+        assert_eq!(
+            apart.as_select_condition().as_deref(),
+            Some("between(n,0,2)+between(n,7,7)+between(n,9,10)")
+        );
+        assert_eq!(PicturesToCompare::default().as_select_condition(), None);
+        assert_eq!(
+            small_copy_filters("between(n,0,2)"),
+            "select='between(n,0,2)',scale=16:16:flags=area,format=gray"
+        );
+    }
+
+    #[test]
+    fn each_picture_gets_the_small_copy_written_in_its_place() {
+        let compared = PicturesToCompare(BTreeSet::from([4, 9]));
+        let mut cells = vec![10; SMALL_COPY_CELLS];
+        cells.extend(vec![20; SMALL_COPY_CELLS]);
+
+        let small_copies = small_copies_from(&compared, &cells).unwrap();
+        assert_eq!(small_copies[&4], SmallCopy(vec![10; SMALL_COPY_CELLS]));
+        assert_eq!(small_copies[&9], SmallCopy(vec![20; SMALL_COPY_CELLS]));
+        assert!((small_copies[&4].difference_from(&small_copies[&9]) - 10.0).abs() < 1e-9);
+
+        // A picture short, as when ffmpeg decoded fewer than were listed.
+        assert!(small_copies_from(&compared, &cells[..SMALL_COPY_CELLS]).is_err());
     }
 
     #[test]

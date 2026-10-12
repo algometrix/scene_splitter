@@ -81,7 +81,7 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 - **Review now, split later.** Mark each reviewed video with "Split later", then split all of them with one button.
 - **Scan settings per folder.** A folder can have scan settings of its own, for videos from a source that needs them.
 - **Built-in player.** Click a preview picture to play from there, step picture by picture with the mouse wheel, and split the scene at the current position.
-- **Exact cuts, if you want them.** Off by default. With "Cut on the exact picture" on, a split lands on the very picture you chose. Only the pictures between the cut and the nearest points where the video can be cut are encoded again, and the original is always kept.
+- **Exact cuts, if you want them.** Off by default. With "Cut on the exact picture" on, a split lands on the very picture you chose. Only the pictures between the cut and the nearest points where the video can be cut are encoded again, and the original is always kept. A video that cannot be cut that way is cut at the nearest points where it can be cut instead, and the app says so.
 - **Verified before the original is removed.** After a split, the app checks every packet of the scene files against the original. Only then does it move the original to the Recycle Bin or Trash.
 - **Scan ahead.** Scan a whole folder from the command line, and review the results in the window later.
 - **No ffmpeg setup.** The app fetches ffmpeg on first run and checks it against a built-in checksum.
@@ -154,7 +154,7 @@ Scene files are named `<video name>_scene_001`, `_scene_002` and so on, with the
 Two things make a split keep the original whatever you chose for it:
 
 - **A scene is dropped.** The new files do not hold all of the video, so the original is the only place the dropped part still exists.
-- **Exact cuts are on.** The pictures around each cut are encoded again, and no check can compare those with the original one for one.
+- **Exact cuts are on.** The pictures around each cut are encoded again, and no check can compare those with the original one for one. The original also stays when the video could not be cut on the exact pictures and was [cut at the nearest points instead](#when-a-video-cannot-be-cut-exactly). You asked for a split that keeps it, so it is kept.
 
 In both cases the choice about the original on the review screen gives way to one sentence that says the original is always kept, and why. The result of the split says the same. Your saved choice is not changed, and the one-time question about the Recycle Bin or Trash is not asked for such a split. It is left for the first split that could move an original.
 
@@ -184,6 +184,7 @@ Every safeguard of a single split applies to each video:
 - Every safeguard is checked again when a video's turn comes, with the settings as they are then. A video whose split could move its original to the Recycle Bin or Trash before you were ever asked about that is not split. It stays ready, and the next run asks first. A video with splits on exact pictures is not split while exact cuts are off (see [Exact cuts](#exact-cuts)). It goes back into review with that question open.
 - The one-time question about the Recycle Bin or Trash is asked once, before the first video is split, and the answer goes for all of them. It counts only the videos whose original could be moved. If every ready video [keeps its original anyway](#when-the-original-is-always-kept), nothing is asked.
 - A ready video with dropped scenes keeps its original, and so does every video while exact cuts are on. Each video is split with the settings as they are when its turn comes.
+- A ready video that could not be cut on the exact pictures is [cut at the nearest points instead](#when-a-video-cannot-be-cut-exactly). The run counts it among the videos whose result needs a look, and its page says why and how far its splits moved.
 - A video whose split fails keeps its review and offers "Back to review". The videos after it are still split.
 
 Click a ready video to see its page. It says how many files the split will write, how many scenes are dropped, and when the original is always kept. "Edit the scenes again" takes it back into review, as you left it. It is then no longer ready, until you press "Split later" again. Videos you mark ready while a run is under way wait for the next run.
@@ -270,7 +271,7 @@ Splitting from the command line always scans the video afresh. Only the window a
 | `--save-list <file>` | Write the list of scenes to this file: their numbers, times, the names their files get and their chapter titles. With `--list-only` it writes the list and no scene files. See [Scene list](#scene-list). |
 | `--list-format <csv, chapters or edl>` | The format of the scene list. Left out, it follows the file's ending: `.csv`, `.txt` (or `.ffmetadata`) for chapters, `.edl`. |
 | `--keep-original` | Keep the original video, whatever the saved setting says. |
-| `--exact-cuts` | Cut on the exact picture where each scene changes: the middle of a black screen, or the first picture after a hard cut. A few seconds around each cut are encoded again, so the split takes longer. The original is always kept. See [Exact cuts](#exact-cuts). |
+| `--exact-cuts` | Cut on the exact picture where each scene changes: the middle of a black screen, or the first picture after a hard cut. A few seconds around each cut are encoded again, so the split takes longer. The original is always kept. A video that cannot be cut that way is cut at the nearest points where it can be cut instead. The run says so before and after, lists how far each split moved, and exits with an error code. See [Exact cuts](#exact-cuts). |
 | `--hard-cuts` | Also look for hard cuts (scene changes with no black screen). This decodes every frame and is much slower. It uses the saved sensitivity and shortest scene. |
 | `--no-chapters` | Do not split at the chapter marks of the file. Without it, a video with chapters is also split where each chapter begins. |
 | `--scan suspicious` | Decode only where packet sizes hint at a black screen. |
@@ -284,7 +285,7 @@ Options you leave out take their value from the saved [settings](#settings). Out
 
 A video with chapters is listed and split at its chapter marks too, and the list of scenes shows the chapter titles. `--no-chapters` leaves the marks out.
 
-A command line split exits with an error code when the scenes could not be verified or the original could not be moved, so a script can tell.
+A command line split exits with an error code when the scenes could not be verified, the original could not be moved, or `--exact-cuts` was given and the video was cut at the nearest points instead, so a script can tell.
 
 On Windows the program is built as a window program, so that starting it from Explorer opens no console window. From a terminal it still prints there, but an interactive Command Prompt or PowerShell does not wait for a window program: the prompt comes back at once and the output appears after it. To wait for it, and to get its exit code, start it like this in Command Prompt:
 
@@ -469,15 +470,32 @@ Before the scene files get their names, the app decodes the original and every s
 - every scene decodes to its end without an error,
 - each scene has exactly the pictures planned for it, so the scenes together have as many pictures as the original and each scene starts on the picture that was chosen,
 - every copied picture decodes to the very same picture as in the original,
+- every picture that was encoded again looks like its picture in the original, and not more like the one before or after it. The app compares small grey copies of them, 16 by 16 cells each. This is what would show an encoding that began one picture early or late,
+- each scene is to be shown as the original is: the same picture size and shape, the same turn, the same colour properties,
 - the pictures of each scene are shown at the pace of the original, also across the joins,
 - the scenes hold every packet of the original's sound, unchanged and in order, each in the scene in which it starts,
-- the sound of each scene is in step with its pictures.
+- every packet of sound of each scene is in step with its pictures.
 
 With dropped scenes, an exact split still writes and checks every scene, since the check counts the pictures and the sound of the whole video. Only then are the dropped scenes left out and the kept ones named, numbered without gaps.
 
-If any of this does not hold, the scene files are thrown away, the app says so, and you can split the video the normal way instead. What the check cannot prove is how the pictures that were encoded again look, since they are new. So the original is always kept after an exact cut, whatever the setting for originals says. See [When the original is always kept](#when-the-original-is-always-kept).
+If any of this does not hold, the scene files are thrown away before they get their names. What the check cannot prove is that the pictures that were encoded again look the same as the original's in every detail, since they are new. The small copies tell a wrong picture from the right one, not a slightly worse one from a good one, and they cannot tell apart two pictures in a row that show the same thing. So the original is always kept after an exact cut, whatever the setting for originals says. See [When the original is always kept](#when-the-original-is-always-kept).
 
-Exact cuts work for H.264 video with 8-bit 4:2:0 colour that is not interlaced, in MP4, MOV or Matroska files, and need an ffmpeg with the libx264 encoder (the one the app downloads has it). For any other video the app refuses before it writes anything, and says how to split it the normal way. Checking takes about as long as decoding the video twice, and while a scene is written its parts take up as much room again as that scene.
+A scene that has no stretch between two points where a copy can start and end is encoded again as a whole. In a video whose keyframes are no clean starts (many discs and broadcasts are stored that way) that is every scene, so the whole video is encoded again and the split takes as long as that. The result says how many pictures were encoded again and how many scenes as a whole.
+
+Checking takes about as long as decoding the video twice, and while a scene is written its parts take up as much room again as that scene.
+
+<a id="when-a-video-cannot-be-cut-exactly"></a>**When a video cannot be cut exactly.** Exact cuts work for H.264 video with 8-bit 4:2:0 colour that is not interlaced, in MP4, MOV or Matroska files. They need ffmpeg 4.4 or newer with the libx264 encoder, which the ffmpeg the app downloads has. They do not work for a file that stores pictures it never shows, as a video does that was trimmed without encoding.
+
+A video that cannot be cut exactly is not refused. It is cut the normal way, by copying, at the points nearest to your splits where it can be cut:
+
+- **Known before the split.** The kind of file, how its pictures are stored and what the ffmpeg in use can do show at a glance. With exact cuts on, the review screen then says above the choices for the split that this video will be cut at the nearest points instead, and why. The command line prints the same before it starts. Some reasons only show once every picture is listed, at the start of the split, such as two splits on the same picture.
+- **Found out during the split.** If the scenes could not be written on the exact pictures, or were written and did not pass the check above, they are thrown away. Nothing of them is left, and scene files of an earlier split are still as they were. The video is then cut at the nearest points as well.
+
+Either way the result says so in plain words: that the video could not be cut on the exact picture, why, that it was cut at the nearest points where it can be cut instead, how many splits moved, and how far the one that moved farthest went ("from 00:00:02.920 to 00:00:02.000, 0.920 seconds earlier"). The technical reason is under "Details". The command line lists every split with where it was asked for and where the video was cut. Such a result is headed "The files were written, but check the note below", and a run over the ready videos counts it among the results that need a look.
+
+The scene files of such a split are plain copies, and the app checks them [packet for packet](#how-it-works) like those of any normal split. The original is kept all the same, because you asked for a split that always keeps it.
+
+Two things stop even that, with nothing written and the original untouched: two of your splits have the same nearest point where the video can be cut (merge the scenes on both sides of one of them), or the video has no such point near a split. Trouble that has nothing to do with exact cuts, such as a full disk, a drive that stopped answering or an ffmpeg that does not start, fails the split as before. A normal cut would only fail on it again.
 
 **Nothing half-written.** The split writes the scenes into a folder named `unfinished_` and a number, inside the folder they go to. Only when every scene is there does it move them to their names and remove that folder. A split that fails or stalls leaves no partial scene files, and leaves the scene files of an earlier split as they were. In the window, a video whose split failed offers "Back to review", which brings back the scenes as you left them, and "Try again", which scans it afresh.
 
@@ -512,6 +530,9 @@ What differs between systems:
 - A split you added or moved with exact cuts on stays where you put it if you turn exact cuts off again. A normal split cannot cut there, so it does not start: the review names those splits and offers to move them to the nearest points where the video can be cut (Undo takes that back), or you turn exact cuts back on. A split that cannot move, because another split is at that point already, is named too. Merge the scenes on both sides of it.
 - Chapter marks go to the nearest keyframe also when exact cuts are on. Move the split by hand to put it on the exact picture.
 - The scene files of an exact split carry no chapters, like those of a normal split.
+- A scene of an exact split holds pictures from two encoders, the original's and libx264, one after another in one stream. ffmpeg decodes that, which the check makes sure of, and players built on ffmpeg should too. A player that reads how the pictures are stored only once, at the start of the file, may show broken pictures for a moment after a join. If yours does, split that video with exact cuts off.
+- Whether a video is interlaced is not always stated in the file. Exact cuts refuse a video that says it is. One that does not say is taken to be not interlaced, and the pictures around its cuts are encoded as whole pictures.
+- A video that was cut at the nearest points instead of on the exact pictures reports where its splits were moved to. It does not measure afterwards where each scene file begins.
 - The hard-cut scan finds shot changes, not story scenes. Expect to merge its results by hand.
 - Audio and video sync in the player is loose. The player is for finding scene boundaries, not for watching.
 - Scene files contain the first video stream and the audio streams. Other streams, such as subtitles or cover art, are not copied. An original that holds such streams fails verification on purpose, so it is never recycled.

@@ -336,6 +336,17 @@ impl ExactCutPlan {
             .map(|part| part.frames.len())
             .sum()
     }
+
+    /// How many scenes have no stretch that can be copied and are encoded
+    /// again from their first picture to their last. That is every scene
+    /// too short to hold such a stretch, and every scene of a video that
+    /// has no clean place to start a copy from.
+    pub fn scenes_encoded_as_a_whole(&self) -> usize {
+        self.scenes
+            .iter()
+            .filter(|scene| scene.parts.iter().all(|part| !part.is_copied()))
+            .count()
+    }
 }
 
 /// Why no plan could be made.
@@ -677,6 +688,22 @@ mod tests {
                 reorder_ticks: 0,
             }
         );
+    }
+
+    #[test]
+    fn scenes_with_no_stretch_to_copy_are_counted_as_encoded_whole() {
+        let table = table(225, 50);
+        let around_one_cut = plan_exact_cuts(&table, &cuts(&table, &[time_of(73)])).unwrap();
+        assert_eq!(around_one_cut.scenes_encoded_as_a_whole(), 0);
+
+        // The first three scenes each end before a copy could: pictures 0
+        // to 9, 10 to 29 and 30 to 69.
+        let with_short_scenes = plan_exact_cuts(
+            &table,
+            &cuts(&table, &[time_of(10), time_of(30), time_of(70)]),
+        )
+        .unwrap();
+        assert_eq!(with_short_scenes.scenes_encoded_as_a_whole(), 3);
     }
 
     #[test]

@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::exact_cut::CutPrecision;
-use crate::exact_split::{self, ExactCutError, Unsupported};
-use crate::exact_verify::ExactCutProof;
+use crate::exact_fallback::{CannotMoveSplits, ExactCutFallback, NoWayToCut, WhyNotExact};
+use crate::exact_split::{self, Encoder, ExactCutError, Unsupported};
+use crate::exact_verify::{self, ExactCutProof, NotProven, VerifyError, WrittenScenes};
 use crate::export::{
-    self, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalOutcome, SplitOrder,
+    self, CutOutcome, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalOutcome, SplitOrder,
     Verification,
 };
 use crate::fates::{SceneFate, ScenesToWrite};
@@ -373,13 +374,13 @@ fn a_video_whose_later_keyframes_are_no_clean_starts_is_cut_on_the_chosen_pictur
 #[ignore = "needs ffmpeg on the PATH"]
 fn a_video_stored_turned_on_its_side_stays_turned_the_same_way() {
     let video = TestVideo::with_reordered_pictures("exact_turned");
-    // Older versions of ffmpeg store the turn asked for here. Newer ones
-    // ignore the request, and the test then only shows that nothing is
-    // turned that was not.
-    let turned = rewritten(
-        &video,
-        "turned.mp4",
-        &["-map", "0", "-c", "copy", "-metadata:s:v:0", "rotate=90"],
+    let turned = turned_on_its_side(&video);
+    assert!(
+        size_and_turn(&turned)
+            .iter()
+            .any(|property| property.contains("rotat")),
+        "the test video is not marked as turned: {:?}",
+        size_and_turn(&turned)
     );
     let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
 
@@ -396,6 +397,29 @@ fn a_video_stored_turned_on_its_side_stays_turned_the_same_way() {
             "{}",
             scene.display()
         );
+    }
+}
+
+/// The video with a mark that says to show its pictures turned by a quarter,
+/// as a phone held upright stores what it films. Newer versions of ffmpeg
+/// set the mark as they read the file. Older ones do not know that option
+/// and store the turn as a tag instead, which newer ones ignore.
+fn turned_on_its_side(video: &TestVideo) -> PathBuf {
+    let turned = video.folder().join("turned.mp4");
+    let the_newer_way = tools::command(Program::Ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(["-display_rotation", "90", "-i"])
+        .arg(&video.path)
+        .args(["-map", "0", "-c", "copy"])
+        .arg(&turned)
+        .run(REWRITE_LIMIT);
+    match the_newer_way {
+        Ok(_) => turned,
+        Err(_an_older_ffmpeg) => rewritten(
+            video,
+            "turned.mp4",
+            &["-map", "0", "-c", "copy", "-metadata:s:v:0", "rotate=90"],
+        ),
     }
 }
 
@@ -440,6 +464,7 @@ fn a_video_that_is_not_h264_is_refused_and_nothing_is_touched() {
         &ScenesToWrite::every_scene(cuts),
         video.folder(),
         SceneNamePattern::default(),
+        Encoder::LIBX264,
     )
     .unwrap_err();
 
@@ -479,6 +504,7 @@ fn an_exact_split_of_a_damaged_video_leaves_no_scene_files() {
         &ScenesToWrite::every_scene(cuts),
         video.folder(),
         SceneNamePattern::default(),
+        Encoder::LIBX264,
     )
     .unwrap_err();
 
@@ -499,4 +525,601 @@ fn an_exact_split_of_a_damaged_video_leaves_no_scene_files() {
     .unwrap();
     assert!(scenes_left.is_empty(), "{scenes_left:?}");
     assert!(folders_in(video.folder()).is_empty());
+}
+
+/// The picture nearest to `CUT_FRAME` where the reordered video can be cut
+/// by copying: the keyframe two seconds in.
+const NEAREST_CUT_POINT_FRAME: usize = REORDERED_KEYFRAME_EVERY;
+
+/// The reordered video with its pictures stored as MPEG-4 part 2, which no
+/// exact cut is made for, and a point where it can be cut every two seconds
+/// as before.
+fn in_another_codec(video: &TestVideo) -> PathBuf {
+    let keyframe_every = REORDERED_KEYFRAME_EVERY.to_string();
+    rewritten(
+        video,
+        "other.mp4",
+        &[
+            "-map",
+            "0",
+            "-c:v",
+            "mpeg4",
+            "-g",
+            &keyframe_every,
+            "-c:a",
+            "copy",
+        ],
+    )
+}
+
+fn exact_order(cuts: &CutTimes) -> SplitOrder {
+    SplitOrder::new(
+        ScenesToWrite::every_scene(cuts.clone()),
+        exact_cut_options().split_method(),
+    )
+}
+
+fn fallback_of(report: &ExportReport) -> &ExactCutFallback {
+    match &report.cut {
+        CutOutcome::AtTheNearestPointsInstead(fallback) => fallback,
+        CutOutcome::AsAskedFor => panic!("the video was cut as asked: {report:?}"),
+    }
+}
+
+/// Asserts what holds after every split that asked for the exact picture
+/// `CUT_FRAME` and was cut at the nearest point instead: the one split
+/// moved there and is reported, the scenes are copies that hold the whole
+/// video, and the original is where and what it was.
+fn assert_cut_at_the_nearest_point_instead(
+    report: &ExportReport,
+    original: &Path,
+    original_bytes: &[u8],
+) {
+    let fallback = fallback_of(report);
+    assert_eq!(fallback.splits.len(), 1);
+    let split = fallback.splits[0];
+    assert_eq!(split.asked_for, time_of(CUT_FRAME));
+    assert!(
+        (split.cut_at - time_of(NEAREST_CUT_POINT_FRAME)).abs() < MILLISECOND,
+        "{split:?}"
+    );
+    let frames_moved = CUT_FRAME - NEAREST_CUT_POINT_FRAME;
+    assert!(
+        (split.seconds_moved() - time_of(frames_moved)).abs() < MILLISECOND,
+        "{split:?}"
+    );
+    assert_eq!(fallback.farthest_move(), Some(split));
+
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![
+            NEAREST_CUT_POINT_FRAME,
+            REORDERED_FRAMES - NEAREST_CUT_POINT_FRAME
+        ]
+    );
+    // The check of a normal split ran: every packet of the original is in
+    // the scenes, unchanged.
+    assert!(
+        matches!(report.verification, Verification::Passed),
+        "{:?}",
+        report.verification
+    );
+    // The setting says to recycle, the split asked for exact pictures, and
+    // so the original stays.
+    assert!(
+        matches!(
+            report.original,
+            OriginalOutcome::AlwaysKept(OriginalAlwaysKept::CutIsExact)
+        ),
+        "{:?}",
+        report.original
+    );
+    assert_eq!(std::fs::read(original).unwrap(), original_bytes);
+    // Not what was asked for, so the person is sent to look at the result.
+    assert!(!report.is_clean());
+    let summary = report.plain_summary();
+    assert!(
+        summary.contains("It was cut at the nearest points where it can be cut instead."),
+        "{summary}"
+    );
+    assert!(summary.contains("0.920 seconds earlier"), "{summary}");
+    assert!(folders_in(report.out_dir.as_path()).is_empty());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_in_another_codec_is_cut_at_the_nearest_points_and_the_result_says_so() {
+    let video = TestVideo::with_reordered_pictures("fallback_other_codec");
+    let other_codec = in_another_codec(&video);
+    let original_bytes = std::fs::read(&other_codec).unwrap();
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+    let out_dir = video.folder().join("scenes");
+
+    // What the person is told before the split.
+    let known_before = exact_split::why_no_exact_cut_at_a_glance(&other_codec).unwrap();
+    let not_h264 = WhyNotExact::KindOfVideo(Unsupported::Codec {
+        name: "mpeg4".to_owned(),
+    });
+    assert_eq!(known_before, Some(not_h264.clone()));
+
+    let report = export::export_scenes(
+        &other_codec,
+        &exact_order(&cuts),
+        &out_dir,
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+
+    assert_eq!(fallback_of(&report).why, not_h264);
+    assert_cut_at_the_nearest_point_instead(&report, &other_codec, &original_bytes);
+    assert!(report
+        .plain_summary()
+        .contains("because its pictures are stored as mpeg4"));
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_that_can_be_cut_exactly_has_nothing_against_it_at_a_glance() {
+    let video = TestVideo::with_reordered_pictures("exact_at_a_glance");
+    assert_eq!(
+        exact_split::why_no_exact_cut_at_a_glance(&video.path).unwrap(),
+        None
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn with_an_ffmpeg_that_lacks_the_encoder_the_video_is_cut_at_the_nearest_points() {
+    let video = TestVideo::with_reordered_pictures("fallback_no_encoder");
+    let original_bytes = std::fs::read(&video.path).unwrap();
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+    let out_dir = video.folder().join("scenes");
+
+    let report = export::export_scenes_encoding_with(
+        &video.path,
+        &exact_order(&cuts),
+        &out_dir,
+        SceneNamePattern::default(),
+        Encoder::ONE_NO_FFMPEG_HAS,
+    )
+    .unwrap();
+
+    assert_eq!(fallback_of(&report).why, WhyNotExact::EncoderMissing);
+    assert_cut_at_the_nearest_point_instead(&report, &video.path, &original_bytes);
+    assert!(report
+        .plain_summary()
+        .contains("because this copy of ffmpeg lacks the encoder that exact cuts need"));
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn an_exact_cut_that_fails_its_check_is_thrown_away_and_the_video_cut_at_the_nearest_points() {
+    let video = TestVideo::with_reordered_pictures("fallback_not_proven");
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+    // Damaged as in the test of a damaged video: only decoding shows it.
+    let damaged = video.folder().join("damaged.mp4");
+    let mut bytes = std::fs::read(&video.path).unwrap();
+    let damage_start = bytes.len() * 2 / 3;
+    bytes[damage_start..damage_start + DAMAGED_BYTES].fill(DAMAGE_FILL);
+    std::fs::write(&damaged, &bytes).unwrap();
+    let out_dir = video.folder().join("scenes");
+
+    let report = export::export_scenes(
+        &damaged,
+        &exact_order(&cuts),
+        &out_dir,
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+
+    // The exact cut was made, did not pass, and nothing of it is left.
+    let why = &fallback_of(&report).why;
+    assert!(
+        matches!(why, WhyNotExact::DidNotPassTheCheck { .. }),
+        "{why:?}"
+    );
+    assert!(report
+        .plain_summary()
+        .contains("did not pass the check and were thrown away"));
+    assert!(report.details().is_some());
+    // What is there instead are copies, which hold the damage as the
+    // original does and so pass the packet for packet check.
+    assert_cut_at_the_nearest_point_instead(&report, &damaged, &bytes);
+    let scene_files =
+        split::scene_files_from_earlier_splits(&damaged, &out_dir, SceneNamePattern::default())
+            .unwrap();
+    assert_eq!(scene_files, report.scene_files);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_trimmed_video_with_pictures_that_are_never_shown_is_cut_at_the_nearest_points() {
+    let video = TestVideo::with_reordered_pictures("fallback_trimmed");
+    // Trimmed by a second without encoding. The file still stores the
+    // pictures of that second, since the ones after them are built on them,
+    // and marks them as never shown.
+    let trimmed = video.folder().join("trimmed.mp4");
+    tools::command(Program::Ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y", "-ss", "1", "-i"])
+        .arg(&video.path)
+        .args(["-map", "0", "-c", "copy"])
+        .arg(&trimmed)
+        .run(REWRITE_LIMIT)
+        .unwrap();
+    let index = probe::read_packet_index(&trimmed).unwrap();
+    let cuts = CutTimes::inside(index.video, vec![index.video.start + time_of(CUT_FRAME)]).unwrap();
+
+    let report = export::export_scenes(
+        &trimmed,
+        &exact_order(&cuts),
+        &video.folder().join("scenes"),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+
+    let why = &fallback_of(&report).why;
+    assert!(
+        matches!(
+            why,
+            WhyNotExact::KindOfVideo(Unsupported::PicturesNeverShown { count }) if *count > 0
+        ),
+        "{why:?}"
+    );
+    assert!(matches!(
+        report.original,
+        OriginalOutcome::AlwaysKept(OriginalAlwaysKept::CutIsExact)
+    ));
+    assert!(trimmed.is_file());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn splits_that_would_meet_at_one_point_leave_nothing_written() {
+    let video = TestVideo::with_reordered_pictures("fallback_splits_meet");
+    let other_codec = in_another_codec(&video);
+    let original_bytes = std::fs::read(&other_codec).unwrap();
+    // Two pictures before and two after the same point where the video can
+    // be cut.
+    let before = time_of(NEAREST_CUT_POINT_FRAME - 2);
+    let after = time_of(NEAREST_CUT_POINT_FRAME + 2);
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[before, after]);
+    let out_dir = video.folder().join("scenes");
+
+    let error = export::export_scenes(
+        &other_codec,
+        &exact_order(&cuts),
+        &out_dir,
+        SceneNamePattern::default(),
+    )
+    .unwrap_err();
+
+    let no_way = error.downcast_ref::<NoWayToCut>();
+    assert!(
+        matches!(
+            no_way,
+            Some(NoWayToCut {
+                obstacle: CannotMoveSplits::SplitsMeet { first, second, .. },
+                ..
+            }) if *first == before && *second == after
+        ),
+        "{error:#}"
+    );
+    let words = no_way.unwrap().in_plain_words();
+    assert!(
+        words.contains("Nothing was written, and the original was not changed."),
+        "{words}"
+    );
+    assert_eq!(std::fs::read(&other_codec).unwrap(), original_bytes);
+    assert!(!out_dir.exists(), "{}", out_dir.display());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn cuts_right_beside_a_point_where_the_video_can_be_cut_land_on_the_chosen_pictures() {
+    let video = TestVideo::with_reordered_pictures("exact_beside_keyframes");
+    // One picture before a keyframe, two before the next, one after it.
+    // Here a part that is encoded again begins or ends within the pictures
+    // that are stored out of order around the keyframe.
+    let cut_frames = [
+        REORDERED_KEYFRAME_EVERY - 1,
+        2 * REORDERED_KEYFRAME_EVERY - 2,
+        2 * REORDERED_KEYFRAME_EVERY + 1,
+    ];
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &cut_frames.map(time_of));
+
+    let report = split_exactly(&video.path, video.folder(), &cuts);
+
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![49, 49, 3, REORDERED_FRAMES - 101]
+    );
+    // The check compared every picture that was encoded again with its own
+    // in the original and with the ones beside it.
+    let proof = proof_of(&report);
+    assert!(proof.pictures_encoded_again > 0);
+    assert!(
+        proof.largest_picture_difference < 1.0,
+        "{}",
+        proof.largest_picture_difference
+    );
+    assert_pictures_keep_their_pace(&video.path, &report.scene_files);
+    assert!(report.is_clean());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_scene_encoded_from_the_picture_before_its_first_is_not_proven() {
+    // Every scene of this video is encoded again as a whole, so a scene of
+    // one split can stand in for a scene of another.
+    let video = TestVideo::with_open_picture_groups("exact_wrong_pictures");
+    let one_picture_early = video.folder().join("early");
+    let as_chosen = video.folder().join("chosen");
+    let early_cut = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME - 1)]);
+    let chosen_cut = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+    let early = split_exactly(&video.path, &one_picture_early, &early_cut);
+    let chosen = split_exactly(&video.path, &as_chosen, &chosen_cut);
+
+    // The second scene of the early split without its last picture: as many
+    // pictures as the chosen split's second scene, shown at the same pace,
+    // and each of them the picture before the one that belongs there.
+    let second_scene_pictures = (REORDERED_FRAMES - CUT_FRAME).to_string();
+    let shifted = video.folder().join("shifted.mp4");
+    tools::command(Program::Ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(&early.scene_files[1])
+        .args([
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-frames:v",
+            &second_scene_pictures,
+        ])
+        .arg(&shifted)
+        .run(REWRITE_LIMIT)
+        .unwrap();
+    assert_eq!(
+        picture_counts(std::slice::from_ref(&shifted)),
+        vec![REORDERED_FRAMES - CUT_FRAME]
+    );
+
+    let plan = exact_split::plan_of(&video.path, &chosen_cut).unwrap();
+    let scratch_folder = video.folder().join("scratch");
+    std::fs::create_dir_all(&scratch_folder).unwrap();
+    let verify = |second_scene: &Path| {
+        let files = [chosen.scene_files[0].clone(), second_scene.to_path_buf()];
+        let written = WrittenScenes {
+            files: &files,
+            scratch_folder: &scratch_folder,
+        };
+        exact_verify::verify_exact_split(&video.path, written, &plan, chosen_cut.as_slice())
+    };
+
+    let not_proven = verify(&shifted).unwrap_err();
+    assert!(
+        matches!(
+            not_proven,
+            VerifyError::NotProven(NotProven::EncodedPictureIsAnother {
+                scene: 2,
+                picture: 1
+            })
+        ),
+        "{not_proven}"
+    );
+    // The scene that was written for this cut passes the same check.
+    assert!(verify(&chosen.scene_files[1]).is_ok());
+}
+
+/// Splits `video` on the picture that is `CUT_FRAME` pictures in, wherever
+/// the file says that picture is shown, and returns the report with how
+/// many pictures the video has.
+fn split_on_the_cut_frame_looked_up(video: &Path, out_dir: &Path) -> (ExportReport, usize) {
+    let index = probe::read_packet_index(video).unwrap();
+    let cuts = CutTimes::inside(index.video, vec![index.packets[CUT_FRAME].time]).unwrap();
+    (split_exactly(video, out_dir, &cuts), index.packets.len())
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_with_pictures_shown_at_an_uneven_pace_is_cut_on_the_chosen_picture() {
+    let video = TestVideo::with_reordered_pictures("exact_uneven_pace");
+    // Every fifth picture is left out and the others keep their times, so
+    // some pictures are shown twice as long as the rest.
+    let keyframe_every = REORDERED_KEYFRAME_EVERY.to_string();
+    let mut how = vec!["-map", "0", "-vf", "select='not(eq(mod(n,5),3))'"];
+    how.extend(tools::picture_times_option().arguments());
+    how.extend(["-c:v", "libx264", "-preset", "veryfast", "-bf", "2"]);
+    how.extend(["-g", &keyframe_every, "-sc_threshold", "0", "-c:a", "copy"]);
+    let uneven = rewritten(&video, "uneven.mp4", &how);
+    let times = picture_times(&uneven);
+    let longest_gap = times
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .fold(0.0, f64::max);
+    assert!(
+        (longest_gap - 2.0 * FRAME_SECONDS).abs() < MILLISECOND,
+        "the test video is not uneven: {longest_gap}"
+    );
+
+    let (report, frames) = split_on_the_cut_frame_looked_up(&uneven, &video.folder().join("out"));
+
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![CUT_FRAME, frames - CUT_FRAME]
+    );
+    assert!((proof_of(&report).cut_landings[0].landed_at - times[CUT_FRAME]).abs() < MILLISECOND);
+    assert_pictures_keep_their_pace(&uneven, &report.scene_files);
+    assert!(report.is_clean());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_whose_pictures_begin_after_its_sound_is_cut_on_the_chosen_picture() {
+    let video = TestVideo::with_reordered_pictures("exact_late_pictures");
+    // The same pictures, shown from 0.4 seconds on, under sound that begins
+    // at zero.
+    let late = video.folder().join("late.mp4");
+    tools::command(Program::Ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(&video.path)
+        .args(["-itsoffset", "0.4", "-i"])
+        .arg(&video.path)
+        .args(["-map", "1:v", "-map", "0:a", "-c", "copy"])
+        .arg(&late)
+        .run(REWRITE_LIMIT)
+        .unwrap();
+    let first_picture_at = picture_times(&late)[0];
+    assert!(
+        (first_picture_at - 0.4).abs() < MILLISECOND,
+        "the pictures of the test video begin at {first_picture_at}"
+    );
+
+    let (report, frames) = split_on_the_cut_frame_looked_up(&late, &video.folder().join("out"));
+
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![CUT_FRAME, frames - CUT_FRAME]
+    );
+    let proof = proof_of(&report);
+    assert!(proof.sound_packets > 0);
+    assert!(proof.largest_sound_shift_seconds <= 2.0 * MILLISECOND);
+    // The first scene still begins with sound alone, as the original does.
+    let first_scene_begins_at = picture_times(&report.scene_files[0])[0];
+    assert!(
+        (first_scene_begins_at - first_picture_at).abs() <= 2.0 * MILLISECOND,
+        "{first_scene_begins_at}"
+    );
+    assert_pictures_keep_their_pace(&late, &report.scene_files);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn sound_of_other_kinds_and_in_several_streams_is_kept_packet_for_packet() {
+    let video = TestVideo::with_reordered_pictures("exact_other_sound");
+    // The sound twice: as it is, and as AC-3, whose packets are longer.
+    let two_streams = rewritten(
+        &video,
+        "two_streams.mkv",
+        &[
+            "-map", "0:v", "-map", "0:a", "-map", "0:a", "-c:v", "copy", "-c:a:0", "copy",
+            "-c:a:1", "ac3",
+        ],
+    );
+
+    let (report, frames) =
+        split_on_the_cut_frame_looked_up(&two_streams, &video.folder().join("out"));
+
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![CUT_FRAME, frames - CUT_FRAME]
+    );
+    let proof = proof_of(&report);
+    assert!(proof.largest_sound_shift_seconds <= 2.0 * MILLISECOND);
+    for scene in &report.scene_files {
+        assert_eq!(sound_stream_count(scene), 2, "{}", scene.display());
+    }
+}
+
+fn sound_stream_count(video: &Path) -> usize {
+    tools::command(Program::Ffprobe)
+        .args(["-v", "error", "-select_streams", "a"])
+        .args(["-show_entries", "stream=index", "-of", "csv=p=0"])
+        .arg(video)
+        .run_for_text(REWRITE_LIMIT)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+/// The reordered video encoded anew with `colours` stated in it, cut on a
+/// picture between two keyframes. The second scene then begins with
+/// pictures that were encoded again, so what ffprobe says of its colours is
+/// what the encoder of the exact cut wrote. Returns what the original states.
+fn split_a_video_that_states_its_colours(test_name: &str, colours: &[&str]) -> Vec<String> {
+    let video = TestVideo::with_reordered_pictures(test_name);
+    let keyframe_every = REORDERED_KEYFRAME_EVERY.to_string();
+    let mut how = vec![
+        "-map", "0", "-c:v", "libx264", "-preset", "veryfast", "-bf", "2",
+    ];
+    how.extend(["-g", &keyframe_every, "-sc_threshold", "0", "-c:a", "copy"]);
+    how.extend(colours);
+    let coloured = rewritten(&video, "coloured.mp4", &how);
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+
+    let report = split_exactly(&coloured, &video.folder().join("out"), &cuts);
+
+    assert_eq!(
+        proof_of(&report).pictures_encoded_again,
+        REORDERED_KEYFRAME_EVERY
+    );
+    let stated_in_the_original = colours_of(&coloured);
+    for scene in &report.scene_files {
+        assert_eq!(
+            colours_of(scene),
+            stated_in_the_original,
+            "{}",
+            scene.display()
+        );
+    }
+    stated_in_the_original
+}
+
+/// What ffprobe says about the colours of the pictures.
+fn colours_of(video: &Path) -> Vec<String> {
+    let streams = tools::command(Program::Ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_streams"])
+        .arg(video)
+        .run_for_text(REWRITE_LIMIT)
+        .unwrap();
+    streams
+        .lines()
+        .filter(|line| line.starts_with("color_"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_that_states_its_colours_keeps_them_in_every_scene() {
+    let stated = split_a_video_that_states_its_colours(
+        "exact_colours",
+        &[
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+        ],
+    );
+    assert!(
+        stated.contains(&"color_space=bt709".to_owned()),
+        "the test video does not state its colours: {stated:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_with_the_full_range_of_brightness_keeps_it_in_every_scene() {
+    // As phones and cameras record: black is 0 and white 255, where films
+    // keep to 16 and 235. Read the wrong way, the pictures around a cut
+    // would be paler or harsher than the rest.
+    let stated = split_a_video_that_states_its_colours(
+        "exact_full_range",
+        &[
+            "-vf",
+            "scale=out_range=full",
+            "-color_range",
+            "pc",
+            "-colorspace",
+            "bt709",
+        ],
+    );
+    assert!(
+        stated.contains(&"color_range=pc".to_owned()),
+        "the test video does not have the full range: {stated:?}"
+    );
 }

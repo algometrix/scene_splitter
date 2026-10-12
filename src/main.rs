@@ -22,6 +22,7 @@ mod e2e_tests;
 mod exact_cut;
 #[cfg(test)]
 mod exact_e2e_tests;
+mod exact_fallback;
 mod exact_split;
 mod exact_verify;
 mod export;
@@ -66,6 +67,7 @@ use clap::Parser;
 use chapters::ChapterSplits;
 use detect::{Detection, ScanDepth, ScanKind, ScanMode};
 use exact_cut::CutPrecision;
+use exact_fallback::NoWayToCut;
 use exact_split::ExactCutError;
 use export::{ExistingListFile, OriginalPolicy, SplitMethod, SplitOrder};
 use fates::ScenesToWrite;
@@ -148,7 +150,9 @@ struct Arguments {
     /// Cut on the exact picture where each scene changes, and not on the
     /// nearest point where the video can be cut as it is. A few seconds
     /// around each cut are encoded again, so this is slower. The original
-    /// video is always kept.
+    /// video is always kept. A video that cannot be cut this way is cut at
+    /// the nearest points where it can be cut instead. The run then says
+    /// so, lists how far each split moved, and ends with an error code.
     #[arg(long, requires = "video", conflicts_with_all = ["scan_only", "review"])]
     exact_cuts: bool,
 
@@ -487,7 +491,7 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     let started = Instant::now();
     let order = SplitOrder::new(scenes, method);
     if method == SplitMethod::ExactFrames {
-        println!("{EXACT_CUT_NOTICE}");
+        println!("{}", notice_before_an_exact_cut(video));
     }
     let report = export::export_scenes(video, &order, &out_dir, scene_name)
         .map_err(with_the_way_back_to_a_normal_cut)?;
@@ -495,12 +499,16 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     if let Some(measurements) = report.exact_cut_measurements() {
         println!("{measurements}");
     }
+    if let Some(moved_splits) = report.fallback_measurements() {
+        println!("{moved_splits}");
+    }
     println!(
         "Writing and verifying took {:.2}s.",
         started.elapsed().as_secs_f64()
     );
     // A script that goes on after this must be able to tell that the scenes
-    // were not verified, or that the original is still there.
+    // were not verified, that the original is still there, or that the video
+    // was not cut on the exact pictures it asked for.
     if !report.is_clean() {
         bail!("the scenes were written, but see the note above before relying on them");
     }
@@ -590,8 +598,25 @@ const EXACT_CUT_NOTICE: &str =
     "Cutting on the exact pictures. A few seconds around each cut are encoded again, \
      and the original is kept.";
 
-/// A failed exact cut is told with what the person can do instead.
+/// What is said before a split that asked for exact pictures starts. A
+/// video that cannot be cut that way is known by a look at its file, and
+/// then the notice says how it will be cut instead.
+fn notice_before_an_exact_cut(video: &Path) -> String {
+    match exact_split::why_no_exact_cut_at_a_glance(video) {
+        Ok(Some(why_not_exact)) => why_not_exact.before_the_split_in_plain_words(),
+        // A video that could not be looked at fails in the split itself,
+        // which says why.
+        Ok(None) | Err(_) => EXACT_CUT_NOTICE.to_owned(),
+    }
+}
+
+/// A failed exact cut is told with what the person can do instead. A video
+/// that can be cut neither way says so itself.
 fn with_the_way_back_to_a_normal_cut(error: anyhow::Error) -> anyhow::Error {
+    if let Some(no_way) = error.downcast_ref::<NoWayToCut>() {
+        let in_plain_words = no_way.in_plain_words();
+        return error.context(in_plain_words);
+    }
     if error.downcast_ref::<ExactCutError>().is_none() {
         return error;
     }

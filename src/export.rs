@@ -7,10 +7,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::exact_cut::CutPrecision;
-use crate::exact_split;
+use crate::exact_fallback::{self, ExactCutFallback, NoWayToCut, WhyNotExact};
+use crate::exact_split::{self, Encoder, ExactCutError};
 use crate::exact_verify::ExactCutProof;
 use crate::fates::ScenesToWrite;
 use crate::library::VIDEO_EXTENSIONS;
+use crate::probe;
 use crate::scene_list::{SceneList, SceneListFormat};
 use crate::scene_name::SceneNamePattern;
 use crate::split::{self, SceneLocation, SceneOutcome};
@@ -159,6 +161,23 @@ impl OriginalAlwaysKept {
     fn as_a_following_sentence(self) -> String {
         format!("It is {}", self.rule_in_words())
     }
+
+    /// The rule after a split that was to cut on exact pictures and cut at
+    /// the nearest points instead. Nothing was encoded again then, so the
+    /// reason an exact cut gives would not be true. The original stays for
+    /// what was asked for, not for what was done.
+    fn as_a_sentence_after_a_cut_at_the_nearest_points(self) -> String {
+        match self {
+            Self::ScenesDropped => self.as_a_following_sentence(),
+            Self::CutIsExact => "It is always kept when a cut on the exact picture was asked \
+                                 for, whichever way the video was cut in the end."
+                .to_owned(),
+            Self::ScenesDroppedAndCutIsExact => "It is always kept when scenes are dropped or \
+                                                 a cut on the exact picture was asked for, \
+                                                 whichever way the video was cut in the end."
+                .to_owned(),
+        }
+    }
 }
 
 /// What may happen to the original after one split.
@@ -213,6 +232,17 @@ pub enum Verification {
     Failed(String),
 }
 
+/// Whether the scenes were cut the way the split asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CutOutcome {
+    /// Copied at points where the video can be cut, or cut on the exact
+    /// pictures, whichever was asked for.
+    AsAskedFor,
+    /// Exact pictures were asked for and the video could not be cut on
+    /// them. It was copied at the nearest points where it can be cut.
+    AtTheNearestPointsInstead(ExactCutFallback),
+}
+
 #[derive(Debug)]
 pub enum OriginalOutcome {
     Kept,
@@ -229,22 +259,37 @@ pub struct ExportReport {
     pub out_dir: PathBuf,
     /// How many scenes the person dropped, which are in no scene file.
     pub dropped_scenes: usize,
+    pub cut: CutOutcome,
     pub verification: Verification,
     pub original: OriginalOutcome,
 }
 
 impl ExportReport {
-    /// True when the scenes are verified and nothing went wrong afterwards.
+    /// True when the scenes are cut as asked and verified, and nothing went
+    /// wrong afterwards. A video cut at the nearest points instead of on
+    /// the exact pictures is not what was asked for, so the person is sent
+    /// to look at its result.
     pub fn is_clean(&self) -> bool {
-        matches!(
-            self.verification,
-            Verification::Passed | Verification::PassedForExactCut(_)
-        ) && matches!(
-            self.original,
-            OriginalOutcome::Kept
-                | OriginalOutcome::AlwaysKept(_)
-                | OriginalOutcome::MovedToRecycleBin
-        )
+        self.cut == CutOutcome::AsAskedFor
+            && matches!(
+                self.verification,
+                Verification::Passed | Verification::PassedForExactCut(_)
+            )
+            && matches!(
+                self.original,
+                OriginalOutcome::Kept
+                    | OriginalOutcome::AlwaysKept(_)
+                    | OriginalOutcome::MovedToRecycleBin
+            )
+    }
+
+    /// Why and how the video was cut another way than asked for, or `None`
+    /// when it was cut as asked.
+    pub fn fallback(&self) -> Option<&ExactCutFallback> {
+        match &self.cut {
+            CutOutcome::AsAskedFor => None,
+            CutOutcome::AtTheNearestPointsInstead(fallback) => Some(fallback),
+        }
     }
 
     /// What the check of an exact split measured, one line per fact, for a
@@ -257,6 +302,11 @@ impl ExportReport {
             format!(
                 "Pictures: {} in the original and in the scenes together, {} of them encoded again.",
                 proof.pictures, proof.pictures_encoded_again
+            ),
+            format!(
+                "Pictures encoded again: none differs from its picture in the original by more \
+                 than {:.2} of 255 steps of brightness, compared as small grey copies.",
+                proof.largest_picture_difference
             ),
             format!(
                 "Sound: {} packets, all copied unchanged. Largest shift against the picture: {:.4} s.",
@@ -283,33 +333,61 @@ impl ExportReport {
             Some(details) => format!("{sentence}\n\nDetails: {details}"),
             None => sentence,
         };
-        format!(
-            "{}\n\n{}\n\n{}",
-            self.where_the_scenes_are(),
-            with_details(self.check_in_plain_words(), self.verification_details()),
-            with_details(self.original_in_plain_words(), self.recycling_details())
-        )
+        let fallback_details = self.fallback().map(|fallback| fallback.why.details());
+        let paragraphs = [
+            Some(self.where_the_scenes_are()),
+            self.fallback_in_plain_words()
+                .map(|fallback| with_details(fallback, fallback_details.as_deref())),
+            Some(with_details(
+                self.check_in_plain_words(),
+                self.verification_details(),
+            )),
+            Some(with_details(
+                self.original_in_plain_words(),
+                self.recycling_details(),
+            )),
+        ];
+        in_paragraphs(paragraphs)
     }
 
     /// The summary without the technical reasons, for a screen that shows
     /// those apart, where they can be copied.
     pub fn plain_summary(&self) -> String {
-        format!(
-            "{}\n\n{}\n\n{}",
-            self.where_the_scenes_are(),
-            self.check_in_plain_words(),
-            self.original_in_plain_words()
-        )
+        in_paragraphs([
+            Some(self.where_the_scenes_are()),
+            self.fallback_in_plain_words(),
+            Some(self.check_in_plain_words()),
+            Some(self.original_in_plain_words()),
+        ])
     }
 
     /// The technical reasons for whatever went wrong, or `None` after a
     /// split with nothing to report.
     pub fn details(&self) -> Option<String> {
-        let details: Vec<&str> = [self.verification_details(), self.recycling_details()]
-            .into_iter()
-            .flatten()
-            .collect();
+        let fallback_details = self.fallback().map(|fallback| fallback.why.details());
+        let details: Vec<&str> = [
+            fallback_details.as_deref(),
+            self.verification_details(),
+            self.recycling_details(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         (!details.is_empty()).then(|| details.join("\n\n"))
+    }
+
+    /// Why the video was not cut on the exact pictures and how far that
+    /// moved its splits, after a split that cut at the nearest points
+    /// instead.
+    fn fallback_in_plain_words(&self) -> Option<String> {
+        self.fallback().map(ExactCutFallback::in_plain_words)
+    }
+
+    /// Where each split was asked for and where the video was cut, one line
+    /// per split, for a run from the command line. `None` unless the video
+    /// was cut at the nearest points instead of on the exact pictures.
+    pub fn fallback_measurements(&self) -> Option<String> {
+        self.fallback().map(ExactCutFallback::each_split_in_words)
     }
 
     fn where_the_scenes_are(&self) -> String {
@@ -336,18 +414,17 @@ impl ExportReport {
             Verification::PassedForExactCut(proof) if self.dropped_scenes > 0 => format!(
                 "Checked before the dropped scenes were left out: every scene plays to its \
                  end, together they have all {} pictures of the original, each scene starts on \
-                 the picture that was chosen, and the sound is the original's, unchanged. {} \
-                 around the cuts were encoded again. {}",
+                 the picture that was chosen, and the sound is the original's, unchanged. {} {}",
                 proof.pictures,
-                counted_pictures(proof.pictures_encoded_again),
+                encoded_again_in_words(proof),
                 dropped_scenes_are_in_no_file(self.dropped_scenes)
             ),
             Verification::PassedForExactCut(proof) => format!(
                 "Checked: every scene plays to its end, together they have all {} pictures of \
                  the original, each scene starts on the picture that was chosen, and the sound \
-                 is the original's, unchanged. {} around the cuts were encoded again.",
+                 is the original's, unchanged. {}",
                 proof.pictures,
-                counted_pictures(proof.pictures_encoded_again)
+                encoded_again_in_words(proof)
             ),
             Verification::Failed(_) => {
                 "The check did not pass, so the original was kept. Play the scene files before you delete anything."
@@ -369,7 +446,13 @@ impl ExportReport {
                 "The original is still in its place.".to_owned()
             }
             OriginalOutcome::AlwaysKept(why) => {
-                format!("The original is still in its place. {}", why.as_a_following_sentence())
+                let rule = match self.cut {
+                    CutOutcome::AsAskedFor => why.as_a_following_sentence(),
+                    CutOutcome::AtTheNearestPointsInstead(_) => {
+                        why.as_a_sentence_after_a_cut_at_the_nearest_points()
+                    }
+                };
+                format!("The original is still in its place. {rule}")
             }
             OriginalOutcome::MovedToRecycleBin => {
                 format!("The original is in the {TRASH_NAME}. You can restore it from there.")
@@ -388,6 +471,30 @@ impl ExportReport {
             | OriginalOutcome::MovedToRecycleBin
             | OriginalOutcome::KeptBecauseUnverified => None,
         }
+    }
+}
+
+/// The paragraphs that are there, with an empty line between them.
+fn in_paragraphs<const COUNT: usize>(paragraphs: [Option<String>; COUNT]) -> String {
+    let paragraphs: Vec<String> = paragraphs.into_iter().flatten().collect();
+    paragraphs.join("\n\n")
+}
+
+/// How much of an exact split was encoded again. A scene with no stretch
+/// that could be copied is said to be encoded as a whole, since "around the
+/// cuts" would not be true of it.
+fn encoded_again_in_words(proof: &ExactCutProof) -> String {
+    let pictures = counted_pictures(proof.pictures_encoded_again);
+    match proof.scenes_encoded_as_a_whole {
+        0 => format!("{pictures} around the cuts were encoded again."),
+        1 => format!(
+            "{pictures} were encoded again, among them all of 1 scene that has no stretch \
+             that could be copied."
+        ),
+        scenes => format!(
+            "{pictures} were encoded again, among them all of {scenes} scenes that have no \
+             stretch that could be copied."
+        ),
     }
 }
 
@@ -439,24 +546,72 @@ pub fn export_scenes(
     out_dir: &Path,
     scene_name: SceneNamePattern,
 ) -> Result<ExportReport> {
+    export_scenes_encoding_with(video, order, out_dir, scene_name, Encoder::LIBX264)
+}
+
+/// `export_scenes`, with the encoder an exact split looks for in ffmpeg
+/// named by the caller. The tests name one that no ffmpeg has.
+pub fn export_scenes_encoding_with(
+    video: &Path,
+    order: &SplitOrder,
+    out_dir: &Path,
+    scene_name: SceneNamePattern,
+    encoder: Encoder,
+) -> Result<ExportReport> {
     match order.cut_precision {
-        CutPrecision::NearestKeyframe => export_copied_scenes(video, order, out_dir, scene_name),
-        CutPrecision::ExactFrame => export_exact_scenes(video, order, out_dir, scene_name),
+        CutPrecision::NearestKeyframe => export_copied_scenes(
+            video,
+            order.scenes(),
+            order.original,
+            out_dir,
+            scene_name,
+            CutOutcome::AsAskedFor,
+        ),
+        CutPrecision::ExactFrame => export_exact_scenes(video, order, out_dir, scene_name, encoder),
     }
 }
 
 /// Writes scenes that start on the exact pictures chosen, and checks them.
+/// A video that cannot be cut that way is cut at the nearest points where
+/// it can be cut instead, and the result says so.
 ///
-/// The original is never recycled after an exact split, whatever the order
-/// says about it. Fails when the scenes could not be written or did not
-/// pass their check. In both cases no scene file is put in place.
+/// The original is never recycled after a split that asked for exact
+/// pictures, whatever the order says about it and whichever way the video
+/// was cut in the end.
+///
+/// The cut at the nearest points is also made when the exact cut was tried
+/// and failed its check or could not be written. That is safe: scenes of an
+/// exact cut are checked before they leave the unfinished folder, so by
+/// then nothing of the try is left, and the scene files of an earlier split
+/// are still as they were. What is written instead goes through the same
+/// packet for packet check as any normal split.
 fn export_exact_scenes(
     video: &Path,
     order: &SplitOrder,
     out_dir: &Path,
     scene_name: SceneNamePattern,
+    encoder: Encoder,
 ) -> Result<ExportReport> {
-    let split = exact_split::split_on_exact_frames(video, order.scenes(), out_dir, scene_name)?;
+    let exact_split =
+        exact_split::split_on_exact_frames(video, order.scenes(), out_dir, scene_name, encoder);
+    let split = match exact_split {
+        Ok(split) => split,
+        Err(failure) => {
+            let why_not_exact = failure
+                .downcast_ref::<ExactCutError>()
+                .and_then(ExactCutError::calls_for_a_normal_cut);
+            let Some(why_not_exact) = why_not_exact else {
+                return Err(failure);
+            };
+            return export_at_the_nearest_cut_points(
+                video,
+                order,
+                out_dir,
+                scene_name,
+                why_not_exact,
+            );
+        }
+    };
     let verification = Verification::PassedForExactCut(split.proof);
     let original = match decide_about_original(order.original, &verification) {
         OriginalDecision::AlwaysKeep(why) => OriginalOutcome::AlwaysKept(why),
@@ -470,22 +625,95 @@ fn export_exact_scenes(
         scene_files: split.scene_files,
         out_dir: out_dir.to_path_buf(),
         dropped_scenes: order.scenes().dropped_count(),
+        cut: CutOutcome::AsAskedFor,
         verification,
         original,
     })
 }
+
+/// Cuts a video that was to be cut on exact pictures at the points nearest
+/// to its splits where it can be cut, by copying, and checks the scenes
+/// packet for packet as after any normal split.
+///
+/// Fails, with nothing written, when the splits cannot all go to such
+/// points and still leave every scene in place.
+fn export_at_the_nearest_cut_points(
+    video: &Path,
+    order: &SplitOrder,
+    out_dir: &Path,
+    scene_name: SceneNamePattern,
+    why_not_exact: WhyNotExact,
+) -> Result<ExportReport> {
+    let after_no_exact_cut = format!(
+        "the video was not cut on the exact pictures ({}), and cutting it at the nearest \
+         points where it can be cut failed",
+        why_not_exact.details()
+    );
+    // The points a copy can cut at are the keyframes as ffmpeg sees them,
+    // which is how a scan lists them too.
+    let cut_points = probe::read_packet_index(video)
+        .with_context(|| after_no_exact_cut.clone())?
+        .keyframe_times();
+    let moved =
+        exact_fallback::splits_at_the_nearest_cut_points(order.scenes().cuts(), &cut_points);
+    let (cuts, splits) = match moved {
+        Ok(moved) => moved,
+        Err(obstacle) => {
+            return Err(anyhow::Error::new(NoWayToCut {
+                why_not_exact,
+                obstacle,
+            }))
+        }
+    };
+    // As many scenes as before, so each keeps what was chosen for it.
+    let scenes = ScenesToWrite::new(cuts, order.scenes().fates().to_vec())
+        .map_err(|nothing_to_write| anyhow::anyhow!("{nothing_to_write}"))
+        .with_context(|| after_no_exact_cut.clone())?;
+    let fallback = ExactCutFallback {
+        why: why_not_exact,
+        splits,
+    };
+    export_copied_scenes(
+        video,
+        &scenes,
+        original_rule_after_no_exact_cut(order.original),
+        out_dir,
+        scene_name,
+        CutOutcome::AtTheNearestPointsInstead(fallback),
+    )
+    .with_context(|| after_no_exact_cut)
+}
+
+/// What may happen to the original of a split that asked for exact pictures
+/// and was cut at the nearest points instead: it stays.
+///
+/// The scenes of such a split are copies and pass the packet for packet
+/// check, which is all that a normal split needs to let its original go. It
+/// stays all the same, because the person asked for a split that always
+/// keeps it, and may have counted on that when they started it.
+fn original_rule_after_no_exact_cut(rule_of_the_order: OriginalRule) -> OriginalRule {
+    match rule_of_the_order {
+        OriginalRule::AlwaysKept(why) => OriginalRule::AlwaysKept(why),
+        // No order for an exact split leaves the choice to the person.
+        // Should one ever, the original stays all the same.
+        OriginalRule::AsChosen(_) => OriginalRule::AlwaysKept(OriginalAlwaysKept::CutIsExact),
+    }
+}
+
 /// Copies the scenes out of the video at keyframes. Fails only when the
 /// scenes could not be written. A failed verification is reported in the
 /// result, and always leaves the original in place.
 fn export_copied_scenes(
     video: &Path,
-    order: &SplitOrder,
+    scenes: &ScenesToWrite,
+    original_rule: OriginalRule,
     out_dir: &Path,
     scene_name: SceneNamePattern,
+    cut: CutOutcome,
 ) -> Result<ExportReport> {
     let outcomes = split::split_scenes(
         video,
-        order.scenes(),
+        scenes,
         out_dir,
         scene_name,
         verify::record_dropped_scene,
@@ -501,7 +729,7 @@ fn export_copied_scenes(
 
     // A split of every scene goes through the check it always went through.
     // Only a split that dropped scenes needs what was noted about them.
-    let verified = if order.scenes().has_dropped_scenes() {
+    let verified = if scenes.has_dropped_scenes() {
         verify::verify_scenes_with_dropped(video, &scenes_to_verify)
     } else {
         verify::verify_scenes(video, &scene_files)
@@ -510,7 +738,7 @@ fn export_copied_scenes(
         Ok(()) => Verification::Passed,
         Err(error) => Verification::Failed(format!("{error:#}")),
     };
-    let original = match decide_about_original(order.original, &verification) {
+    let original = match decide_about_original(original_rule, &verification) {
         OriginalDecision::Keep => OriginalOutcome::Kept,
         OriginalDecision::AlwaysKeep(why) => OriginalOutcome::AlwaysKept(why),
         OriginalDecision::KeepBecauseUnverified => OriginalOutcome::KeptBecauseUnverified,
@@ -523,7 +751,8 @@ fn export_copied_scenes(
     Ok(ExportReport {
         scene_files,
         out_dir: out_dir.to_path_buf(),
-        dropped_scenes: order.scenes().dropped_count(),
+        dropped_scenes: scenes.dropped_count(),
+        cut,
         verification,
         original,
     })
@@ -624,6 +853,7 @@ mod tests {
             scene_files: vec![PathBuf::from("film_scene_001.mp4")],
             out_dir: PathBuf::from("scenes"),
             dropped_scenes: 0,
+            cut: CutOutcome::AsAskedFor,
             verification,
             original,
         }
@@ -755,6 +985,8 @@ mod tests {
         ExactCutProof {
             pictures: 225,
             pictures_encoded_again: 50,
+            scenes_encoded_as_a_whole: 0,
+            largest_picture_difference: 0.21,
             sound_packets: 389,
             cut_landings: vec![crate::exact_verify::CutLanding {
                 asked_for: 2.9,
@@ -993,11 +1225,154 @@ mod tests {
     }
 
     #[test]
+    fn scenes_encoded_as_a_whole_are_not_said_to_be_around_the_cuts() {
+        let mut report = exact_cut_report();
+        let Verification::PassedForExactCut(proof) = &mut report.verification else {
+            panic!("the report of an exact cut carries its proof");
+        };
+        proof.pictures_encoded_again = 225;
+        proof.scenes_encoded_as_a_whole = 2;
+        assert!(
+            report.plain_summary().contains(
+                "225 pictures were encoded again, among them all of 2 scenes that have no \
+                 stretch that could be copied."
+            ),
+            "{}",
+            report.plain_summary()
+        );
+        assert!(!report.plain_summary().contains("around the cuts"));
+    }
+
+    fn not_h264() -> WhyNotExact {
+        WhyNotExact::KindOfVideo(exact_split::Unsupported::Codec {
+            name: "mpeg4".to_owned(),
+        })
+    }
+
+    /// The report of a video that was to be cut on the exact picture at
+    /// 2.92 s and was copied from 2 s on instead.
+    fn fallback_report(why: WhyNotExact) -> ExportReport {
+        ExportReport {
+            cut: CutOutcome::AtTheNearestPointsInstead(ExactCutFallback {
+                why,
+                splits: vec![exact_fallback::MovedSplit {
+                    asked_for: 2.92,
+                    cut_at: 2.0,
+                }],
+            }),
+            ..report(
+                Verification::Passed,
+                OriginalOutcome::AlwaysKept(OriginalAlwaysKept::CutIsExact),
+            )
+        }
+    }
+
+    #[test]
+    fn a_video_cut_at_the_nearest_points_instead_says_why_how_far_and_that_the_original_stays() {
+        let report = fallback_report(not_h264());
+        assert_eq!(
+            report.plain_summary(),
+            "1 scene file is in\nscenes\n\n\
+             This video could not be cut on the exact picture because its pictures are stored \
+             as mpeg4, and exact cuts only work for pictures stored as H.264. It was cut at the \
+             nearest points where it can be cut instead. The split moved from 00:00:02.920 to \
+             00:00:02.000, 0.920 seconds earlier.\n\n\
+             Checked: together they contain the whole original, with nothing missing or \
+             changed.\n\n\
+             The original is still in its place. It is always kept when a cut on the exact \
+             picture was asked for, whichever way the video was cut in the end."
+        );
+        assert_eq!(
+            report.details().as_deref(),
+            Some("exact cuts work on H.264 video, this video is mpeg4")
+        );
+        assert_eq!(
+            report.fallback_measurements().as_deref(),
+            Some("Split 1: moved from 00:00:02.920 to 00:00:02.000, 0.920 seconds earlier.")
+        );
+        assert_eq!(report.exact_cut_measurements(), None);
+    }
+
+    #[test]
+    fn a_video_that_was_not_cut_as_asked_is_one_to_look_at() {
+        // The scenes passed their check and the original is where it was,
+        // but the splits are not where the person put them.
+        assert!(!fallback_report(not_h264()).is_clean());
+        let as_asked = report(Verification::Passed, OriginalOutcome::Kept);
+        assert!(as_asked.is_clean());
+        assert_eq!(as_asked.fallback_measurements(), None);
+    }
+
+    #[test]
+    fn an_exact_cut_that_was_tried_and_thrown_away_is_named_as_that() {
+        let report = fallback_report(WhyNotExact::DidNotPassTheCheck {
+            details: "scene 2 should have 152 pictures but decodes to 151".to_owned(),
+        });
+        assert!(
+            report.plain_summary().contains(
+                "because the scenes that were cut that way did not pass the check and were \
+                 thrown away. It was cut at the nearest points where it can be cut instead."
+            ),
+            "{}",
+            report.plain_summary()
+        );
+        assert!(report.summary().contains(
+            "\n\nDetails: scene 2 should have 152 pictures but decodes to 151\n\nChecked:"
+        ));
+    }
+
+    #[test]
+    fn with_dropped_scenes_too_the_original_is_said_to_stay_for_what_was_asked() {
+        let mut report = fallback_report(not_h264());
+        report.dropped_scenes = 1;
+        report.original =
+            OriginalOutcome::AlwaysKept(OriginalAlwaysKept::ScenesDroppedAndCutIsExact);
+        assert!(
+            report.plain_summary().ends_with(
+                "The original is still in its place. It is always kept when scenes are dropped \
+                 or a cut on the exact picture was asked for, whichever way the video was cut \
+                 in the end."
+            ),
+            "{}",
+            report.plain_summary()
+        );
+    }
+
+    #[test]
+    fn no_cut_at_the_nearest_points_ever_lets_the_original_of_an_exact_split_go() {
+        // Whatever rule the order carried, and it should only ever carry
+        // the first two, and however the check of the copied scenes went.
+        let every_rule = [
+            OriginalRule::AlwaysKept(OriginalAlwaysKept::CutIsExact),
+            OriginalRule::AlwaysKept(OriginalAlwaysKept::ScenesDroppedAndCutIsExact),
+            OriginalRule::AlwaysKept(OriginalAlwaysKept::ScenesDropped),
+            OriginalRule::AsChosen(OriginalPolicy::Keep),
+            OriginalRule::AsChosen(OriginalPolicy::RecycleOnceVerified),
+        ];
+        for rule_of_the_order in every_rule {
+            let rule = original_rule_after_no_exact_cut(rule_of_the_order);
+            assert!(
+                matches!(rule, OriginalRule::AlwaysKept(_)),
+                "{rule_of_the_order:?}"
+            );
+            for verification in [Verification::Passed, failed()] {
+                assert_ne!(
+                    decide_about_original(rule, &verification),
+                    OriginalDecision::Recycle,
+                    "{rule_of_the_order:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_measurements_of_an_exact_split_say_where_each_cut_landed() {
         assert_eq!(
             exact_cut_report().exact_cut_measurements().as_deref(),
             Some(
                 "Pictures: 225 in the original and in the scenes together, 50 of them encoded again.\n\
+                 Pictures encoded again: none differs from its picture in the original by more \
+                 than 0.21 of 255 steps of brightness, compared as small grey copies.\n\
                  Sound: 389 packets, all copied unchanged. Largest shift against the picture: 0.0007 s.\n\
                  Cut 1: asked for at 00:00:02.900, the next scene starts at 00:00:02.920 (0.020 s later)."
             )

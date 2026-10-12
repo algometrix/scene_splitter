@@ -15,8 +15,9 @@ use crate::queue::JobId;
 pub enum SplitOutcome {
     /// Written and checked, and the original dealt with as asked.
     Clean,
-    /// Written, but the check did not pass or the original could not be
-    /// moved. The page of the video says which.
+    /// Written, but the check did not pass, the original could not be moved,
+    /// or the video was cut at the nearest points and not on the exact
+    /// pictures that were asked for. The page of the video says which.
     NeedsALook,
     /// Nothing usable was written. The video keeps its review.
     Failed,

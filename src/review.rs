@@ -17,6 +17,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::detect::ScanKind;
+use crate::exact_cut::CutPrecision;
 use crate::export::{ExportOptions, OriginalAlwaysKept, TRASH_NAME};
 use crate::fates::SceneFate;
 use crate::focus::{self, PicturePosition, PictureStep, SceneStep};
@@ -721,6 +722,7 @@ impl ReviewScreen {
         let mut requests = Vec::new();
         requests.extend(show_title_and_main_action(ui, session));
         requests.extend(show_export_obstacle(ui, session));
+        show_exact_cut_notice(ui, session, settings.export.cut_precision);
         requests.extend(show_export_options(
             ui,
             session.video(),
@@ -2044,6 +2046,19 @@ fn show_export_obstacle(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Re
         }
     }
     request
+}
+
+/// Says before the split that this video will not be cut on the exact
+/// pictures, why, and how it will be cut instead. Nothing is shown for a
+/// video that can be, or while exact cuts are off.
+fn show_exact_cut_notice(ui: &mut egui::Ui, session: &ReviewSession, cut_precision: CutPrecision) {
+    let Some(notice) = session.exact_cut_notice_for(cut_precision) else {
+        return;
+    };
+    let palette = theme::palette(ui.ctx());
+    ui.horizontal_wrapped(|ui| {
+        ui.colored_label(palette.warning_text, notice);
+    });
 }
 
 /// What happens to the original and where the scenes go, right under the
@@ -4001,6 +4016,43 @@ mod tests {
         assert_eq!(screen.view.scene_cards.len(), 5);
         screen.press_ctrl_z();
         assert_eq!(dropped_scenes(&screen), Vec::<usize>::new());
+    }
+
+    /// How often the last frame painted exactly `text`.
+    fn times_painted(screen: &Screen, text: &str) -> usize {
+        let mut places = Vec::new();
+        for clipped in &screen.shapes {
+            places_of_text_in(&clipped.shape, text, &mut places);
+        }
+        places.len()
+    }
+
+    #[test]
+    fn a_video_that_cannot_be_cut_exactly_says_so_above_the_split_in_the_smallest_window() {
+        let why_not_exact = crate::exact_fallback::WhyNotExact::EncoderMissing;
+        let notice = why_not_exact.before_the_split_in_plain_words();
+        let mut screen = Screen::showing(test_sessions::five_scenes(), SMALLEST_WINDOW_MAIN_PANEL);
+        screen
+            .session
+            .note_exact_cut_look(crate::exact_fallback::ExactCutLook::CannotBeCut(
+                why_not_exact,
+            ));
+
+        // With exact cuts off nobody asked for one, so nothing is said.
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        assert_eq!(times_painted(&screen, &notice), 0);
+
+        screen.settings.export.cut_precision = CutPrecision::ExactFrame;
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        assert_eq!(times_painted(&screen, &notice), 1);
+        // It wraps inside the panel, and the scenes are all still there.
+        assert!(
+            screen.right_edge_of_all_text() <= SMALLEST_WINDOW_MAIN_PANEL.x,
+            "{}",
+            screen.right_edge_of_all_text()
+        );
+        assert_eq!(screen.view.scene_cards.len(), 5);
     }
 
     #[test]

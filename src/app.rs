@@ -22,6 +22,8 @@ use crate::batch::{SplitBatch, SplitOutcome};
 use crate::cache::{self, CacheUse, SourcedDetection};
 use crate::detect::{ScanKind, ScanProgress, ScanStage};
 use crate::exact_cut::CutPrecision;
+use crate::exact_fallback::ExactCutLook;
+use crate::exact_split;
 use crate::export::{
     self, ExistingListFile, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalPolicy,
     SplitMethod, SplitOrder, TRASH_NAME,
@@ -271,6 +273,9 @@ enum JobEvent {
     ScanProgressed(ScanProgress),
     Scanned(Result<SourcedDetection>),
     Exported(Result<ExportReport>),
+    /// A look at the video's file said this about cutting it on exact
+    /// pictures.
+    ExactCutLookedAt(ExactCutLook),
     /// The background work stopped without a result.
     Crashed,
 }
@@ -458,6 +463,7 @@ impl SceneSplitterApp {
         self.apply_job_updates();
         self.advance_batch(ctx);
         self.tell_the_review_where_new_splits_land();
+        self.look_whether_the_video_on_show_can_be_cut_exactly(ctx);
         self.apply(ctx, requests_from_keys_and_drops(ctx));
         self.start_next_scan(ctx);
         self.close_player_unless_its_video_is_in_review();
@@ -522,6 +528,45 @@ impl SceneSplitterApp {
         if let Some(review) = review_on_show {
             review.place_new_splits(precision);
         }
+    }
+
+    /// While exact cuts are on, the review says before the split when its
+    /// video cannot be cut that way and will be cut at the nearest points
+    /// instead. That takes a look at the file, which is made once for each
+    /// review, in the background, when the review is first on show.
+    fn look_whether_the_video_on_show_can_be_cut_exactly(&mut self, ctx: &egui::Context) {
+        if self.settings.export.cut_precision != CutPrecision::ExactFrame {
+            return;
+        }
+        let Some(job) = self.queue.current() else {
+            return;
+        };
+        let Some(review) = self.queue.review_mut(job) else {
+            return;
+        };
+        if *review.exact_cut_look() != ExactCutLook::NotLooked {
+            return;
+        }
+        review.note_exact_cut_look(ExactCutLook::Looking);
+        let video = Arc::clone(review.video());
+
+        let updates_sender = self.updates_sender.clone();
+        let ctx = ctx.clone();
+        // Not through `run_in_background`: should the look ever stop
+        // without a result, the review is simply told nothing before the
+        // split, and the video is not marked as failed over it.
+        std::thread::spawn(move || {
+            let look = match exact_split::why_no_exact_cut_at_a_glance(&video) {
+                Ok(Some(why_not_exact)) => ExactCutLook::CannotBeCut(why_not_exact),
+                // A video that could not be looked at fails in the split
+                // itself, which says why.
+                Ok(None) | Err(_) => ExactCutLook::CanBeTried,
+            };
+            let event = JobEvent::ExactCutLookedAt(look);
+            if updates_sender.send(JobUpdate { job, event }).is_ok() {
+                ctx.request_repaint();
+            }
+        });
     }
 
     /// A dialog in front of everything has the keyboard to itself.
@@ -1199,6 +1244,10 @@ impl SceneSplitterApp {
                 JobEvent::Exported(Err(error)) => {
                     self.queue.failed(job, Failure::from_split_error(&error))
                 }
+                JobEvent::ExactCutLookedAt(look) => {
+                    self.queue.note_exact_cut_look(job, look);
+                    Ok(())
+                }
                 JobEvent::Crashed => self.queue.crashed(job),
             };
             self.note_refusal(told);
@@ -1343,7 +1392,7 @@ fn split_outcome_of(event: &JobEvent) -> Option<SplitOutcome> {
         // A crash is counted for the video whose turn it is, which is being
         // split. A scan that crashed is some other video's.
         JobEvent::Exported(Err(_)) | JobEvent::Crashed => Some(SplitOutcome::Failed),
-        JobEvent::ScanProgressed(_) | JobEvent::Scanned(_) => None,
+        JobEvent::ScanProgressed(_) | JobEvent::Scanned(_) | JobEvent::ExactCutLookedAt(_) => None,
     }
 }
 
@@ -2742,6 +2791,50 @@ mod tests {
         assert_eq!(app.queue.review(job).unwrap().export_obstacle(), None);
     }
 
+    fn exact_cut_look_of(app: &SceneSplitterApp, job: JobId) -> ExactCutLook {
+        app.queue.review(job).unwrap().exact_cut_look().clone()
+    }
+
+    #[test]
+    fn the_video_on_show_is_looked_at_once_and_only_while_exact_cuts_are_on() {
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+
+        // Nobody asked for an exact cut, so nobody looks.
+        app.look_whether_the_video_on_show_can_be_cut_exactly(&ctx);
+        assert_eq!(exact_cut_look_of(&app, job), ExactCutLook::NotLooked);
+
+        app.settings.export.cut_precision = CutPrecision::ExactFrame;
+        app.look_whether_the_video_on_show_can_be_cut_exactly(&ctx);
+        assert_eq!(exact_cut_look_of(&app, job), ExactCutLook::Looking);
+        // A look under way is not started again on the next frame.
+        app.look_whether_the_video_on_show_can_be_cut_exactly(&ctx);
+        assert_eq!(exact_cut_look_of(&app, job), ExactCutLook::Looking);
+    }
+
+    #[test]
+    fn what_the_look_said_reaches_the_review_and_ends_no_split() {
+        let (mut app, job) = app_with_a_video_in_review();
+        let cannot = ExactCutLook::CannotBeCut(crate::exact_fallback::WhyNotExact::EncoderMissing);
+        assert_eq!(
+            split_outcome_of(&JobEvent::ExactCutLookedAt(cannot.clone())),
+            None
+        );
+
+        let event = JobEvent::ExactCutLookedAt(cannot.clone());
+        app.updates_sender.send(JobUpdate { job, event }).unwrap();
+        app.apply_job_updates();
+
+        assert_eq!(exact_cut_look_of(&app, job), cannot);
+        assert!(app.problems.is_empty());
+        assert!(app
+            .queue
+            .review(job)
+            .unwrap()
+            .exact_cut_notice_for(CutPrecision::ExactFrame)
+            .is_some());
+    }
+
     #[test]
     fn the_summary_of_a_run_stays_until_it_is_dismissed() {
         let ctx = egui::Context::default();
@@ -2763,12 +2856,14 @@ mod tests {
         let clean = ExportReport {
             scene_files: Vec::new(),
             out_dir: PathBuf::from("scenes"),
+            cut: export::CutOutcome::AsAskedFor,
             verification: export::Verification::Passed,
             original: export::OriginalOutcome::Kept,
             dropped_scenes: 0,
         };
         let unverified = ExportReport {
             dropped_scenes: 0,
+            cut: export::CutOutcome::AsAskedFor,
             verification: export::Verification::Failed("a packet differs".to_owned()),
             original: export::OriginalOutcome::KeptBecauseUnverified,
             scene_files: Vec::new(),
@@ -3634,6 +3729,7 @@ mod tests {
             scene_files: Vec::new(),
             out_dir: PathBuf::from("scenes"),
             dropped_scenes: 0,
+            cut: export::CutOutcome::AsAskedFor,
             verification: export::Verification::Failed("a packet differs".to_owned()),
             original: export::OriginalOutcome::KeptBecauseUnverified,
         };
