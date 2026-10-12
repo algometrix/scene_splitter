@@ -84,6 +84,8 @@ const SPLIT_NEAR_HINT: &str =
     "Cuts the scene playing now in two, at the closest point where the video can be cut.";
 const SPLIT_EXACTLY_LABEL: &str = "Split here (S)";
 const SPLIT_EXACTLY_HINT: &str = "Cuts the scene playing now in two, on this picture.";
+/// Room for the two one-picture buttons side by side.
+const PICTURE_STEP_BUTTONS_WIDTH: f32 = 185.0;
 const ONE_PICTURE_BACK_LABEL: &str = "-1 picture";
 const ONE_PICTURE_FORWARD_LABEL: &str = "+1 picture";
 const PLAYER_HINT: &str =
@@ -1093,7 +1095,13 @@ impl Player {
                 self.skip(SKIP_SECONDS, ui.ctx());
             }
 
-            ui.separator();
+            // The two buttons are one pair. In the smallest window the row
+            // ended between them, so the pair starts the next row when it
+            // does not fit whole, and no line is drawn before it that would
+            // take the room it just fits in.
+            if ui.available_size_before_wrap().x < PICTURE_STEP_BUTTONS_WIDTH {
+                ui.end_row();
+            }
             // The same step the mouse wheel makes, for those who do not
             // think to turn it.
             if ui

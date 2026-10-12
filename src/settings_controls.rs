@@ -181,7 +181,10 @@ pub fn show_hard_cut_controls(
 /// screen for the settings its video is scanned with.
 pub fn show_black_screen_controls(ui: &mut egui::Ui, scan: &mut ScanSettings) {
     let criteria = &mut scan.criteria;
-    ui.horizontal(|ui| {
+    // Each label wraps apart from its number box where the two do not fit
+    // side by side, as in the sidebar of a small window. A row that did not
+    // wrap made the sidebar wider instead.
+    ui.horizontal_wrapped(|ui| {
         ui.label("Shortest black screen");
         ui.add(
             egui::DragValue::new(&mut criteria.min_seconds)
@@ -191,13 +194,13 @@ pub fn show_black_screen_controls(ui: &mut egui::Ui, scan: &mut ScanSettings) {
                 .suffix(" s"),
         );
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("How dark counts as black").on_hover_text(
             "0 is pure black, 255 is white. Raise this if dark grey screens are missed.",
         );
         ui.add(egui::DragValue::new(&mut criteria.max_dark_luma));
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("How much of the picture must be black")
             .on_hover_text("A logo in a corner is why this is not 100%.");
         let mut percent = criteria.min_dark_fraction * PERCENT;

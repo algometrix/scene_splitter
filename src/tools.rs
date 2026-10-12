@@ -1,9 +1,12 @@
 //! Finds the two programs that do all the video work, ffmpeg and ffprobe,
 //! and downloads them the first time the app runs on a machine without them.
 //!
-//! The download is one fixed release for each operating system, checked
-//! against checksums built into this program, so what runs is the same
-//! version everywhere.
+//! The download is one fixed build for each operating system, checked
+//! against checksums built into this program, so what runs on a system is
+//! always the same program. The builds come from different builders and are
+//! not one version of ffmpeg: they report 6.1.1 on Windows and Intel Macs,
+//! 6.0 on Apple Silicon and 7.0.2 on Linux. No text may therefore name one
+//! version for the download.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -19,11 +22,14 @@ use sha2::{Digest, Sha256};
 use crate::ffmpeg::{self, Program, TimeLimit, ToolCommand};
 use crate::folders;
 
-pub const FFMPEG_VERSION: &str = "6.1.1";
 /// Static builds of ffmpeg and ffprobe for every platform, published as
 /// release assets by the ffmpeg-static project. Each asset is one program,
 /// gzipped.
 const RELEASE_URL: &str = "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1";
+/// The folder for the builds of that release. It carries the release's name
+/// and not a version of ffmpeg. A change of release needs a new folder name,
+/// so that the old programs are not taken for the new ones.
+const OWN_COPY_FOLDER: &str = "ffmpeg-6.1.1";
 
 const APP_FOLDER: &str = "scene_splitter";
 const TOOLS_FOLDER: &str = "tools";
@@ -247,7 +253,7 @@ fn tools_dir() -> Option<PathBuf> {
         folders::data_dir()?
             .join(APP_FOLDER)
             .join(TOOLS_FOLDER)
-            .join(format!("ffmpeg-{FFMPEG_VERSION}")),
+            .join(OWN_COPY_FOLDER),
     )
 }
 

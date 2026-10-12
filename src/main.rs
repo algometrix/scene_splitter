@@ -269,10 +269,7 @@ fn get_tools_if_missing() -> Result<()> {
     if tools::find_installed() == tools::Availability::Ready {
         return Ok(());
     }
-    println!(
-        "ffmpeg was not found. Downloading ffmpeg {} (this happens once).",
-        tools::FFMPEG_VERSION
-    );
+    println!("ffmpeg was not found. Downloading ffmpeg (this happens once).");
     let mut percent_reported = 0;
     tools::download(|progress| {
         let percent = (progress.fraction() * 100.0) as u32;

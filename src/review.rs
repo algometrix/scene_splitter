@@ -2100,28 +2100,29 @@ fn show_export_options(
     dropped_count: usize,
 ) -> Option<ReviewRequest> {
     let mut wanted = export_options;
+    let always_kept = OriginalAlwaysKept::for_split(dropped_count, export_options.cut_precision);
+    // The original is kept whatever was chosen for it, so the choice gives
+    // way to saying so, before the split. The sentence is long and gets
+    // rows of its own: a choice at the end of its last row reads as part
+    // of it.
+    if let Some(why) = always_kept {
+        ui.label(theme::muted(ui, why.in_plain_words()))
+            .on_hover_text(original_always_kept_hint(why));
+    }
     ui.horizontal_wrapped(|ui| {
-        // The original is kept whatever was chosen for it, so the choice
-        // gives way to saying so, before the split.
-        match OriginalAlwaysKept::for_split(dropped_count, export_options.cut_precision) {
-            Some(why) => {
-                ui.label(theme::muted(ui, why.in_plain_words()))
-                    .on_hover_text(original_always_kept_hint(why));
-            }
-            None => {
-                let recycle_label = format!(
-                    "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
-                );
-                settings_controls::show_original_policy_checkbox(
-                    ui,
-                    &mut wanted.original_policy,
-                    recycle_label,
-                )
-                .on_hover_text(format!(
-                    "The check compares the new files with the original. If anything is missing \
-                     or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
-                ));
-            }
+        if always_kept.is_none() {
+            let recycle_label = format!(
+                "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
+            );
+            settings_controls::show_original_policy_checkbox(
+                ui,
+                &mut wanted.original_policy,
+                recycle_label,
+            )
+            .on_hover_text(format!(
+                "The check compares the new files with the original. If anything is missing \
+                 or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
+            ));
         }
         settings_controls::show_scene_location_checkbox(ui, &mut wanted.scene_location);
         if let Ok(dir) = split::scene_dir(video, wanted.scene_location) {
@@ -2264,7 +2265,7 @@ fn show_status_line(ui: &mut egui::Ui, session: &ReviewSession) {
 fn show_what_the_split_will_do(ui: &mut egui::Ui, session: &ReviewSession, export: ExportOptions) {
     let original =
         match OriginalAlwaysKept::for_split(session.dropped_count(), export.cut_precision) {
-            Some(why) => why.in_plain_words().to_owned(),
+            Some(why) => why.in_few_words().to_owned(),
             None => match export.original_policy {
                 crate::export::OriginalPolicy::Keep => ORIGINAL_STAYS_SUMMARY.to_owned(),
                 crate::export::OriginalPolicy::RecycleOnceVerified => {

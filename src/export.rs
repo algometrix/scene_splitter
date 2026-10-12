@@ -157,6 +157,18 @@ impl OriginalAlwaysKept {
         format!("The original is {}", self.rule_in_words())
     }
 
+    /// The rule without its reason, for the one line under the split button,
+    /// which has to fit a narrow window. The reason is in the options below.
+    pub fn in_few_words(self) -> &'static str {
+        match self {
+            Self::ScenesDropped => "The original is kept, since scenes are dropped.",
+            Self::CutIsExact => "The original is kept, since the cut is exact.",
+            Self::ScenesDroppedAndCutIsExact => {
+                "The original is kept, since scenes are dropped and the cut is exact."
+            }
+        }
+    }
+
     /// The same rule after a sentence that has already named the original.
     fn as_a_following_sentence(self) -> String {
         format!("It is {}", self.rule_in_words())

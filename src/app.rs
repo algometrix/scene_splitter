@@ -50,7 +50,15 @@ const WINDOW_SIZE: [f32; 2] = [1320.0, 900.0];
 /// Below this the review screen cannot show its buttons and a scene card.
 const MIN_WINDOW_SIZE: [f32; 2] = [900.0, 600.0];
 const QUEUE_PANEL_WIDTH: f32 = 270.0;
-const QUEUE_PANEL_WIDTHS: std::ops::RangeInclusive<f32> = 230.0..=380.0;
+/// A heading that folds does not wrap, so this one has to fit the queue
+/// panel at its narrowest.
+const BLACK_SCREEN_SETTINGS_HEADING: &str = "Advanced: black screens";
+const QUEUE_PANEL_NARROWEST: f32 = 230.0;
+const QUEUE_PANEL_WIDEST: f32 = 380.0;
+/// The most of the window the queue panel may take. Open settings ask for
+/// more room than the panel has, and in the smallest window a panel that
+/// grew for them left the review too narrow for its own buttons.
+const QUEUE_PANEL_LARGEST_SHARE: f32 = 0.31;
 const MESSAGE_CARD_WIDTH: f32 = 560.0;
 /// Room kept on both sides of a card or dialog, for its margin and shadow.
 const CARD_SIDE_ROOM: f32 = 48.0;
@@ -482,7 +490,7 @@ impl SceneSplitterApp {
         egui::SidePanel::left("queue")
             .frame(theme::panel(theme::palette(ctx).sidebar))
             .default_width(QUEUE_PANEL_WIDTH)
-            .width_range(QUEUE_PANEL_WIDTHS)
+            .width_range(queue_panel_widths(ctx.screen_rect().width()))
             .show(ctx, |ui| {
                 // One scroll area for the whole panel, so opening the
                 // settings can never push the video list out of reach.
@@ -1665,7 +1673,7 @@ fn show_settings(
     // What counts as a black screen needs some knowledge of video to set,
     // and the defaults suit most films, so it stays folded away.
     ui.add_space(4.0);
-    egui::CollapsingHeader::new("Advanced: what counts as a black screen").show(ui, |ui| {
+    egui::CollapsingHeader::new(BLACK_SCREEN_SETTINGS_HEADING).show(ui, |ui| {
         settings_controls::show_black_screen_controls(ui, &mut settings.detection.scan);
     });
     show_folders_with_their_own_settings(ui, &mut settings);
@@ -1755,6 +1763,13 @@ fn show_job_card(ui: &mut egui::Ui, job: &Job, is_current: bool) -> Option<AppRe
     clicked.then_some(AppRequest::ShowJob(job.id()))
 }
 
+/// How narrow and how wide the queue panel may be in a window this wide.
+fn queue_panel_widths(window_width: f32) -> std::ops::RangeInclusive<f32> {
+    let widest =
+        (window_width * QUEUE_PANEL_LARGEST_SHARE).clamp(QUEUE_PANEL_NARROWEST, QUEUE_PANEL_WIDEST);
+    QUEUE_PANEL_NARROWEST..=widest
+}
+
 /// The first-run screen, with the way to try the download again when it
 /// failed.
 fn show_setup(ctx: &egui::Context, setup: &Setup) -> Option<AppRequest> {
@@ -1767,9 +1782,8 @@ fn show_setup(ctx: &egui::Context, setup: &Setup) -> Option<AppRequest> {
             ui.label(theme::muted(
                 ui,
                 format!(
-                "Scene Splitter is downloading the video tools it needs (ffmpeg {}, about {} MB). \
+                "Scene Splitter is downloading the video tools it needs (ffmpeg, about {} MB). \
                  You can add videos now. Scanning starts when the download is done.",
-                tools::FFMPEG_VERSION,
                 megabytes(progress.total_bytes.max(progress.received_bytes))
             ),
             ));
@@ -3480,6 +3494,36 @@ mod tests {
     }
 
     const WINDOW: egui::Vec2 = egui::vec2(1320.0, 900.0);
+    const SMALLEST_WINDOW: egui::Vec2 = egui::vec2(MIN_WINDOW_SIZE[0], MIN_WINDOW_SIZE[1]);
+    /// The panel's own padding and the indent of what is folded inside it.
+    const QUEUE_PANEL_EDGES: f32 = 40.0;
+
+    #[test]
+    fn open_settings_do_not_widen_the_queue_panel_in_the_smallest_window() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let (mut app, _) = app_with_a_video_in_review();
+        // Every part that folds is drawn open, as if the person had opened
+        // the settings and all that is folded inside them.
+        ctx.memory_mut(|memory| memory.set_everything_is_visible(true));
+        for _ in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SMALLEST_WINDOW)),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.run_frame(ctx));
+        }
+
+        let panel = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("queue"))
+            .expect("the queue panel was drawn")
+            .rect;
+        let widest = SMALLEST_WINDOW.x * QUEUE_PANEL_LARGEST_SHARE + QUEUE_PANEL_EDGES;
+        assert!(
+            panel.width() <= widest,
+            "the queue panel is {} wide, the most it may be is {widest}",
+            panel.width()
+        );
+    }
 
     /// An app as a person sees it, driven one frame at a time with keys.
     /// Nothing here changes a setting, so nothing is written to disk.

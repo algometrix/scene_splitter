@@ -342,7 +342,7 @@ The Settings section is under the list on the left. It holds:
 - Whether the tips are shown on the review screen.
 - "Colours", under "How the window looks": "Same as the system", "Light" or "Dark". See [Light and dark](#light-and-dark).
 - For missed scenes: how much to detect, and the shortest scene to allow.
-- Under "Advanced: what counts as a black screen": the shortest black screen, how dark counts as black, how much of the picture must be black, and "Check every picture", the slow scan for grainy black screens.
+- Under "Advanced: black screens": the shortest black screen, how dark counts as black, how much of the picture must be black, and "Check every picture", the slow scan for grainy black screens.
 - "Folders with their own scan settings", once there are some, each with "Forget".
 - "Restore default settings". This leaves your choice about originals as it is, and does not bring back the one-time question about the Recycle Bin or Trash. It also forgets the settings remembered for folders, which the line under the button says before you press it, and the window follows the system's light or dark setting again.
 
@@ -433,17 +433,17 @@ The app needs `ffmpeg` and `ffprobe`. It looks for them in this order:
 
 1. Its own copy, in `scene_splitter/tools/ffmpeg-6.1.1` inside the data folder (see [Where files are kept](#where-files-are-kept)).
 2. Your `PATH`.
-3. If neither has both programs, it downloads ffmpeg 6.1.1 into the folder from step 1. This happens once. The window shows a progress bar, and the command line prints the progress. You can add videos while it downloads. If the download fails, the window offers "Try again".
+3. If neither has both programs, it downloads ffmpeg into the folder from step 1. This happens once. The window shows a progress bar, and the command line prints the progress. You can add videos while it downloads. If the download fails, the window offers "Try again".
 
-The downloads are the static builds from the `b6.1.1` release of the [`ffmpeg-static`](https://github.com/eugeneware/ffmpeg-static) project on GitHub, two gzipped files per system:
+The downloads are the static builds from the `b6.1.1` release of the [`ffmpeg-static`](https://github.com/eugeneware/ffmpeg-static) project on GitHub, two gzipped files per system. The release bundles builds from different builders, so the ffmpeg version depends on the system. The folder name is the same everywhere:
 
-| System | Download size |
-| --- | --- |
-| Windows x64 | about 56 MB |
-| macOS, Apple Silicon | about 37 MB |
-| macOS, Intel | about 48 MB |
-| Linux x64 | about 56 MB |
-| Linux ARM64 | about 49 MB |
+| System | Download size | ffmpeg version |
+| --- | --- | --- |
+| Windows x64 | about 56 MB | 6.1.1 |
+| macOS, Apple Silicon | about 37 MB | 6.0 |
+| macOS, Intel | about 48 MB | 6.1.1 |
+| Linux x64 | about 56 MB | 7.0.2 |
+| Linux ARM64 | about 49 MB | 7.0.2 |
 
 The app checks each file against a SHA-256 checksum built into the program and discards it on a mismatch. On any other system (Windows on ARM, for example), or to use your own ffmpeg, put `ffmpeg` and `ffprobe` on your `PATH`.
 
