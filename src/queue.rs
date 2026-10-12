@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::cache::{CacheUse, SourcedDetection};
 use crate::detect::{ScanDepth, ScanKind, ScanProgress};
 use crate::export::ExportReport;
+use crate::fates::ScenesToWrite;
 use crate::ffmpeg::FfmpegError;
 use crate::review_session::ReviewSession;
 use crate::scenes::CutTimes;
@@ -355,7 +356,8 @@ pub struct ScanOrder {
 pub struct ExportOrder {
     pub job: JobId,
     pub video: Arc<Path>,
-    pub cuts: CutTimes,
+    /// Where to cut, and which of the scenes between the cuts to write.
+    pub scenes: ScenesToWrite,
 }
 
 #[derive(Debug, Default)]
@@ -563,7 +565,7 @@ impl Queue {
         Ok(())
     }
 
-    /// Takes the cuts of the review as final and shows the next video that
+    /// Takes the scenes of the review as final and shows the next video that
     /// needs attention, so the person can keep reviewing while this one is
     /// written. The review stays with the video until the split has worked.
     pub fn start_export(&mut self, id: JobId) -> Result<ExportOrder, Refused> {
@@ -578,7 +580,7 @@ impl Queue {
         let order = ExportOrder {
             job: id,
             video: Arc::clone(&job.video),
-            cuts: session.accepted_cuts(),
+            scenes: session.scenes_to_write(),
         };
         job.status = match std::mem::replace(&mut job.status, JobStatus::Waiting) {
             JobStatus::Reviewing(session) => JobStatus::Exporting(session),
@@ -753,6 +755,7 @@ mod tests {
         ExportReport {
             scene_files: Vec::new(),
             out_dir: PathBuf::from("scenes"),
+            dropped_scenes: 0,
             verification: Verification::Passed,
             original: OriginalOutcome::Kept,
         }
@@ -1286,9 +1289,27 @@ mod tests {
         let order = queue.start_export(ids[0]).unwrap();
         assert_eq!(order.job, ids[0]);
         assert_eq!(&*order.video, Path::new("video_0.mp4"));
-        assert_eq!(order.cuts.as_slice(), [20.0, 60.0]);
+        assert_eq!(order.scenes.cuts().as_slice(), [20.0, 60.0]);
+        assert!(!order.scenes.has_dropped_scenes());
         assert_eq!(stage(&queue, ids[0]), Stage::Exporting);
         assert_eq!(queue.current(), Some(ids[1]));
+    }
+
+    #[test]
+    fn a_split_leaves_out_the_scenes_the_person_dropped() {
+        let (mut queue, ids) = queue_with(1);
+        bring_to_review(&mut queue, ids[0]);
+        let nothing_in_the_way = test_sessions::nothing_in_the_way;
+        let middle_scene = SceneIndex::new(1);
+        queue
+            .review_mut(ids[0])
+            .unwrap()
+            .apply(ReviewRequest::DropScene(middle_scene), &nothing_in_the_way);
+
+        let order = queue.start_export(ids[0]).unwrap();
+        assert_eq!(order.scenes.cuts().as_slice(), [20.0, 60.0]);
+        assert_eq!(order.scenes.dropped_count(), 1);
+        assert_eq!(order.scenes.kept_scenes().len(), 2);
     }
 
     #[test]

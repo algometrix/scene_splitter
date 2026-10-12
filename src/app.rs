@@ -20,16 +20,22 @@ use eframe::egui;
 
 use crate::cache::{self, CacheUse, SourcedDetection};
 use crate::detect::{ScanKind, ScanMode, ScanProgress, ScanStage};
-use crate::export::{self, ExportReport, OriginalPolicy, TRASH_NAME};
+use crate::export::{
+    self, ExistingListFile, ExportOptions, ExportReport, OriginalPolicy, SplitOrder, TRASH_NAME,
+};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
 use crate::player::{Player, PlayerEvent};
 use crate::queue::{Failure, Job, JobId, JobStatus, Queue, Refused, ScanOrder};
 use crate::review::{file_name, ReviewScreen};
-use crate::review_session::{counted, EarlierSceneFiles, FollowUp, ReviewRequest, ReviewSession};
+use crate::review_session::{
+    counted, EarlierSceneFiles, FollowUp, ReviewRequest, ReviewSession, SceneListNote,
+};
+use crate::scene_list::{FrameRate, SceneList, SceneListFormat};
+use crate::scene_name::SceneNamePattern;
 use crate::settings::{LoadedSettings, RecyclingQuestion, Settings, SettingsChange};
-use crate::settings_controls;
-use crate::split::{self, SceneLocation};
+use crate::settings_controls::{self, SceneNameDraft};
+use crate::split;
 use crate::theme;
 use crate::tools::{self, Availability, DownloadProgress};
 
@@ -186,6 +192,14 @@ fn settings_after_recycling_answer(
     Some(answered)
 }
 
+/// Whether a split has to wait for the person to say what happens to
+/// originals. A split that drops scenes keeps the original whatever is set,
+/// so it has nothing to ask about, and leaves the question for the first
+/// split that could move one.
+fn split_waits_for_the_recycling_answer(settings: &Settings, dropped_scenes: usize) -> bool {
+    dropped_scenes == 0 && settings.must_ask_before_recycling()
+}
+
 /// The result of background work on one job.
 struct JobUpdate {
     job: JobId,
@@ -207,6 +221,9 @@ struct SceneSplitterApp {
     saved_settings: Settings,
     /// Why the settings could not be saved, when that happened.
     settings_problem: String,
+    /// What stands in the Settings box for the name of scene files, which
+    /// is not always a name that can be used yet.
+    scene_name_draft: SceneNameDraft,
     setup: Setup,
     queue: Queue,
     /// What the review screen of each video in review has drawn and loaded.
@@ -352,6 +369,7 @@ impl SceneSplitterApp {
             settings: loaded.settings,
             saved_settings: loaded.settings,
             settings_problem: loaded.problem.unwrap_or_default(),
+            scene_name_draft: SceneNameDraft::of(loaded.settings.export.scene_name),
             setup: Setup::Ready,
             queue: Queue::default(),
             review_screens: HashMap::new(),
@@ -377,7 +395,7 @@ impl SceneSplitterApp {
         self.forget_review_screens_no_longer_shown();
         self.drop_the_recycling_question_unless_its_video_is_in_review();
 
-        let scene_location_before = self.settings.export.scene_location;
+        let export_options_before = self.settings.export;
         let keyboard = self.keyboard_owner();
         self.leave_escape_to_the_text_box(ctx, keyboard);
         // The player is in front of the review screen but drawn after it,
@@ -404,6 +422,7 @@ impl SceneSplitterApp {
                             &self.problems,
                             &mut self.settings,
                             &self.settings_problem,
+                            &mut self.scene_name_draft,
                         ));
                     });
             });
@@ -415,7 +434,7 @@ impl SceneSplitterApp {
         requests.extend(self.show_recycling_question(ctx));
         self.apply(ctx, requests);
 
-        self.forget_export_obstacles_if_scenes_go_elsewhere(scene_location_before);
+        self.forget_export_obstacles_if_scenes_go_elsewhere(export_options_before);
         self.text_box_had_the_keyboard = ctx.wants_keyboard_input();
         self.save_settings_once_changed(ctx);
     }
@@ -445,11 +464,14 @@ impl SceneSplitterApp {
     }
 
     /// A warning about the scene files of an earlier split names the folder
-    /// the scenes go to. Wherever in the window the person changes that
-    /// folder, the sidebar or a review screen, this is the one place that
-    /// notices, so no warning about the old folder stays on any review.
-    fn forget_export_obstacles_if_scenes_go_elsewhere(&mut self, location_before: SceneLocation) {
-        if self.settings.export.scene_location != location_before {
+    /// the scenes go to, and counts the files there that are named as the
+    /// scenes would be. Wherever in the window the person changes that
+    /// folder or that name, the sidebar or a review screen, this is the one
+    /// place that notices, so no warning about the old ones stays on any
+    /// review.
+    fn forget_export_obstacles_if_scenes_go_elsewhere(&mut self, before: ExportOptions) {
+        let now = self.settings.export;
+        if now.scene_location != before.scene_location || now.scene_name != before.scene_name {
             self.queue.forget_export_obstacles();
         }
     }
@@ -540,7 +562,11 @@ impl SceneSplitterApp {
     /// Bin or Trash and the person has never been told what that means. Then
     /// the split waits for their answer.
     fn split_once_recycling_is_settled(&mut self, ctx: &egui::Context, job: JobId) {
-        if !self.settings.must_ask_before_recycling() {
+        let dropped_scenes = self
+            .queue
+            .review(job)
+            .map_or(0, ReviewSession::dropped_count);
+        if !split_waits_for_the_recycling_answer(&self.settings, dropped_scenes) {
             return self.start_export(ctx, job);
         }
         // The person is done with the player, and its keys must not go on
@@ -597,8 +623,8 @@ impl SceneSplitterApp {
             return;
         };
         let video = Arc::clone(session.video());
-        let scene_location = self.settings.export.scene_location;
-        let look_for_files = || look_for_earlier_scene_files(&video, scene_location);
+        let export_options = self.settings.export;
+        let look_for_files = || look_for_earlier_scene_files(&video, export_options);
         let Some(follow_up) = session.apply_frame(requests, &look_for_files) else {
             return;
         };
@@ -615,7 +641,22 @@ impl SceneSplitterApp {
             }
             FollowUp::PlayFrom(time) => self.play_from(ctx, job, time),
             FollowUp::ChangeSettings(change) => self.change_settings(change),
+            FollowUp::SaveSceneList { format, path } => self.save_scene_list(job, format, path),
         }
+    }
+
+    /// Writes the list of the scenes under review to the file the person
+    /// chose, and leaves word on the review of how that went.
+    fn save_scene_list(&mut self, job: JobId, format: SceneListFormat, path: PathBuf) {
+        let scene_name = self.settings.export.scene_name;
+        let Some(session) = self.queue.review_mut(job) else {
+            return;
+        };
+        let note = match write_scene_list(session, scene_name, format, &path) {
+            Ok(()) => SceneListNote::Saved(path),
+            Err(error) => SceneListNote::NotSaved(format!("{error:#}")),
+        };
+        session.note_scene_list(note);
     }
 
     /// Takes over a change of settings made on a review screen. It is saved
@@ -819,8 +860,12 @@ impl SceneSplitterApp {
         let Some(video) = self.queue.job(job).map(|job| Arc::clone(job.video())) else {
             return self.note_refusal(Err(Refused::NoSuchJob(job)));
         };
-        let policy = self.settings.export.original_policy;
-        let out_dir = match split::scene_dir(&video, self.settings.export.scene_location) {
+        let ExportOptions {
+            original_policy,
+            scene_name,
+            scene_location,
+        } = self.settings.export;
+        let out_dir = match split::scene_dir(&video, scene_location) {
             Ok(out_dir) => out_dir,
             Err(error) => {
                 let failure = Failure::in_plain_words(format!("{error:#}"));
@@ -832,12 +877,15 @@ impl SceneSplitterApp {
             Ok(order) => order,
             Err(refused) => return self.note_refusal(Err(refused)),
         };
+        // Made here and not from the settings alone: an order that drops
+        // scenes keeps the original whatever the person chose for it.
+        let split_order = SplitOrder::new(order.scenes, original_policy);
         self.run_in_background(ctx, job, move || {
             JobEvent::Exported(export::export_scenes(
                 &order.video,
-                &order.cuts,
+                &split_order,
                 &out_dir,
-                policy,
+                scene_name,
             ))
         });
     }
@@ -969,17 +1017,37 @@ impl SceneSplitterApp {
     }
 }
 
+/// Saves the list of the scenes a split of this review would write. The
+/// system's dialog has already asked before replacing a file.
+fn write_scene_list(
+    review: &ReviewSession,
+    scene_name: SceneNamePattern,
+    format: SceneListFormat,
+    path: &Path,
+) -> Result<()> {
+    let frame_rate = FrameRate::from_frame_seconds(review.frame_seconds())
+        .map_err(|not_a_rate| anyhow!("the video's frame rate is not known: {not_a_rate}"))?;
+    let list = SceneList::of_split(
+        review.video(),
+        &review.scenes_to_write(),
+        frame_rate,
+        scene_name,
+    )?;
+    export::save_scene_list(&list, format, path, ExistingListFile::Replace)
+}
+
 /// Looks where the scenes of this video would go now, and counts the scene
-/// files an earlier split of it left there.
+/// files an earlier split of it left there under the name scenes get now.
 fn look_for_earlier_scene_files(
     video: &Path,
-    scene_location: SceneLocation,
+    export_options: ExportOptions,
 ) -> Result<EarlierSceneFiles, String> {
-    let scene_dir =
-        split::scene_dir(video, scene_location).map_err(|error| format!("{error:#}"))?;
-    let file_count = split::scene_files_from_earlier_splits(video, &scene_dir)
-        .map_err(|error| format!("{error:#}"))?
-        .len();
+    let scene_dir = split::scene_dir(video, export_options.scene_location)
+        .map_err(|error| format!("{error:#}"))?;
+    let file_count =
+        split::scene_files_from_earlier_splits(video, &scene_dir, export_options.scene_name)
+            .map_err(|error| format!("{error:#}"))?
+            .len();
     Ok(EarlierSceneFiles {
         scene_dir,
         file_count,
@@ -1027,6 +1095,7 @@ fn show_queue(
     problems: &[String],
     settings: &mut Settings,
     settings_problem: &str,
+    scene_name_draft: &mut SceneNameDraft,
 ) -> Vec<AppRequest> {
     let mut requests = Vec::new();
     ui.label(theme::semibold("Scene Splitter", 20.0).color(theme::PRIMARY));
@@ -1055,8 +1124,9 @@ fn show_queue(
     requests.extend(show_problems(ui, problems));
 
     ui.add_space(8.0);
-    egui::CollapsingHeader::new(theme::semibold("Settings", 14.0))
-        .show(ui, |ui| show_settings(ui, settings, settings_problem));
+    egui::CollapsingHeader::new(theme::semibold("Settings", 14.0)).show(ui, |ui| {
+        show_settings(ui, settings, settings_problem, scene_name_draft);
+    });
     requests
 }
 
@@ -1093,7 +1163,12 @@ fn path_from_pasted_text(text: &str) -> Option<PathBuf> {
 
 /// The settings section. Whatever changes here is saved and used from then
 /// on, by the window and by the command line.
-fn show_settings(ui: &mut egui::Ui, settings: &mut Settings, problem: &str) {
+fn show_settings(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+    problem: &str,
+    scene_name_draft: &mut SceneNameDraft,
+) {
     if !problem.is_empty() {
         ui.add(theme::selectable(
             egui::RichText::new(problem).color(theme::DANGER),
@@ -1111,6 +1186,7 @@ fn show_settings(ui: &mut egui::Ui, settings: &mut Settings, problem: &str) {
         "The new files are compared with the original first. If anything is missing or different, the original stays.",
     );
     settings_controls::show_scene_location_checkbox(ui, &mut settings.export.scene_location);
+    settings_controls::show_scene_name_box(ui, scene_name_draft, &mut settings.export.scene_name);
     ui.checkbox(&mut settings.show_tips, "Show tips on the review screen");
 
     ui.add_space(4.0);
@@ -1624,6 +1700,7 @@ fn show_scan_progress(ctx: &egui::Context, text: &str, progress: ScanProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::split::SceneLocation;
 
     #[test]
     fn a_pasted_path_loses_its_surrounding_quotes() {
@@ -1842,6 +1919,84 @@ mod tests {
         assert_eq!(copied, details);
     }
 
+    fn scenes_go(scene_location: SceneLocation) -> ExportOptions {
+        ExportOptions {
+            scene_location,
+            ..ExportOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_split_that_drops_scenes_does_not_ask_about_recycling() {
+        let never_asked = Settings::default();
+        assert!(split_waits_for_the_recycling_answer(&never_asked, 0));
+        assert!(!split_waits_for_the_recycling_answer(&never_asked, 1));
+
+        let (app, job) = app_with_a_video_in_review();
+        assert_eq!(app.queue.review(job).unwrap().dropped_count(), 0);
+        assert!(split_waits_for_the_recycling_answer(&app.settings, 0));
+    }
+
+    #[test]
+    fn earlier_scene_files_are_counted_under_the_name_scenes_get_now() {
+        let folder = std::env::temp_dir().join(format!(
+            "scene_splitter_test_{}_earlier_files_by_name",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("film_scene_001.mp4"), b"").unwrap();
+        std::fs::write(folder.join("film part 001.mp4"), b"").unwrap();
+        std::fs::write(folder.join("film part 002.mp4"), b"").unwrap();
+        let video = folder.join("film.mp4");
+        let named_by_part = ExportOptions {
+            scene_name: SceneNamePattern::new("{name} part {number}").unwrap(),
+            ..ExportOptions::default()
+        };
+
+        let by_default_name = look_for_earlier_scene_files(&video, ExportOptions::default());
+        let by_part = look_for_earlier_scene_files(&video, named_by_part);
+        let _ = std::fs::remove_dir_all(&folder);
+        assert_eq!(by_default_name.map(|found| found.file_count), Ok(1));
+        assert_eq!(by_part.map(|found| found.file_count), Ok(2));
+    }
+
+    #[test]
+    fn the_scene_list_of_a_review_is_saved_and_the_review_says_so() {
+        let folder = std::env::temp_dir().join(format!(
+            "scene_splitter_test_{}_scene_list",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let (mut app, job) = app_with_a_video_in_review();
+        let drop_the_second = ReviewRequest::DropScene(crate::plan::SceneIndex::new(1));
+        app.queue.review_mut(job).unwrap().apply(
+            drop_the_second,
+            &crate::review_session::test_sessions::nothing_in_the_way,
+        );
+
+        let list_file = folder.join("scenes.csv");
+        app.save_scene_list(job, SceneListFormat::Csv, list_file.clone());
+        let saved = std::fs::read_to_string(&list_file);
+        // A list is never written over a video.
+        let video_file = folder.join("scenes.mp4");
+        app.save_scene_list(job, SceneListFormat::Csv, video_file.clone());
+        let note_after_refusal = app.queue.review(job).unwrap().scene_list_note().cloned();
+        let video_file_was_written = video_file.exists();
+        let _ = std::fs::remove_dir_all(&folder);
+
+        // Four of the five scenes are written, so the table has four rows.
+        let saved = saved.unwrap();
+        assert_eq!(saved.lines().count(), 5, "{saved}");
+        assert!(
+            saved.contains("2,00:00:40.000,00:01:00.000,00:00:20.000,no_such_video_scene_002.mp4")
+        );
+        assert!(matches!(
+            note_after_refusal,
+            Some(SceneListNote::NotSaved(_))
+        ));
+        assert!(!video_file_was_written);
+    }
+
     #[test]
     fn a_video_with_no_scene_files_beside_it_has_none_to_replace() {
         let folder = std::env::temp_dir().join(format!(
@@ -1851,7 +2006,7 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let video = folder.join("film.mp4");
 
-        let found = look_for_earlier_scene_files(&video, SceneLocation::BesideVideo);
+        let found = look_for_earlier_scene_files(&video, scenes_go(SceneLocation::BesideVideo));
         let _ = std::fs::remove_dir_all(&folder);
         assert_eq!(
             found,
@@ -1875,8 +2030,9 @@ mod tests {
         std::fs::write(new_folder.join("film_scene_002.mp4"), b"").unwrap();
         let video = folder.join("film.mp4");
 
-        let beside = look_for_earlier_scene_files(&video, SceneLocation::BesideVideo);
-        let in_new_folder = look_for_earlier_scene_files(&video, SceneLocation::NewFolder);
+        let beside = look_for_earlier_scene_files(&video, scenes_go(SceneLocation::BesideVideo));
+        let in_new_folder =
+            look_for_earlier_scene_files(&video, scenes_go(SceneLocation::NewFolder));
         let _ = std::fs::remove_dir_all(&folder);
         assert_eq!(
             beside,
@@ -1931,13 +2087,34 @@ mod tests {
         assert!(review.export_obstacle().is_some());
 
         // Nothing changed: the warning stays.
-        let location_before = app.settings.export.scene_location;
-        app.forget_export_obstacles_if_scenes_go_elsewhere(location_before);
+        let options_before = app.settings.export;
+        app.forget_export_obstacles_if_scenes_go_elsewhere(options_before);
         assert!(app.queue.review(job).unwrap().export_obstacle().is_some());
 
         // Ticked in the sidebar, which sends no request to any review.
         app.settings.export.scene_location = SceneLocation::NewFolder;
-        app.forget_export_obstacles_if_scenes_go_elsewhere(location_before);
+        app.forget_export_obstacles_if_scenes_go_elsewhere(options_before);
+        assert!(app.queue.review(job).unwrap().export_obstacle().is_none());
+    }
+
+    #[test]
+    fn a_change_of_how_scenes_are_named_takes_the_warning_off_every_review() {
+        let (mut app, job) = app_with_a_video_in_review();
+        let three_in_the_way = || -> Result<EarlierSceneFiles, String> {
+            Ok(EarlierSceneFiles {
+                scene_dir: PathBuf::from("videos"),
+                file_count: 3,
+            })
+        };
+        let review = app.queue.review_mut(job).unwrap();
+        review.apply(ReviewRequest::Split, &three_in_the_way);
+        assert!(review.export_obstacle().is_some());
+
+        // Typed into the box in the sidebar. The files that were counted
+        // had the old name, so the count no longer says anything.
+        let options_before = app.settings.export;
+        app.settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
+        app.forget_export_obstacles_if_scenes_go_elsewhere(options_before);
         assert!(app.queue.review(job).unwrap().export_obstacle().is_none());
     }
 

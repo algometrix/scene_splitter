@@ -9,6 +9,7 @@
 use std::fmt;
 use std::ops::RangeInclusive;
 
+use crate::fates::{NothingToWrite, SceneFate, ScenesToWrite};
 use crate::scenes::{self, CutTimes};
 use crate::timecode::TimeSpan;
 
@@ -142,6 +143,7 @@ impl SceneLayout {
 #[derive(Debug)]
 pub struct PlanSnapshot {
     cuts: Vec<ProposedCut>,
+    fates: Vec<SceneFate>,
 }
 
 #[derive(Debug)]
@@ -151,6 +153,10 @@ pub struct SplitPlan {
     /// In ascending order of time, with no duplicates, each strictly inside
     /// `whole_video`.
     cuts: Vec<ProposedCut>,
+    /// Whether each segment is written or dropped, one per segment. The
+    /// segments of one scene always share a fate, and at least one segment
+    /// is kept.
+    fates: Vec<SceneFate>,
 }
 
 impl SplitPlan {
@@ -168,6 +174,7 @@ impl SplitPlan {
         Self {
             whole_video: detected_cuts.whole_video(),
             keyframe_times,
+            fates: vec![SceneFate::Keep; detected_cuts.len() + 1],
             cuts,
         }
     }
@@ -228,6 +235,60 @@ impl SplitPlan {
                 self.cuts[cut_position].choice = CutChoice::Merge;
             }
         }
+        self.keep_scenes_with_a_kept_part();
+    }
+
+    /// What the split does with each of the current scenes, in scene order.
+    pub fn scene_fates(&self) -> Vec<SceneFate> {
+        self.scene_layouts()
+            .iter()
+            .map(|layout| self.fates[layout.first_segment.0])
+            .collect()
+    }
+
+    /// Marks one of the current scenes as written or dropped. Dropping the
+    /// last scene that is still written is refused, since a split has to
+    /// write something.
+    pub fn set_scene_fate(
+        &mut self,
+        scene: SceneIndex,
+        fate: SceneFate,
+    ) -> Result<(), NothingToWrite> {
+        let layouts = self.scene_layouts();
+        let Some(layout) = layouts.get(scene.position()) else {
+            return Ok(());
+        };
+        let segments = layout.first_segment.0..layout.first_segment.0 + layout.segments.len();
+        let kept_elsewhere = self
+            .fates
+            .iter()
+            .enumerate()
+            .any(|(segment, &fate)| fate == SceneFate::Keep && !segments.contains(&segment));
+        if fate == SceneFate::Drop && !kept_elsewhere {
+            return Err(NothingToWrite::EverySceneDropped);
+        }
+        self.fates[segments].fill(fate);
+        Ok(())
+    }
+
+    /// The cuts and the scenes to write, as a split takes them.
+    pub fn scenes_to_write(&self) -> ScenesToWrite {
+        // `set_scene_fate` refuses to drop the last kept scene, and no other
+        // edit drops anything.
+        ScenesToWrite::new(self.accepted_cuts(), self.scene_fates())
+            .expect("a plan has one fate per scene and keeps at least one scene")
+    }
+
+    /// A scene made by merging a dropped scene with a kept one is kept as a
+    /// whole. Merging must never be a way to lose footage unnoticed, and a
+    /// scene that is half dropped could not be shown or written.
+    fn keep_scenes_with_a_kept_part(&mut self) {
+        for layout in self.scene_layouts() {
+            let segments = layout.first_segment.0..layout.first_segment.0 + layout.segments.len();
+            if self.fates[segments.clone()].contains(&SceneFate::Keep) {
+                self.fates[segments].fill(SceneFate::Keep);
+            }
+        }
     }
 
     /// Takes one segment out of a merged scene and makes it a scene of its
@@ -246,36 +307,42 @@ impl SplitPlan {
     }
 
     /// Goes back to the scan's own suggestion: every detected cut splits
-    /// again, and the cuts the person added are gone.
+    /// again, the cuts the person added are gone, and no scene is dropped.
     pub fn reset_to_detected(&mut self) {
         self.cuts.retain(|cut| cut.source == CutSource::Detected);
         for cut in &mut self.cuts {
             cut.choice = CutChoice::Split;
         }
+        self.fates = vec![SceneFate::Keep; self.cuts.len() + 1];
     }
 
     /// The plan as it is now, to come back to with `restore`.
     pub fn snapshot(&self) -> PlanSnapshot {
         PlanSnapshot {
             cuts: self.cuts.clone(),
+            fates: self.fates.clone(),
         }
     }
 
     /// Puts the plan back to how it was when `snapshot` was taken of it.
     pub fn restore(&mut self, snapshot: PlanSnapshot) {
         self.cuts = snapshot.cuts;
+        self.fates = snapshot.fates;
     }
 
     /// Whether nothing has changed since `snapshot` was taken.
     pub fn is_at(&self, snapshot: &PlanSnapshot) -> bool {
-        self.cuts == snapshot.cuts
+        self.cuts == snapshot.cuts && self.fates == snapshot.fates
     }
 
     /// Whether the plan is still exactly what the scan suggested.
     pub fn is_as_detected(&self) -> bool {
-        self.cuts
-            .iter()
-            .all(|cut| cut.source == CutSource::Detected && cut.choice == CutChoice::Split)
+        let no_scene_dropped = !self.fates.contains(&SceneFate::Drop);
+        no_scene_dropped
+            && self
+                .cuts
+                .iter()
+                .all(|cut| cut.source == CutSource::Detected && cut.choice == CutChoice::Split)
     }
 
     /// Undoes every merge strictly inside `span`.
@@ -307,6 +374,7 @@ impl SplitPlan {
 
     pub fn set_choice(&mut self, cut: CutIndex, choice: CutChoice) {
         self.cuts[cut.0].choice = choice;
+        self.keep_scenes_with_a_kept_part();
     }
 
     /// Where a cut asked for at `requested_time` would land: on the nearest
@@ -347,6 +415,9 @@ impl SplitPlan {
                 choice: CutChoice::Split,
             },
         );
+        // The new cut divides segment `position` in two. Both halves are
+        // written or dropped as the whole was.
+        self.fates.insert(position, self.fates[position]);
         Ok(time)
     }
 }
@@ -831,9 +902,15 @@ mod tests {
 
         plan.add_cut_near(5.75).unwrap();
         check(&plan);
+        plan.set_scene_fate(SceneIndex::new(1), SceneFate::Drop)
+            .unwrap();
+        check(&plan);
         plan.merge_scenes(scenes(0, 2));
         check(&plan);
         plan.isolate_segment(SegmentIndex(1));
+        check(&plan);
+        plan.set_scene_fate(SceneIndex::new(2), SceneFate::Drop)
+            .unwrap();
         check(&plan);
         plan.merge_scenes(scenes(1, 3));
         check(&plan);
@@ -899,6 +976,155 @@ mod tests {
             .cuts
             .iter()
             .all(|cut| cut.source == CutSource::Detected));
+    }
+
+    fn fates(plan: &SplitPlan) -> Vec<SceneFate> {
+        plan.scene_fates()
+    }
+
+    const KEEP: SceneFate = SceneFate::Keep;
+    const DROP: SceneFate = SceneFate::Drop;
+
+    #[test]
+    fn every_scene_is_written_until_one_is_dropped() {
+        let mut plan = plan_with_cuts(&[4.0, 8.0]);
+        assert_eq!(fates(&plan), [KEEP, KEEP, KEEP]);
+
+        plan.set_scene_fate(SceneIndex::new(1), DROP).unwrap();
+        assert_eq!(fates(&plan), [KEEP, DROP, KEEP]);
+        assert_eq!(
+            plan.scenes_to_write().kept_scenes(),
+            vec![span(0.0, 4.0), span(8.0, 10.0)]
+        );
+        // The scenes themselves are as they were.
+        assert_eq!(plan.scenes().len(), 3);
+    }
+
+    #[test]
+    fn a_dropped_scene_can_be_kept_again() {
+        let mut plan = plan_with_cuts(&[4.0, 8.0]);
+        plan.set_scene_fate(SceneIndex::new(1), DROP).unwrap();
+        assert!(!plan.is_as_detected());
+
+        plan.set_scene_fate(SceneIndex::new(1), KEEP).unwrap();
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn dropping_the_last_scene_that_is_written_is_refused() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.set_scene_fate(SceneIndex::new(0), DROP).unwrap();
+
+        assert_eq!(
+            plan.set_scene_fate(SceneIndex::new(1), DROP),
+            Err(NothingToWrite::EverySceneDropped)
+        );
+        assert_eq!(fates(&plan), [DROP, KEEP]);
+    }
+
+    #[test]
+    fn the_only_scene_of_a_video_cannot_be_dropped() {
+        let mut plan = plan_with_cuts(&[]);
+        assert_eq!(
+            plan.set_scene_fate(SceneIndex::new(0), DROP),
+            Err(NothingToWrite::EverySceneDropped)
+        );
+    }
+
+    #[test]
+    fn a_fate_for_a_scene_that_does_not_exist_changes_nothing() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        let before = plan.snapshot();
+        plan.set_scene_fate(SceneIndex::new(7), DROP).unwrap();
+        assert!(plan.is_at(&before));
+    }
+
+    #[test]
+    fn merging_a_dropped_scene_with_a_kept_one_keeps_all_of_it() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.set_scene_fate(SceneIndex::new(1), DROP).unwrap();
+
+        plan.merge_scenes(scenes(0, 1));
+        assert_eq!(fates(&plan), [KEEP, KEEP, KEEP, KEEP]);
+        // Taken apart again, both parts are written.
+        plan.restore_splits_within(span(0.0, 4.0));
+        assert_eq!(fates(&plan), [KEEP, KEEP, KEEP, KEEP, KEEP]);
+    }
+
+    #[test]
+    fn merging_only_dropped_scenes_gives_one_dropped_scene() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.set_scene_fate(SceneIndex::new(1), DROP).unwrap();
+        plan.set_scene_fate(SceneIndex::new(2), DROP).unwrap();
+
+        plan.merge_scenes(scenes(1, 2));
+        assert_eq!(fates(&plan), [KEEP, DROP, KEEP, KEEP]);
+        assert_eq!(plan.scenes()[1], span(2.0, 6.0));
+    }
+
+    #[test]
+    fn merging_other_scenes_leaves_a_dropped_scene_dropped() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.set_scene_fate(SceneIndex::new(4), DROP).unwrap();
+
+        plan.merge_scenes(scenes(0, 2));
+        assert_eq!(fates(&plan), [KEEP, KEEP, DROP]);
+    }
+
+    #[test]
+    fn dropping_a_merged_scene_drops_every_part_of_it() {
+        let mut plan = plan_with_cuts(&[2.0, 4.0, 6.0, 8.0]);
+        plan.merge_scenes(scenes(1, 3));
+        plan.set_scene_fate(SceneIndex::new(1), DROP).unwrap();
+        assert_eq!(fates(&plan), [KEEP, DROP, KEEP]);
+
+        // Each part taken out of it is still dropped.
+        plan.isolate_segment(SegmentIndex(2));
+        assert_eq!(fates(&plan), [KEEP, DROP, DROP, DROP, KEEP]);
+    }
+
+    #[test]
+    fn a_split_added_inside_a_dropped_scene_leaves_both_halves_dropped() {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        plan.set_scene_fate(SceneIndex::new(1), DROP).unwrap();
+
+        plan.add_cut_near(5.75).unwrap();
+        assert_eq!(fates(&plan), [KEEP, DROP, DROP, KEEP]);
+    }
+
+    #[test]
+    fn a_reset_writes_every_scene_again() {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        plan.add_cut_near(5.75).unwrap();
+        plan.set_scene_fate(SceneIndex::new(3), DROP).unwrap();
+
+        plan.reset_to_detected();
+        assert_eq!(fates(&plan), [KEEP, KEEP, KEEP]);
+        assert!(plan.is_as_detected());
+    }
+
+    #[test]
+    fn a_snapshot_remembers_which_scenes_were_dropped() {
+        let mut plan = plan_with_cuts(&[2.0, 8.0]);
+        let nothing_dropped = plan.snapshot();
+        plan.set_scene_fate(SceneIndex::new(0), DROP).unwrap();
+        assert!(!plan.is_at(&nothing_dropped));
+        let first_dropped = plan.snapshot();
+
+        plan.restore(nothing_dropped);
+        assert_eq!(fates(&plan), [KEEP, KEEP, KEEP]);
+        plan.restore(first_dropped);
+        assert_eq!(fates(&plan), [DROP, KEEP, KEEP]);
+    }
+
+    #[test]
+    fn there_is_always_one_fate_per_scene_and_one_scene_to_write() {
+        check_after_every_edit(|plan| {
+            assert_eq!(plan.fates.len(), plan.segments().len());
+            let scenes_to_write = plan.scenes_to_write();
+            assert_eq!(scenes_to_write.fates().len(), plan.scenes().len());
+            assert!(!scenes_to_write.kept_scenes().is_empty());
+        });
     }
 
     #[test]

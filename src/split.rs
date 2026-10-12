@@ -8,8 +8,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::fnv1a_64;
+use crate::fates::{SceneFate, ScenesToWrite};
 use crate::ffmpeg::{Program, TimeLimit, COPY_SCENE_STREAMS};
+use crate::scene_name::{SceneNamePattern, SceneNaming};
 use crate::scenes::CutTimes;
+use crate::timecode::TimeSpan;
 use crate::tools;
 
 /// The segment muxer starts a new file at the first keyframe at or after each
@@ -27,7 +30,8 @@ const COPY_STALL_LIMIT: TimeLimit = TimeLimit::Silence(Duration::from_secs(120))
 
 const FIRST_SCENE_NUMBER: usize = 1;
 const SCENE_NUMBER_DIGITS: usize = 3;
-/// Scene files are named "<video name>_scene_001.<extension>".
+/// Unless the person chose another name in Settings, scene files are named
+/// "<video name>_scene_001.<extension>".
 const SCENE_NAME_MARKER: &str = "_scene_";
 const NEW_FOLDER_SUFFIX: &str = "_scenes";
 /// Scenes are written into "unfinished_<number of the video's name>" inside
@@ -67,21 +71,34 @@ pub fn scene_dir(video: &Path, location: SceneLocation) -> Result<PathBuf> {
     }
 }
 
-/// The files a split into `scene_count` scenes writes, in scene order.
-pub fn scene_file_paths(video: &Path, out_dir: &Path, scene_count: usize) -> Result<Vec<PathBuf>> {
-    let name = SceneFileName::of(video)?;
-    Ok((FIRST_SCENE_NUMBER..FIRST_SCENE_NUMBER + scene_count)
-        .map(|number| out_dir.join(name.numbered(number)))
+/// The files a split writes for `scenes`, in scene order. `scenes` are the
+/// scenes that are written, so the files are numbered without gaps.
+pub fn scene_file_paths(
+    video: &Path,
+    out_dir: &Path,
+    pattern: SceneNamePattern,
+    scenes: &[TimeSpan],
+) -> Result<Vec<PathBuf>> {
+    let file_names = SceneNaming::of(video, pattern)?.file_names(scenes)?;
+    Ok(file_names
+        .into_iter()
+        .map(|file_name| out_dir.join(file_name))
         .collect())
 }
 
 /// Every scene file of this video already in `out_dir`, whatever its number.
+/// A scene file is one named the way `pattern` names the scenes of this
+/// video, so the same naming decides what a split writes and what it finds.
 ///
 /// A new split replaces all of them, including numbers it does not use
 /// itself, so callers ask the person before going ahead when this is not
 /// empty.
-pub fn scene_files_from_earlier_splits(video: &Path, out_dir: &Path) -> Result<Vec<PathBuf>> {
-    let name = SceneFileName::of(video)?;
+pub fn scene_files_from_earlier_splits(
+    video: &Path,
+    out_dir: &Path,
+    pattern: SceneNamePattern,
+) -> Result<Vec<PathBuf>> {
+    let name = SceneNaming::of(video, pattern)?;
     if !out_dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -103,6 +120,10 @@ pub fn scene_files_from_earlier_splits(video: &Path, out_dir: &Path) -> Result<V
 /// Whether a file is a scene written by an earlier split. Scenes sit next to
 /// the videos they came from, and a scene should not be split a second time
 /// just because its folder was added again.
+///
+/// This knows the default naming only. Which video a file with another name
+/// came from cannot be told from the name alone, and guessing would hide
+/// videos the person wants to add.
 pub fn is_scene_file(path: &Path) -> bool {
     let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
@@ -115,18 +136,70 @@ pub fn is_scene_file(path: &Path) -> bool {
         && number.chars().all(|digit| digit.is_ascii_digit())
 }
 
-/// Splits `input` at the given keyframe times and returns the scene files in
-/// order. Scene files of this video from an earlier split are replaced, and
-/// those with numbers the new split does not use are removed.
+/// What a split made of one scene.
+#[derive(Debug, PartialEq)]
+pub enum SceneOutcome<Record> {
+    /// The scene is in this file.
+    Written(PathBuf),
+    /// The scene was dropped and is in no file. This is what the caller
+    /// noted about it while it still existed.
+    Dropped(Record),
+}
+
+/// Splits `input` at the given keyframe times into one file per scene, with
+/// the default names, and returns the scene files in order.
+#[cfg(test)]
+pub fn split_at_keyframes(input: &Path, cuts: &CutTimes, out_dir: &Path) -> Result<Vec<PathBuf>> {
+    let every_scene = ScenesToWrite::every_scene(cuts.clone());
+    let nothing_is_dropped = |_dropped: &Path| Ok(());
+    let outcomes = split_scenes(
+        input,
+        &every_scene,
+        out_dir,
+        SceneNamePattern::default(),
+        nothing_is_dropped,
+    )?;
+    Ok(written_files(&outcomes))
+}
+
+/// The scene files among `outcomes`, in scene order.
+pub fn written_files<Record>(outcomes: &[SceneOutcome<Record>]) -> Vec<PathBuf> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            SceneOutcome::Written(scene_file) => Some(scene_file.clone()),
+            SceneOutcome::Dropped(_) => None,
+        })
+        .collect()
+}
+
+/// Splits `input` at the cuts of `scenes` and says, for every scene in
+/// order, which file it is in or that it was dropped. Scene files of this
+/// video from an earlier split are replaced, and those with names the new
+/// split does not use are removed.
 ///
 /// The scenes are written into a folder of their own first and only moved
 /// to their real names once all of them are there. A split that fails or is
 /// stopped half way therefore leaves nothing that looks like a finished
 /// scene, and leaves the scene files of an earlier split as they were.
-pub fn split_at_keyframes(input: &Path, cuts: &CutTimes, out_dir: &Path) -> Result<Vec<PathBuf>> {
+///
+/// Dropped scenes are written into that folder too, since ffmpeg cuts the
+/// whole video in one pass, and are removed with it. Before that,
+/// `record_dropped_scene` is shown each of them, so the caller can keep
+/// what it needs to prove later that the kept scenes are the right parts
+/// of the video. A split with dropped scenes so needs as much free room
+/// while it runs as one without.
+pub fn split_scenes<Record>(
+    input: &Path,
+    scenes: &ScenesToWrite,
+    out_dir: &Path,
+    pattern: SceneNamePattern,
+    record_dropped_scene: impl Fn(&Path) -> Result<Record>,
+) -> Result<Vec<SceneOutcome<Record>>> {
     let name = SceneFileName::of(input)?;
-    let earlier_scene_files = scene_files_from_earlier_splits(input, out_dir)?;
-    let scene_files = scene_file_paths(input, out_dir, cuts.len() + 1)?;
+    let earlier_scene_files = scene_files_from_earlier_splits(input, out_dir, pattern)?;
+    let scene_files = scene_file_paths(input, out_dir, pattern, &scenes.kept_scenes())?;
+    refuse_to_write_over_the_video(input, &scene_files)?;
 
     let unfinished_dir = out_dir.join(name.unfinished_folder());
     // What a run that was killed left there is of no use to anyone.
@@ -134,15 +207,69 @@ pub fn split_at_keyframes(input: &Path, cuts: &CutTimes, out_dir: &Path) -> Resu
     std::fs::create_dir_all(&unfinished_dir)
         .with_context(|| format!("could not create {}", unfinished_dir.display()))?;
 
-    let written = write_scenes(input, cuts, &unfinished_dir, &name)
-        .and_then(|unfinished_files| move_into_place(&unfinished_files, &scene_files));
+    let settled =
+        write_scenes(input, scenes.cuts(), &unfinished_dir, &name).and_then(|unfinished_files| {
+            settle_scenes(
+                &unfinished_files,
+                scenes.fates(),
+                &scene_files,
+                &record_dropped_scene,
+            )
+        });
     let tidied = remove_unfinished_scenes(&unfinished_dir);
     // Why the split failed matters more than a folder that stayed behind.
-    written?;
+    let outcomes = settled?;
     tidied?;
 
     remove_leftover_scenes(&earlier_scene_files, &scene_files)?;
-    Ok(scene_files)
+    Ok(outcomes)
+}
+
+/// No pattern can name a scene like its video today, since every scene name
+/// holds the video's name and a number besides. Should that ever change,
+/// the split stops here instead of replacing the original with a scene.
+fn refuse_to_write_over_the_video(input: &Path, scene_files: &[PathBuf]) -> Result<()> {
+    let same_name_as_the_video = scene_files
+        .iter()
+        .find(|scene_file| scene_file.file_name() == input.file_name());
+    if let Some(scene_file) = same_name_as_the_video {
+        bail!(
+            "the scene file {} would have the name of the video itself",
+            scene_file.display()
+        );
+    }
+    Ok(())
+}
+
+/// Shows every dropped scene to `record_dropped_scene`, then gives every
+/// kept scene its real name. The dropped ones come first: looking at them
+/// changes nothing, so a failure there leaves an earlier split untouched.
+fn settle_scenes<Record>(
+    unfinished_files: &[PathBuf],
+    fates: &[SceneFate],
+    scene_files: &[PathBuf],
+    record_dropped_scene: &impl Fn(&Path) -> Result<Record>,
+) -> Result<Vec<SceneOutcome<Record>>> {
+    let mut records = Vec::new();
+    let mut kept_unfinished_files = Vec::new();
+    for (unfinished, fate) in unfinished_files.iter().zip(fates) {
+        match fate {
+            SceneFate::Keep => kept_unfinished_files.push(unfinished.clone()),
+            SceneFate::Drop => records.push(record_dropped_scene(unfinished)?),
+        }
+    }
+    move_into_place(&kept_unfinished_files, scene_files)?;
+
+    let mut scene_files = scene_files.iter();
+    let mut records = records.into_iter();
+    fates
+        .iter()
+        .map(|fate| match fate {
+            SceneFate::Keep => scene_files.next().cloned().map(SceneOutcome::Written),
+            SceneFate::Drop => records.next().map(SceneOutcome::Dropped),
+        })
+        .collect::<Option<Vec<_>>>()
+        .context("there are not as many scene files as scenes to write")
 }
 
 /// Has ffmpeg write every scene into `unfinished_dir` and returns those
@@ -233,7 +360,8 @@ fn remove_leftover_scenes(
     Ok(())
 }
 
-/// The naming of one video's scene files.
+/// The naming of one video's scene files while they are being written. What
+/// they are called once they are finished is `SceneNaming`'s to say.
 struct SceneFileName {
     stem: String,
     extension: String,
@@ -253,31 +381,6 @@ impl SceneFileName {
             stem: stem.to_owned(),
             extension: extension.to_owned(),
         })
-    }
-
-    /// Whether `path` is named "<this video>_scene_<digits>.<extension>".
-    fn is_scene_of_this_video(&self, path: &Path) -> bool {
-        let same_extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case(&self.extension));
-        let scene_number = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|stem| stem.strip_prefix(&self.stem))
-            .and_then(|rest| rest.strip_prefix(SCENE_NAME_MARKER));
-        same_extension
-            && scene_number.is_some_and(|number| {
-                number.len() == SCENE_NUMBER_DIGITS
-                    && number.chars().all(|digit| digit.is_ascii_digit())
-            })
-    }
-
-    fn numbered(&self, number: usize) -> String {
-        format!(
-            "{}{SCENE_NAME_MARKER}{number:0SCENE_NUMBER_DIGITS$}.{}",
-            self.stem, self.extension
-        )
     }
 
     /// The folder the scenes of this video are written into until all of
@@ -344,9 +447,29 @@ mod tests {
         );
     }
 
+    fn pattern(typed: &str) -> SceneNamePattern {
+        SceneNamePattern::new(typed).unwrap()
+    }
+
+    /// Scenes of ten seconds each, one after another.
+    fn scenes(count: usize) -> Vec<TimeSpan> {
+        (0..count)
+            .map(|scene| TimeSpan {
+                start: scene as f64 * 10.0,
+                end: (scene + 1) as f64 * 10.0,
+            })
+            .collect()
+    }
+
     #[test]
     fn scene_files_are_numbered_from_one() {
-        let files = scene_file_paths(Path::new("videos/holiday.mp4"), Path::new("out"), 2).unwrap();
+        let files = scene_file_paths(
+            Path::new("videos/holiday.mp4"),
+            Path::new("out"),
+            SceneNamePattern::default(),
+            &scenes(2),
+        )
+        .unwrap();
         assert_eq!(
             files,
             vec![
@@ -357,9 +480,43 @@ mod tests {
     }
 
     #[test]
-    fn scene_files_keep_a_percent_sign_of_the_video_name() {
-        let name = SceneFileName::of(Path::new("100% fun.mkv")).unwrap();
-        assert_eq!(name.numbered(7), "100% fun_scene_007.mkv");
+    fn scene_files_take_the_name_the_person_chose() {
+        let files = scene_file_paths(
+            Path::new("videos/holiday.mp4"),
+            Path::new("out"),
+            pattern("{number} of {count} - {name}"),
+            &scenes(2),
+        )
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![
+                Path::new("out").join("001 of 2 - holiday.mp4"),
+                Path::new("out").join("002 of 2 - holiday.mp4"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_scene_names_are_those_the_folder_scan_recognises() {
+        let files = scene_file_paths(
+            Path::new("holiday.mp4"),
+            Path::new("out"),
+            SceneNamePattern::default(),
+            &scenes(3),
+        )
+        .unwrap();
+        assert!(files.iter().all(|file| is_scene_file(file)));
+    }
+
+    #[test]
+    fn a_scene_file_named_like_its_video_is_refused() {
+        let video = Path::new("videos/holiday.mp4");
+        let error =
+            refuse_to_write_over_the_video(video, &[PathBuf::from("out/holiday.mp4")]).unwrap_err();
+        assert!(error.to_string().contains("name of the video itself"));
+        refuse_to_write_over_the_video(video, &[PathBuf::from("out/holiday_scene_001.mp4")])
+            .unwrap();
     }
 
     #[test]
@@ -412,7 +569,8 @@ mod tests {
         let name = SceneFileName::of(video).unwrap();
         let out_dir = Path::new("out");
 
-        let finished = &scene_file_paths(video, out_dir, 1).unwrap()[0];
+        let finished =
+            &scene_file_paths(video, out_dir, SceneNamePattern::default(), &scenes(1)).unwrap()[0];
         let unfinished = &name.unfinished_files_in(&out_dir.join(name.unfinished_folder()), 1)[0];
         assert!(unfinished.as_os_str().len() < finished.as_os_str().len());
     }
@@ -433,9 +591,12 @@ mod tests {
 
     #[test]
     fn no_earlier_scenes_in_a_folder_that_does_not_exist() {
-        let earlier =
-            scene_files_from_earlier_splits(Path::new("holiday.mp4"), Path::new("no/such/folder"))
-                .unwrap();
+        let earlier = scene_files_from_earlier_splits(
+            Path::new("holiday.mp4"),
+            Path::new("no/such/folder"),
+            SceneNamePattern::default(),
+        )
+        .unwrap();
         assert!(earlier.is_empty());
     }
 
@@ -496,8 +657,12 @@ mod tests {
                 "holiday_scene_notes.mp4",
             ],
         );
-        let earlier =
-            scene_files_from_earlier_splits(&folder.0.join("holiday.mp4"), &folder.0).unwrap();
+        let earlier = scene_files_from_earlier_splits(
+            &folder.0.join("holiday.mp4"),
+            &folder.0,
+            SceneNamePattern::default(),
+        )
+        .unwrap();
         assert_eq!(
             earlier,
             vec![
@@ -505,6 +670,85 @@ mod tests {
                 folder.0.join("holiday_scene_007.mp4"),
             ]
         );
+    }
+
+    #[test]
+    fn earlier_scenes_are_looked_for_under_the_name_the_person_chose() {
+        let folder = Folder::with_files(
+            "earlier_named",
+            &[
+                "holiday.mp4",
+                "holiday_scene_001.mp4",
+                "holiday part 001.mp4",
+                "holiday part 012.mp4",
+                "holiday2 part 001.mp4",
+            ],
+        );
+        let earlier = scene_files_from_earlier_splits(
+            &folder.0.join("holiday.mp4"),
+            &folder.0,
+            pattern("{name} part {number}"),
+        )
+        .unwrap();
+        assert_eq!(
+            earlier,
+            vec![
+                folder.0.join("holiday part 001.mp4"),
+                folder.0.join("holiday part 012.mp4"),
+            ]
+        );
+    }
+
+    #[test]
+    fn kept_scenes_get_numbers_without_gaps_and_dropped_ones_are_recorded() {
+        let folder = Folder::with_files("settle", &[]);
+        let unfinished = [
+            folder.write("unfinished_0/001.mp4", "advert"),
+            folder.write("unfinished_0/002.mp4", "first part"),
+            folder.write("unfinished_0/003.mp4", "credits"),
+            folder.write("unfinished_0/004.mp4", "second part"),
+        ];
+        let fates = [
+            SceneFate::Drop,
+            SceneFate::Keep,
+            SceneFate::Drop,
+            SceneFate::Keep,
+        ];
+        let scene_files = [
+            folder.0.join("holiday_scene_001.mp4"),
+            folder.0.join("holiday_scene_002.mp4"),
+        ];
+        let read_it = |dropped: &Path| -> Result<String> { Ok(std::fs::read_to_string(dropped)?) };
+
+        let outcomes = settle_scenes(&unfinished, &fates, &scene_files, &read_it).unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                SceneOutcome::Dropped("advert".to_owned()),
+                SceneOutcome::Written(scene_files[0].clone()),
+                SceneOutcome::Dropped("credits".to_owned()),
+                SceneOutcome::Written(scene_files[1].clone()),
+            ]
+        );
+        assert_eq!(written_files(&outcomes), scene_files);
+        assert_eq!(folder.read("holiday_scene_001.mp4"), "first part");
+        assert_eq!(folder.read("holiday_scene_002.mp4"), "second part");
+    }
+
+    #[test]
+    fn a_dropped_scene_that_cannot_be_recorded_stops_the_split_before_anything_moves() {
+        let folder = Folder::with_files("settle_fails", &[]);
+        let earlier = folder.write("holiday_scene_001.mp4", "earlier split");
+        let unfinished = [
+            folder.write("unfinished_0/001.mp4", "first part"),
+            folder.write("unfinished_0/002.mp4", "credits"),
+        ];
+        let fates = [SceneFate::Keep, SceneFate::Drop];
+        let cannot_read = |_dropped: &Path| -> Result<()> { bail!("unreadable") };
+
+        let error = settle_scenes(&unfinished, &fates, &[earlier], &cannot_read).unwrap_err();
+        assert_eq!(error.to_string(), "unreadable");
+        assert_eq!(folder.read("holiday_scene_001.mp4"), "earlier split");
     }
 
     #[test]
@@ -518,8 +762,12 @@ mod tests {
                 "holiday_scene_003.mp4",
             ],
         );
-        let earlier =
-            scene_files_from_earlier_splits(&folder.0.join("holiday.mp4"), &folder.0).unwrap();
+        let earlier = scene_files_from_earlier_splits(
+            &folder.0.join("holiday.mp4"),
+            &folder.0,
+            SceneNamePattern::default(),
+        )
+        .unwrap();
         let new_scenes = [
             folder.0.join("holiday_scene_001.mp4"),
             folder.0.join("holiday_scene_002.mp4"),
