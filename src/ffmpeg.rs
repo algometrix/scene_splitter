@@ -347,9 +347,8 @@ impl ToolCommand {
 
             let pumped = pump(&mut stdout, clock, &mut on_output);
             if pumped.is_err() {
-                // Nothing more can be learned from this run. Stopping a
-                // program that already exited fails, which is fine.
-                let _ = lock(child).kill();
+                // Nothing more can be learned from this run.
+                stop_with_its_children(&mut lock(child));
             }
             let status = wait_for_exit(child);
             drop(run_ended);
@@ -460,6 +459,30 @@ fn pump(
     }
 }
 
+/// Stops a program and whatever it started. Stopping one that has already
+/// exited fails, which is fine.
+///
+/// On Windows the program found on the PATH is often a small launcher that
+/// starts the real ffmpeg (Chocolatey and Scoop install it that way).
+/// Stopping only the launcher leaves the real one running with the pipes
+/// open, so the run would not end until ffmpeg did.
+fn stop_with_its_children(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        let mut stop_tree = Command::new("taskkill");
+        stop_tree
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_console_window(&mut stop_tree);
+        // If taskkill is missing or fails, the program itself is still
+        // stopped below.
+        let _ = stop_tree.status();
+    }
+    let _ = child.kill();
+}
+
 /// Waits until the run ends or its time limit passes, and stops the program
 /// in the second case. Returns whether it had to.
 fn stop_when_overdue(
@@ -478,8 +501,8 @@ fn stop_when_overdue(
                 return false;
             }
             // Stopping it closes its pipes, which ends the reading on the
-            // other threads. This fails only when it has already exited.
-            let _ = child.kill();
+            // other threads.
+            stop_with_its_children(&mut child);
             return true;
         }
         match run_ended.recv_timeout(remaining) {
