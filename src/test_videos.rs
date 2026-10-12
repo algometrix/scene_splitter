@@ -23,6 +23,40 @@ const NOISE: &str = "noise=alls=20:allf=t";
 /// minutes allows for a machine busy running every other test at once.
 const ENCODING_LIMIT: TimeLimit = TimeLimit::WholeRun(Duration::from_secs(120));
 
+/// A keyframe on every whole second and nowhere else, and every picture
+/// stored in the order it is shown. The 25 is `FRAME_RATE`, which a list of
+/// fixed texts cannot spell out.
+const PLAIN_PICTURE_ENCODING: [&str; 6] =
+    ["-preset", "ultrafast", "-g", "25", "-sc_threshold", "0"];
+pub const REORDERED_VIDEO_SECONDS: f64 = 9.0;
+/// How many pictures lie between two keyframes of the reordered video.
+pub const REORDERED_KEYFRAME_EVERY: usize = 50;
+/// A keyframe every two seconds, with up to two pictures in a row that are
+/// stored after the picture that follows them.
+const REORDERED_PICTURE_ENCODING: [&str; 8] = [
+    "-preset",
+    "veryfast",
+    "-bf",
+    "2",
+    "-g",
+    "50",
+    "-sc_threshold",
+    "0",
+];
+
+const OPEN_GROUP_PICTURE_ENCODING: [&str; 10] = [
+    "-preset",
+    "veryfast",
+    "-bf",
+    "2",
+    "-g",
+    "50",
+    "-sc_threshold",
+    "0",
+    "-x264-params",
+    "open-gop=1",
+];
+
 /// A generated video in a folder of its own, removed when the test ends.
 pub struct TestVideo {
     folder: PathBuf,
@@ -69,6 +103,32 @@ impl TestVideo {
         )
     }
 
+    /// Nine seconds of one pattern with a keyframe every two seconds, and
+    /// with pictures stored in another order than they are shown, as most
+    /// real videos store them.
+    pub fn with_reordered_pictures(test_name: &str) -> Self {
+        let pictures = format!("[0:v]{NOISE},format=yuv420p[picture]");
+        Self::generate_encoded(
+            test_name,
+            &[pattern("testsrc", REORDERED_VIDEO_SECONDS)],
+            &pictures,
+            &REORDERED_PICTURE_ENCODING,
+        )
+    }
+
+    /// Like `with_reordered_pictures`, but only the first keyframe is a
+    /// clean start. The others are pictures that pictures after them reach
+    /// back across, as in videos made for discs and broadcast.
+    pub fn with_open_picture_groups(test_name: &str) -> Self {
+        let pictures = format!("[0:v]{NOISE},format=yuv420p[picture]");
+        Self::generate_encoded(
+            test_name,
+            &[pattern("testsrc", REORDERED_VIDEO_SECONDS)],
+            &pictures,
+            &OPEN_GROUP_PICTURE_ENCODING,
+        )
+    }
+
     pub fn folder(&self) -> &Path {
         &self.folder
     }
@@ -77,6 +137,15 @@ impl TestVideo {
     /// tone for sound. Panics on failure, since a test cannot go on without
     /// its video.
     fn generate(test_name: &str, patterns: &[String], picture_graph: &str) -> Self {
+        Self::generate_encoded(test_name, patterns, picture_graph, &PLAIN_PICTURE_ENCODING)
+    }
+
+    fn generate_encoded(
+        test_name: &str,
+        patterns: &[String],
+        picture_graph: &str,
+        picture_encoding: &[&str],
+    ) -> Self {
         let folder = std::env::temp_dir().join(format!(
             "scene_splitter_video_test_{}_{test_name}",
             std::process::id()
@@ -94,9 +163,8 @@ impl TestVideo {
             .args(["-f", "lavfi", "-i", "sine=frequency=440"])
             .args(["-filter_complex", picture_graph])
             .args(["-map", "[picture]", "-map", &format!("{sound_input}:a")])
-            // A keyframe on every whole second and nowhere else.
-            .args(["-c:v", "libx264", "-preset", "ultrafast"])
-            .args(["-g", &FRAME_RATE.to_string(), "-sc_threshold", "0"])
+            .args(["-c:v", "libx264"])
+            .args(picture_encoding)
             .args(["-c:a", "aac", "-shortest"])
             .arg(&path)
             .run(ENCODING_LIMIT);

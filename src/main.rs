@@ -10,6 +10,11 @@ mod cache;
 mod detect;
 #[cfg(test)]
 mod e2e_tests;
+mod exact_cut;
+#[cfg(test)]
+mod exact_e2e_tests;
+mod exact_split;
+mod exact_verify;
 mod export;
 mod ffmpeg;
 mod folders;
@@ -45,6 +50,8 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use detect::{ScanDepth, ScanKind, ScanMode};
+use exact_cut::CutPrecision;
+use exact_split::ExactCutError;
 use export::OriginalPolicy;
 use scenes::CutTimes;
 use settings::Settings;
@@ -94,6 +101,12 @@ struct Arguments {
     /// packet of it, unchanged.
     #[arg(long, requires = "video", conflicts_with = "list_only")]
     keep_original: bool,
+
+    /// Cut on the exact picture where each scene changes, and not on the
+    /// nearest keyframe. A few seconds around each cut are encoded again,
+    /// so this is slower. The original video is always kept.
+    #[arg(long, requires = "video", conflicts_with_all = ["scan_only", "review"])]
+    exact_cuts: bool,
 
     /// Also look for hard cuts: scene changes with no black screen. This
     /// decodes every frame, so it takes far longer than the normal scan.
@@ -186,11 +199,13 @@ fn refuse_overrides_for_the_window(arguments: &Arguments) -> Result<()> {
         || arguments.min_black.is_some()
         || arguments.max_luma.is_some()
         || arguments.black_fraction.is_some()
-        || arguments.keep_original;
+        || arguments.keep_original
+        || arguments.exact_cuts;
     if overrides_given {
         bail!(
-            "--scan, --min-black, --max-luma, --black-fraction and --keep-original apply to a \
-             command line run. For the window, change them in its Settings section."
+            "--scan, --min-black, --max-luma, --black-fraction, --keep-original and \
+             --exact-cuts apply to a command line run. For the window, change them in its \
+             Settings section."
         );
     }
     Ok(())
@@ -212,6 +227,9 @@ fn settings_for_this_run(mut settings: Settings, arguments: &Arguments) -> Resul
     }
     if arguments.keep_original {
         settings.export.original_policy = OriginalPolicy::Keep;
+    }
+    if arguments.exact_cuts {
+        settings.export.cut_precision = CutPrecision::ExactFrame;
     }
     settings
         .validate()
@@ -274,13 +292,18 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         eprintln!("Warning: in {}, {stretch}", video.display());
     }
     let detection = scan.detection;
+    let method = settings.export.split_method();
+    let cut_times = match settings.export.cut_precision {
+        CutPrecision::NearestKeyframe => detection.cuts_for(scan_kind(arguments, settings)),
+        // Nobody reviews a split from the command line, so the cuts go
+        // where the scan saw the scene change.
+        CutPrecision::ExactFrame => {
+            exact_cut::exact_cut_times(&detection, scan_kind(arguments, settings))
+        }
+    };
     // Checked once, here, so that neither the listing nor the split can be
     // handed a cut that is not inside the video.
-    let cuts = CutTimes::inside(
-        detection.video,
-        detection.cuts_for(scan_kind(arguments, settings)),
-    )
-    .map_err(|outside| {
+    let cuts = CutTimes::inside(detection.video, cut_times).map_err(|outside| {
         anyhow::anyhow!("the scan of {} made no sense: {outside}", video.display())
     })?;
 
@@ -293,7 +316,7 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         println!(
             "Sudden picture changes: {}, of which {} became cuts.",
             candidates.len(),
-            cuts.len() - detection.cuts.len()
+            cuts.len().saturating_sub(detection.cuts.len())
         );
     }
     print_scenes(&cuts.scenes());
@@ -319,8 +342,15 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     }
 
     let started = Instant::now();
-    let report = export::export_scenes(video, &cuts, &out_dir, settings.export.original_policy)?;
+    if method == export::SplitMethod::ExactFrames {
+        println!("{EXACT_CUT_NOTICE}");
+    }
+    let report = export::export_scenes_as(video, &cuts, &out_dir, method)
+        .map_err(with_the_way_back_to_a_normal_cut)?;
     println!("{}", report.summary());
+    if let Some(measurements) = report.exact_cut_measurements() {
+        println!("{measurements}");
+    }
     println!(
         "Writing and verifying took {:.2}s.",
         started.elapsed().as_secs_f64()
@@ -331,6 +361,23 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         bail!("the scenes were written, but see the note above before relying on them");
     }
     Ok(())
+}
+
+/// Said before an exact split starts, since it takes longer than a copy and
+/// does not do what the saved setting for originals may say.
+const EXACT_CUT_NOTICE: &str =
+    "Cutting on the exact pictures. A few seconds around each cut are encoded again, \
+     and the original is kept.";
+
+/// A failed exact cut is told with what the person can do instead.
+fn with_the_way_back_to_a_normal_cut(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<ExactCutError>().is_none() {
+        return error;
+    }
+    error.context(
+        "the exact cut did not work. The original was not changed. \
+         Run again without --exact-cuts to cut at the nearest keyframes instead",
+    )
 }
 
 fn print_black_screens(black_screens: &[TimeSpan]) {

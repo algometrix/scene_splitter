@@ -6,7 +6,7 @@
 ![ffmpeg](https://img.shields.io/badge/ffmpeg-downloaded%20on%20first%20run-1FA97C)
 ![No re-encoding](https://img.shields.io/badge/splits-without%20re--encoding-2E90D9)
 
-Scene Splitter cuts a long video into its scenes. It finds the stretches of black screen between scenes, shows the proposed scenes in a review screen, and writes one file per scene. It copies the compressed streams and re-encodes nothing, so a split takes seconds and loses no quality.
+Scene Splitter cuts a long video into its scenes. It finds the stretches of black screen between scenes, shows the proposed scenes in a review screen, and writes one file per scene. It copies the compressed streams and re-encodes nothing, so a split takes seconds and loses no quality. If you want a cut on one exact picture, an optional setting re-encodes only the few seconds around each cut (see [Exact cuts](#exact-cuts)).
 
 It is a desktop app and a command line tool in one program, written in Rust with egui/eframe. It runs `ffmpeg` and `ffprobe` for all video work, and downloads them itself the first time it needs them.
 
@@ -51,6 +51,7 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 - **Hard cuts.** An optional slower scan finds scene changes that have no black screen.
 - **Review before writing.** Merge scenes by dragging, add a split by time, move a part back out of a merged scene, undo, or reset.
 - **Built-in player.** Click a preview picture to play from there, step frame by frame with the mouse wheel, and split the scene at the current position.
+- **Exact cuts, if you want them.** Off by default. With "Cut on the exact picture" on, a split lands on the very picture you chose. Only the pictures between the cut and the nearest keyframes are encoded again, and the original is always kept.
 - **Verified before the original is removed.** After a split, the app checks every packet of the scene files against the original. Only then does it move the original to the Recycle Bin or Trash.
 - **Scan ahead.** Scan a whole folder from the command line, and review the results in the window later.
 - **No ffmpeg setup.** The app fetches ffmpeg on first run and checks it against a built-in checksum.
@@ -93,10 +94,10 @@ You can also run it through Cargo: `cargo run --release -- <arguments>`.
    - Click, Ctrl-click or Shift-click cards to select several, then press M or "Merge selected". A selection with gaps merges the scenes between as well.
    - "Undo merge" takes the selected merged scenes apart again. Inside a merged scene, "Separate here" restores a single split, and "Move out to its own scene" takes one part out of it.
    - A merged scene with more than 6 parts shows its first two and last two. "Show all N parts" shows the rest, and "Show fewer parts" hides them again. The app remembers this for each scene while the review is open.
-   - "Add a split at" takes a time such as `1:03:12`. The split lands on the nearest point where the video can be cut (a keyframe).
+   - "Add a split at" takes a time such as `1:03:12`. The split lands on the nearest point where the video can be cut (a keyframe). With [exact cuts](#exact-cuts) on, it stays at the time you typed.
    - Undo takes back the last change. "Reset scenes" returns to the scenes as found.
 5. If the video has scene changes with no black screen, press "Scenes missed?" under the toolbar. Choose how much to detect (only obvious changes, most changes, or even subtle changes) and the shortest scene to allow, then press "Look for sudden picture changes". This scan looks at every picture and is much slower.
-6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
+6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again. With [exact cuts](#exact-cuts) on, the choice about the original gives way to a note that the cuts are exact, that a few seconds around each cut are encoded again, and that the original is always kept.
 7. When the split is done, the app shows whether the check passed and what happened to the original. "Open folder" shows the scene files.
 
 When something goes wrong, the app says so in plain words and shows the technical reason under it. You can select that text, and "Copy details" puts all of it on the clipboard.
@@ -141,7 +142,7 @@ Click a preview picture to play the video from that moment. A line on the timeli
 | Mute box | Sound off or on |
 | Esc | Close the player, or cancel the question about sound |
 
-A split made in the player lands on the nearest point where the video can be cut (a keyframe). Once you pause, the player says how far that point is from the picture you are on. Skipping or dragging the slider while paused stays paused. The player sizes itself to fit the window.
+A split made in the player lands on the nearest point where the video can be cut (a keyframe). Once you pause, the player says how far that point is from the picture you are on. With [exact cuts](#exact-cuts) on, the split is made on the picture you are on, and the player says so. Skipping or dragging the slider while paused stays paused. The player sizes itself to fit the window.
 
 ## Command line
 
@@ -161,6 +162,7 @@ Splitting from the command line always scans the video afresh. Only the window a
 | `--out-dir <folder>` | Where to write the scene files. The default is the saved setting: the video's own folder, unless you changed it. |
 | `--overwrite` | Replace scene files left in the output folder by an earlier run. Without it, the split stops if such files exist. |
 | `--keep-original` | Keep the original video, whatever the saved setting says. |
+| `--exact-cuts` | Cut on the exact picture where each scene changes: the middle of a black screen, or the first picture after a hard cut. A few seconds around each cut are encoded again, so the split takes longer. The original is always kept. See [Exact cuts](#exact-cuts). |
 | `--hard-cuts` | Also look for hard cuts (scene changes with no black screen). This decodes every frame and is much slower. It uses the saved sensitivity and shortest scene. |
 | `--scan suspicious` | Decode only where packet sizes hint at a black screen. |
 | `--scan every-frame` | Decode every frame. Use it when the black screens are noisy or grainy. |
@@ -175,11 +177,11 @@ A command line split exits with an error code when the scenes could not be verif
 
 Which options work together:
 
-- `--scan-only` cannot be combined with `--review`, `--list-only`, `--out-dir`, `--overwrite` or `--keep-original`.
-- `--review` cannot be combined with `--list-only`, `--out-dir`, `--overwrite` or `--keep-original`.
+- `--scan-only` cannot be combined with `--review`, `--list-only`, `--out-dir`, `--overwrite`, `--keep-original` or `--exact-cuts`.
+- `--review` cannot be combined with `--list-only`, `--out-dir`, `--overwrite`, `--keep-original` or `--exact-cuts`.
 - `--list-only` cannot be combined with `--keep-original`.
 - `--hard-cuts` works with every command. With `--review` or a folder, the window opens with the hard-cut scan already chosen for the queued videos.
-- The detection options (`--scan`, `--min-black`, `--max-luma`, `--black-fraction`) and `--keep-original` apply to a command line run. The app refuses them when the command opens the window, where the Settings section does that job.
+- The detection options (`--scan`, `--min-black`, `--max-luma`, `--black-fraction`), `--keep-original` and `--exact-cuts` apply to a command line run. The app refuses them when the command opens the window, where the Settings section does that job.
 - A folder without `--scan-only` opens the window. The app refuses `--list-only`, `--out-dir` and `--overwrite` with a folder, since they work on a single video.
 
 ### Scanning ahead of time
@@ -199,6 +201,7 @@ The window reuses a stored scan only if its detection settings match the ones th
 
 The Settings section is at the bottom of the left panel. It holds:
 
+- "Cut on the exact picture (slower)". Off by default. See [Exact cuts](#exact-cuts). While it is on, the original is always kept and the box for the Recycle Bin or Trash is greyed out.
 - Whether the original is moved to the Recycle Bin or Trash after the check.
 - Whether scenes are written beside the video or in a new `<video name>_scenes` folder next to it.
 - Whether the tips are shown on the review screen.
@@ -260,6 +263,29 @@ Inside each, the app uses a `scene_splitter` folder:
 
 **Keyframe cuts.** The split copies the compressed streams, and a copy can only start a file on a keyframe, because every other frame depends on the frames before it. Each cut goes on the keyframe nearest to its black screen. A keyframe inside the black screen gives a clean cut. Otherwise the cut lands slightly before or after it, and one scene keeps a moment of its neighbour.
 
+<a id="exact-cuts"></a>**Exact cuts.** With "Cut on the exact picture" on (or `--exact-cuts`), each cut lands on the first picture shown at or after the moment you chose, so a scene starts less than one picture after it. The app writes each scene from up to three parts:
+
+1. The pictures from the cut to the next keyframe are encoded again with libx264, set up like the original: same profile, level, pixel format, picture size, colour properties and picture times.
+2. Everything from that keyframe to the last keyframe before the scene's end is copied, untouched.
+3. The pictures from that last keyframe to the end of the scene are encoded again.
+
+ffmpeg then joins the parts without touching them. A scene with no keyframe to copy between is encoded again as a whole. A cut that happens to be on a keyframe encodes nothing. A copy only starts on a keyframe that the pictures stored after it do not reach back across.
+
+Sound is never encoded again. Each scene gets every packet of sound that starts while its pictures are shown, so the sound of a scene can begin up to one packet (about 0.02 seconds for AAC) after its first picture and end up to one packet after its last. Inside a scene, sound and picture are in step as in the original, to within 2 thousandths of a second.
+
+Before the scene files get their names, the app decodes the original and every scene from start to end and checks that:
+
+- every scene decodes to its end without an error,
+- each scene has exactly the pictures planned for it, so the scenes together have as many pictures as the original and each scene starts on the picture that was chosen,
+- every copied picture decodes to the very same picture as in the original,
+- the pictures of each scene are shown at the pace of the original, also across the joins,
+- the scenes hold every packet of the original's sound, unchanged and in order, each in the scene in which it starts,
+- the sound of each scene is in step with its pictures.
+
+If any of this does not hold, the scene files are thrown away, the app says so, and you can split the video the normal way instead. What the check cannot prove is how the pictures that were encoded again look, since they are new. So the original is always kept after an exact cut, whatever the setting for originals says. The window says so before the split and in the result.
+
+Exact cuts work for H.264 video with 8-bit 4:2:0 colour that is not interlaced, in MP4, MOV or Matroska files, and need an ffmpeg with the libx264 encoder (the one the app downloads has it). For any other video the app refuses before it writes anything, and says how to split it the normal way. Checking takes about as long as decoding the video twice, and while a scene is written its parts take up as much room again as that scene.
+
 **Nothing half-written.** The split writes the scenes into a folder named `unfinished_` and a number, inside the folder they go to. Only when every scene is there does it move them to their names and remove that folder. A split that fails or stalls leaves no partial scene files, and leaves the scene files of an earlier split as they were. In the window, a video whose split failed offers "Back to review", which brings back the scenes as you left them, and "Try again", which scans it afresh.
 
 **Verification before recycling.** After the split, the app checks three things:
@@ -284,7 +310,10 @@ What differs between systems:
 
 ## Limitations
 
-- Cuts land on keyframes. A cut can be up to half the distance between two keyframes away from the moment you chose.
+- Cuts land on keyframes, unless [exact cuts](#exact-cuts) are on. A cut can be up to half the distance between two keyframes away from the moment you chose.
+- Exact cuts place the splits you add yourself. The scenes a scan proposes in the window still start on keyframes. On the command line, `--exact-cuts` places the scan's own cuts exactly.
+- A split you added with exact cuts on stays where you put it if you turn exact cuts off again. The normal split then cuts at the first keyframe at or after it.
+- Exact cuts drop chapter marks.
 - The hard-cut scan finds shot changes, not story scenes. Expect to merge its results by hand.
 - Audio and video sync in the player is loose. The player is for finding scene boundaries, not for watching.
 - Scene files contain the first video stream and the audio streams. Other streams, such as subtitles or cover art, are not copied. An original that holds such streams fails verification on purpose, so it is never recycled.
@@ -298,7 +327,7 @@ cargo test --release
 
 This runs the unit tests, which need neither ffmpeg nor a display. They include tests that drive the real review screen with simulated mouse and keyboard input.
 
-The end-to-end tests are ignored by default because they need `ffmpeg` and `ffprobe` on your `PATH` (the copy the app downloads does not count). They generate a small video from test patterns, then scan, split, verify and play it for real:
+The end-to-end tests are ignored by default because they need `ffmpeg` and `ffprobe` on your `PATH` (the copy the app downloads does not count), built with the libx264 encoder. They generate small videos from test patterns, then scan, split, verify and play them for real, with normal cuts and with exact cuts:
 
 ```
 cargo test --release -- --include-ignored

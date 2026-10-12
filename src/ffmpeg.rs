@@ -212,6 +212,30 @@ pub struct ToolCommand {
     program: Program,
     path: PathBuf,
     arguments: Vec<OsString>,
+    complaints: Complaints,
+}
+
+/// What it means when a program that exits as if all went well has written
+/// about problems on the way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Complaints {
+    /// Nothing. Most runs print warnings that do not matter to the caller.
+    Ignored,
+    /// The run failed.
+    AreFailures,
+}
+
+impl Complaints {
+    /// Why a run that exited well still failed, given the end of what it
+    /// wrote about problems. `None` when it did not fail.
+    fn as_failure(self, stderr_tail: &str) -> Option<String> {
+        match self {
+            Self::AreFailures if !stderr_tail.is_empty() => {
+                Some(format!("it reported problems while it ran: {stderr_tail}"))
+            }
+            Self::AreFailures | Self::Ignored => None,
+        }
+    }
 }
 
 impl ToolCommand {
@@ -222,7 +246,17 @@ impl ToolCommand {
             program,
             path: path.into(),
             arguments: Vec::new(),
+            complaints: Complaints::Ignored,
         }
+    }
+
+    /// Makes the run fail when the program writes anything about problems,
+    /// even if it then exits as if all went well. ffmpeg does exactly that
+    /// with a picture it cannot decode properly: it says so and carries on.
+    /// Only for runs that keep ffmpeg quiet about everything but errors.
+    pub fn failing_on_complaints(mut self) -> Self {
+        self.complaints = Complaints::AreFailures;
+        self
     }
 
     pub fn arg(mut self, argument: impl AsRef<OsStr>) -> Self {
@@ -322,6 +356,7 @@ impl ToolCommand {
         mut on_output: impl FnMut(&[u8]) -> Result<(), NotUnderstood>,
     ) -> Result<(), FfmpegError> {
         let program = self.program;
+        let complaints = self.complaints;
         let mut child = self.spawn()?;
         let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             // Both pipes were asked for, so this cannot happen. If it ever
@@ -383,6 +418,9 @@ impl ToolCommand {
                 status,
                 stderr_tail,
             });
+        }
+        if let Some(detail) = complaints.as_failure(&stderr_tail) {
+            return Err(FfmpegError::OutputNotUnderstood { program, detail });
         }
         Ok(())
     }
@@ -757,6 +795,31 @@ mod tests {
         let written: &[u8] = b"first line\nlast line\n";
         assert_eq!(read_tail(written, 10), "last line");
         assert_eq!(read_tail(written, 1000), "first line\nlast line");
+    }
+
+    #[test]
+    fn what_a_program_wrote_about_problems_fails_a_run_only_when_asked_to() {
+        let complaint = "corrupt decoded frame in stream 0";
+        assert_eq!(Complaints::Ignored.as_failure(complaint), None);
+        assert_eq!(
+            Complaints::AreFailures.as_failure(complaint).as_deref(),
+            Some("it reported problems while it ran: corrupt decoded frame in stream 0")
+        );
+        // A program that wrote nothing has nothing held against it.
+        assert_eq!(Complaints::AreFailures.as_failure(""), None);
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg on the PATH"]
+    fn a_quiet_run_passes_when_complaints_are_failures() {
+        let printed = ffmpeg()
+            .args(["-nostdin", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "testsrc=duration=1:size=16x16:rate=5"])
+            .args(["-f", "framecrc", "-"])
+            .failing_on_complaints()
+            .run_for_text(QUICK_ANSWER_LIMIT)
+            .unwrap();
+        assert!(printed.contains("#tb 0:"), "{printed}");
     }
 
     const LIMIT: Duration = Duration::from_secs(10);

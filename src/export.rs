@@ -6,8 +6,12 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::exact_cut::CutPrecision;
+use crate::exact_split;
+use crate::exact_verify::ExactCutProof;
 use crate::scenes::CutTimes;
 use crate::split::{self, SceneLocation};
+use crate::timecode::format_timestamp;
 use crate::verify;
 
 /// What each system calls the place deleted files go to.
@@ -32,28 +36,73 @@ pub enum OriginalPolicy {
 pub struct ExportOptions {
     pub scene_location: SceneLocation,
     pub original_policy: OriginalPolicy,
+    /// Missing from settings saved before the choice existed, which then
+    /// cut on keyframes as they always did.
+    pub cut_precision: CutPrecision,
 }
 
 impl Default for ExportOptions {
-    /// Scenes go beside the video, and the original is recycled once the
-    /// scenes are verified, so the scenes take its place.
+    /// Scenes go beside the video, cuts go on keyframes, and the original is
+    /// recycled once the scenes are verified, so the scenes take its place.
     fn default() -> Self {
         Self {
             scene_location: SceneLocation::BesideVideo,
             original_policy: OriginalPolicy::RecycleOnceVerified,
+            cut_precision: CutPrecision::NearestKeyframe,
+        }
+    }
+}
+
+impl ExportOptions {
+    /// How a split with these options is carried out.
+    pub fn split_method(&self) -> SplitMethod {
+        match self.cut_precision {
+            CutPrecision::NearestKeyframe => SplitMethod::CopyAtKeyframes {
+                original_policy: self.original_policy,
+            },
+            CutPrecision::ExactFrame => SplitMethod::ExactFrames,
+        }
+    }
+}
+
+/// How the scenes of one split are written, and with it what may happen to
+/// the original afterwards.
+///
+/// Only a split that copies every packet can be compared with the original
+/// packet for packet, so only that kind carries a policy for the original.
+/// An exact split encodes the pictures around each cut again. It has no
+/// policy to carry, and so no way to ask for the original to be recycled.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplitMethod {
+    CopyAtKeyframes { original_policy: OriginalPolicy },
+    ExactFrames,
+}
+
+impl SplitMethod {
+    /// What happens to the original when the scenes pass their check.
+    pub fn original_policy(self) -> OriginalPolicy {
+        match self {
+            Self::CopyAtKeyframes { original_policy } => original_policy,
+            Self::ExactFrames => OriginalPolicy::Keep,
         }
     }
 }
 
 #[derive(Debug)]
 pub enum Verification {
+    /// The scenes hold every packet of the original, unchanged.
     Passed,
+    /// The scenes of an exact split passed the checks that can be made of
+    /// them. Scenes that do not are never put in place.
+    PassedForExactCut(ExactCutProof),
     Failed(String),
 }
 
 #[derive(Debug)]
 pub enum OriginalOutcome {
     Kept,
+    /// The original of an exact split is kept whatever the settings say.
+    KeptBecauseCutIsExact,
     MovedToRecycleBin,
     KeptBecauseUnverified,
     KeptBecauseRecyclingFailed(String),
@@ -70,11 +119,44 @@ pub struct ExportReport {
 impl ExportReport {
     /// True when the scenes are verified and nothing went wrong afterwards.
     pub fn is_clean(&self) -> bool {
-        matches!(self.verification, Verification::Passed)
-            && matches!(
-                self.original,
-                OriginalOutcome::Kept | OriginalOutcome::MovedToRecycleBin
-            )
+        matches!(
+            self.verification,
+            Verification::Passed | Verification::PassedForExactCut(_)
+        ) && matches!(
+            self.original,
+            OriginalOutcome::Kept
+                | OriginalOutcome::KeptBecauseCutIsExact
+                | OriginalOutcome::MovedToRecycleBin
+        )
+    }
+
+    /// What the check of an exact split measured, one line per fact, for a
+    /// run from the command line. `None` after any other split.
+    pub fn exact_cut_measurements(&self) -> Option<String> {
+        let Verification::PassedForExactCut(proof) = &self.verification else {
+            return None;
+        };
+        let mut lines = vec![
+            format!(
+                "Pictures: {} in the original and in the scenes together, {} of them encoded again.",
+                proof.pictures, proof.pictures_encoded_again
+            ),
+            format!(
+                "Sound: {} packets, all copied unchanged. Largest shift against the picture: {:.4} s.",
+                proof.sound_packets, proof.largest_sound_shift_seconds
+            ),
+        ];
+        for (position, landing) in proof.cut_landings.iter().enumerate() {
+            lines.push(format!(
+                "Cut {}: asked for at {}, the next scene starts at {} ({:.3} s later).",
+                position + 1,
+                format_timestamp(landing.asked_for),
+                format_timestamp(landing.landed_at),
+                // A landing a rounding step early is no earlier than asked.
+                (landing.landed_at - landing.asked_for).max(0.0)
+            ));
+        }
+        Some(lines.join("\n"))
     }
 
     /// What happened, in words a person who knows nothing of video can act
@@ -127,6 +209,13 @@ impl ExportReport {
                 "Checked: together they contain the whole original, with nothing missing or changed."
                     .to_owned()
             }
+            Verification::PassedForExactCut(proof) => format!(
+                "Checked: every scene plays to its end, together they have all {} pictures of \
+                 the original, each scene starts on the picture that was chosen, and the sound \
+                 is the original's, unchanged. {} around the cuts were encoded again.",
+                proof.pictures,
+                counted_pictures(proof.pictures_encoded_again)
+            ),
             Verification::Failed(_) => {
                 "The check did not pass, so the original was kept. Play the scene files before you delete anything."
                     .to_owned()
@@ -136,7 +225,7 @@ impl ExportReport {
 
     fn verification_details(&self) -> Option<&str> {
         match &self.verification {
-            Verification::Passed => None,
+            Verification::Passed | Verification::PassedForExactCut(_) => None,
             Verification::Failed(reason) => Some(reason),
         }
     }
@@ -146,6 +235,7 @@ impl ExportReport {
             OriginalOutcome::Kept | OriginalOutcome::KeptBecauseUnverified => {
                 "The original is still in its place.".to_owned()
             }
+            OriginalOutcome::KeptBecauseCutIsExact => ORIGINAL_KEPT_AFTER_EXACT_CUT.to_owned(),
             OriginalOutcome::MovedToRecycleBin => {
                 format!("The original is in the {TRASH_NAME}. You can restore it from there.")
             }
@@ -159,6 +249,7 @@ impl ExportReport {
         match &self.original {
             OriginalOutcome::KeptBecauseRecyclingFailed(reason) => Some(reason),
             OriginalOutcome::Kept
+            | OriginalOutcome::KeptBecauseCutIsExact
             | OriginalOutcome::MovedToRecycleBin
             | OriginalOutcome::KeptBecauseUnverified => None,
         }
@@ -173,6 +264,52 @@ fn counted_scene_files(count: usize) -> String {
     } else {
         format!("{count} scene files are in")
     }
+}
+
+/// "1 picture", "50 pictures".
+fn counted_pictures(count: usize) -> String {
+    if count == 1 {
+        "1 picture".to_owned()
+    } else {
+        format!("{count} pictures")
+    }
+}
+
+/// Said in the result of every exact split, whatever the setting for
+/// originals is.
+const ORIGINAL_KEPT_AFTER_EXACT_CUT: &str =
+    "The original is still in its place. It is always kept after an exact cut, because \
+     pictures that were encoded again cannot be compared with it one for one.";
+
+/// Splits the video the way `method` says. See [`export_scenes`] and
+/// [`export_exact_scenes`].
+pub fn export_scenes_as(
+    video: &Path,
+    cuts: &CutTimes,
+    out_dir: &Path,
+    method: SplitMethod,
+) -> Result<ExportReport> {
+    match method {
+        SplitMethod::CopyAtKeyframes { original_policy } => {
+            export_scenes(video, cuts, out_dir, original_policy)
+        }
+        SplitMethod::ExactFrames => export_exact_scenes(video, cuts, out_dir),
+    }
+}
+
+/// Writes scenes that start on the exact pictures chosen, and checks them.
+///
+/// Takes no policy for the original: it is never recycled after an exact
+/// split. Fails when the scenes could not be written or did not pass their
+/// check. In both cases no scene file is put in place.
+pub fn export_exact_scenes(video: &Path, cuts: &CutTimes, out_dir: &Path) -> Result<ExportReport> {
+    let split = exact_split::split_on_exact_frames(video, cuts, out_dir)?;
+    Ok(ExportReport {
+        scene_files: split.scene_files,
+        out_dir: out_dir.to_path_buf(),
+        verification: Verification::PassedForExactCut(split.proof),
+        original: OriginalOutcome::KeptBecauseCutIsExact,
+    })
 }
 
 /// Fails only when the scenes could not be written. A failed verification is
@@ -214,10 +351,13 @@ enum OriginalDecision {
 }
 
 /// The one rule that guards the original: it is only recycled when the
-/// person asked for that and the scenes passed verification.
+/// person asked for that and the scenes were proven to hold every packet of
+/// it. The check of an exact cut proves less than that, so it never counts.
 fn decide_about_original(policy: OriginalPolicy, verification: &Verification) -> OriginalDecision {
     match (policy, verification) {
-        (OriginalPolicy::Keep, _) => OriginalDecision::Keep,
+        (OriginalPolicy::Keep, _) | (_, Verification::PassedForExactCut(_)) => {
+            OriginalDecision::Keep
+        }
         (OriginalPolicy::RecycleOnceVerified, Verification::Failed(_)) => {
             OriginalDecision::KeepBecauseUnverified
         }
@@ -240,6 +380,92 @@ mod tests {
             verification,
             original,
         }
+    }
+
+    fn exact_cut_report() -> ExportReport {
+        let proof = ExactCutProof {
+            pictures: 225,
+            pictures_encoded_again: 50,
+            sound_packets: 389,
+            cut_landings: vec![crate::exact_verify::CutLanding {
+                asked_for: 2.9,
+                landed_at: 2.92,
+            }],
+            largest_sound_shift_seconds: 0.0007,
+        };
+        report(
+            Verification::PassedForExactCut(proof),
+            OriginalOutcome::KeptBecauseCutIsExact,
+        )
+    }
+
+    #[test]
+    fn an_exact_split_never_carries_a_wish_to_recycle_the_original() {
+        for original_policy in [OriginalPolicy::Keep, OriginalPolicy::RecycleOnceVerified] {
+            let options = ExportOptions {
+                original_policy,
+                cut_precision: CutPrecision::ExactFrame,
+                ..ExportOptions::default()
+            };
+            assert_eq!(options.split_method(), SplitMethod::ExactFrames);
+            assert_eq!(
+                options.split_method().original_policy(),
+                OriginalPolicy::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_on_keyframes_carries_the_setting_for_the_original() {
+        for original_policy in [OriginalPolicy::Keep, OriginalPolicy::RecycleOnceVerified] {
+            let options = ExportOptions {
+                original_policy,
+                ..ExportOptions::default()
+            };
+            assert_eq!(
+                options.split_method(),
+                SplitMethod::CopyAtKeyframes { original_policy }
+            );
+            assert_eq!(options.split_method().original_policy(), original_policy);
+        }
+    }
+
+    #[test]
+    fn cuts_go_on_keyframes_unless_chosen_otherwise() {
+        assert_eq!(
+            ExportOptions::default().cut_precision,
+            CutPrecision::NearestKeyframe
+        );
+    }
+
+    #[test]
+    fn the_result_of_an_exact_split_says_what_was_checked_and_that_the_original_is_kept() {
+        let report = exact_cut_report();
+        assert!(report.is_clean());
+        assert_eq!(report.details(), None);
+        assert_eq!(
+            report.plain_summary(),
+            "1 scene file is in\nscenes\n\n\
+             Checked: every scene plays to its end, together they have all 225 pictures of \
+             the original, each scene starts on the picture that was chosen, and the sound \
+             is the original's, unchanged. 50 pictures around the cuts were encoded again.\n\n\
+             The original is still in its place. It is always kept after an exact cut, because \
+             pictures that were encoded again cannot be compared with it one for one."
+        );
+    }
+
+    #[test]
+    fn the_measurements_of_an_exact_split_say_where_each_cut_landed() {
+        assert_eq!(
+            exact_cut_report().exact_cut_measurements().as_deref(),
+            Some(
+                "Pictures: 225 in the original and in the scenes together, 50 of them encoded again.\n\
+                 Sound: 389 packets, all copied unchanged. Largest shift against the picture: 0.0007 s.\n\
+                 Cut 1: asked for at 00:00:02.900, the next scene starts at 00:00:02.920 (0.020 s later)."
+            )
+        );
+        let copied = report(Verification::Passed, OriginalOutcome::Kept);
+        assert_eq!(copied.exact_cut_measurements(), None);
     }
 
     #[test]
@@ -289,6 +515,20 @@ mod tests {
         assert_eq!(
             decide_about_original(OriginalPolicy::RecycleOnceVerified, &Verification::Passed),
             OriginalDecision::Recycle
+        );
+    }
+
+    #[test]
+    fn the_check_of_an_exact_cut_never_lets_the_original_be_recycled() {
+        let Verification::PassedForExactCut(proof) = exact_cut_report().verification else {
+            panic!("the report of an exact cut carries its proof");
+        };
+        assert_eq!(
+            decide_about_original(
+                OriginalPolicy::RecycleOnceVerified,
+                &Verification::PassedForExactCut(proof)
+            ),
+            OriginalDecision::Keep
         );
     }
 

@@ -20,7 +20,7 @@ use eframe::egui;
 
 use crate::cache::{self, CacheUse, SourcedDetection};
 use crate::detect::{ScanKind, ScanMode, ScanProgress, ScanStage};
-use crate::export::{self, ExportReport, OriginalPolicy, TRASH_NAME};
+use crate::export::{self, ExportReport, OriginalPolicy, SplitMethod, TRASH_NAME};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
 use crate::player::{Player, PlayerEvent};
@@ -371,6 +371,7 @@ impl SceneSplitterApp {
     fn run_frame(&mut self, ctx: &egui::Context) {
         self.follow_setup();
         self.apply_job_updates();
+        self.tell_the_review_where_new_splits_land();
         self.apply(ctx, requests_from_keys_and_drops(ctx));
         self.start_next_scan(ctx);
         self.close_player_unless_its_video_is_in_review();
@@ -418,6 +419,21 @@ impl SceneSplitterApp {
         self.forget_export_obstacles_if_scenes_go_elsewhere(scene_location_before);
         self.text_box_had_the_keyboard = ctx.wants_keyboard_input();
         self.save_settings_once_changed(ctx);
+    }
+
+    /// A split the person adds lands on the nearest keyframe or on the very
+    /// picture, as the setting says. Told to the review on show before
+    /// anything is drawn or asked of it, so a change of the setting holds
+    /// from the next frame on.
+    fn tell_the_review_where_new_splits_land(&mut self) {
+        let precision = self.settings.export.cut_precision;
+        let review_on_show = self
+            .queue
+            .current()
+            .and_then(|job| self.queue.review_mut(job));
+        if let Some(review) = review_on_show {
+            review.place_new_splits(precision);
+        }
     }
 
     /// A dialog in front of everything has the keyboard to itself.
@@ -819,7 +835,7 @@ impl SceneSplitterApp {
         let Some(video) = self.queue.job(job).map(|job| Arc::clone(job.video())) else {
             return self.note_refusal(Err(Refused::NoSuchJob(job)));
         };
-        let policy = self.settings.export.original_policy;
+        let method = self.settings.export.split_method();
         let out_dir = match split::scene_dir(&video, self.settings.export.scene_location) {
             Ok(out_dir) => out_dir,
             Err(error) => {
@@ -833,11 +849,11 @@ impl SceneSplitterApp {
             Err(refused) => return self.note_refusal(Err(refused)),
         };
         self.run_in_background(ctx, job, move || {
-            JobEvent::Exported(export::export_scenes(
+            JobEvent::Exported(export::export_scenes_as(
                 &order.video,
                 &order.cuts,
                 &out_dir,
-                policy,
+                method,
             ))
         });
     }
@@ -875,9 +891,9 @@ impl SceneSplitterApp {
                     self.queue.failed(job, Failure::from_scan_error(&error))
                 }
                 JobEvent::Exported(Ok(report)) => self.queue.finished(job, report),
-                JobEvent::Exported(Err(error)) => self
-                    .queue
-                    .failed(job, Failure::could_not_split(format!("{error:#}"))),
+                JobEvent::Exported(Err(error)) => {
+                    self.queue.failed(job, Failure::from_split_error(&error))
+                }
                 JobEvent::Crashed => self.queue.crashed(job),
             };
             self.note_refusal(told);
@@ -1102,14 +1118,24 @@ fn show_settings(ui: &mut egui::Ui, settings: &mut Settings, problem: &str) {
     }
 
     ui.label(theme::semibold("When a video is split", 13.0));
-    settings_controls::show_original_policy_checkbox(
-        ui,
-        &mut settings.export.original_policy,
-        format!("Move the original to the {TRASH_NAME} after the check"),
-    )
-    .on_hover_text(
-        "The new files are compared with the original first. If anything is missing or different, the original stays.",
+    settings_controls::show_cut_precision_checkbox(ui, &mut settings.export.cut_precision);
+    // An exact split keeps the original whatever this box says, so the box
+    // is not offered as if it had a say.
+    let recycling_has_a_say = matches!(
+        settings.export.split_method(),
+        SplitMethod::CopyAtKeyframes { .. }
     );
+    ui.add_enabled_ui(recycling_has_a_say, |ui| {
+        settings_controls::show_original_policy_checkbox(
+            ui,
+            &mut settings.export.original_policy,
+            format!("Move the original to the {TRASH_NAME} after the check"),
+        )
+        .on_hover_text(
+            "The new files are compared with the original first. If anything is missing or different, the original stays.",
+        )
+        .on_disabled_hover_text(settings_controls::ORIGINAL_KEPT_WITH_EXACT_CUTS);
+    });
     settings_controls::show_scene_location_checkbox(ui, &mut settings.export.scene_location);
     ui.checkbox(&mut settings.show_tips, "Show tips on the review screen");
 

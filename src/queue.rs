@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::cache::{CacheUse, SourcedDetection};
 use crate::detect::{ScanDepth, ScanKind, ScanProgress};
+use crate::exact_split::ExactCutError;
 use crate::export::ExportReport;
 use crate::ffmpeg::FfmpegError;
 use crate::review_session::ReviewSession;
@@ -73,6 +74,19 @@ impl Failure {
         Self {
             plain_words: plain_words.to_owned(),
             details: Some(details),
+        }
+    }
+
+    /// Why a split failed. A failed exact cut says what it says about
+    /// itself, which includes the way back to a cut without encoding.
+    pub fn from_split_error(error: &anyhow::Error) -> Self {
+        let details = format!("{error:#}");
+        match error.downcast_ref::<ExactCutError>() {
+            Some(exact_cut) => Self {
+                plain_words: exact_cut.in_plain_words(),
+                details: Some(details),
+            },
+            None => Self::could_not_split(details),
         }
     }
 
@@ -1466,6 +1480,34 @@ mod tests {
 
         queue.back_to_review(id).unwrap();
         assert_eq!(queue.review(id).unwrap().export_obstacle(), None);
+    }
+
+    #[test]
+    fn a_failed_exact_cut_says_the_original_is_untouched_and_offers_the_normal_cut() {
+        let error = anyhow::Error::new(ExactCutError::EncoderMissing);
+        let failure = Failure::from_split_error(&error);
+
+        assert_eq!(
+            failure.plain_words,
+            ExactCutError::EncoderMissing.in_plain_words()
+        );
+        assert!(failure
+            .plain_words
+            .contains("The original was not changed."));
+        assert!(failure.plain_words.contains("turn off"));
+        assert_eq!(
+            failure.details.as_deref(),
+            Some("this ffmpeg has no libx264 encoder")
+        );
+    }
+
+    #[test]
+    fn any_other_failed_split_is_told_as_before() {
+        let error = anyhow::anyhow!("the disk is full");
+        assert_eq!(
+            Failure::from_split_error(&error),
+            Failure::could_not_split("the disk is full".to_owned())
+        );
     }
 
     fn timed_out() -> FfmpegError {

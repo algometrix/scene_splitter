@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::cache::{DetectionSource, SourcedDetection};
 use crate::detect::ScanKind;
+use crate::exact_cut::CutPrecision;
 use crate::plan::{
     AddCutError, CutChoice, CutIndex, PlanSnapshot, SceneIndex, SceneLayout, SegmentIndex,
     SplitPlan,
@@ -44,8 +45,11 @@ pub enum ExportObstacle {
 /// How asking for a new split went, for the screens to say.
 #[derive(Debug, PartialEq)]
 pub enum SplitFeedback {
-    /// A split was added at this time of the video.
+    /// A split was added at this time of the video, the nearest point where
+    /// it can be cut without encoding.
     Added(f64),
+    /// A split was added at the very time that was asked for.
+    AddedExactly(f64),
     Refused(AddCutError),
     /// What was typed is not a time.
     NotATime,
@@ -56,7 +60,7 @@ impl SplitFeedback {
     /// confirmation.
     pub fn is_refusal(&self) -> bool {
         match self {
-            Self::Added(_) => false,
+            Self::Added(_) | Self::AddedExactly(_) => false,
             Self::Refused(_) | Self::NotATime => true,
         }
     }
@@ -65,6 +69,10 @@ impl SplitFeedback {
         match self {
             Self::Added(cut_time) => format!(
                 "Split at {}, the nearest point where the video can be cut.",
+                format_timestamp(*cut_time)
+            ),
+            Self::AddedExactly(cut_time) => format!(
+                "Split at exactly {}. A few seconds around it are encoded again when you split.",
                 format_timestamp(*cut_time)
             ),
             Self::Refused(why) => why.to_string(),
@@ -156,6 +164,9 @@ pub struct ReviewSession {
     /// A scan the person asked for that would throw away their edits, until
     /// they confirm or cancel it.
     rescan_awaiting_consent: Option<ScanKind>,
+    /// Where a split the person adds lands. It follows the setting, which
+    /// the app passes on, since settings belong to no one review.
+    new_split_precision: CutPrecision,
 }
 
 impl ReviewSession {
@@ -202,7 +213,14 @@ impl ReviewSession {
             new_split_feedback: None,
             export_obstacle: None,
             rescan_awaiting_consent: None,
+            new_split_precision: CutPrecision::NearestKeyframe,
         }
+    }
+
+    /// Says where the splits the person adds from now on land: on the
+    /// nearest keyframe, or on the very picture they chose.
+    pub fn place_new_splits(&mut self, precision: CutPrecision) {
+        self.new_split_precision = precision;
     }
 
     pub fn video(&self) -> &Arc<Path> {
@@ -270,10 +288,10 @@ impl ReviewSession {
         self.frame_seconds
     }
 
-    /// The keyframe a split asked for at `time` would land on, or `None`
-    /// where no split is possible.
+    /// Where a split asked for at `time` would land, or `None` where no
+    /// split is possible.
     pub fn split_time_near(&self, time: f64) -> Option<f64> {
-        self.plan.cut_time_near(time).ok()
+        self.plan.cut_time_for(time, self.new_split_precision).ok()
     }
 
     /// The scenes as they stand now, in order, for the player to show.
@@ -375,9 +393,10 @@ impl ReviewSession {
     /// that time, and says what happened. This is what the player's split
     /// button does.
     pub fn split_near(&mut self, time: f64) -> SplitFeedback {
-        match self.add_split_near(time) {
-            Ok(cut_time) => SplitFeedback::Added(cut_time),
-            Err(refusal) => SplitFeedback::Refused(refusal),
+        match (self.add_split_near(time), self.new_split_precision) {
+            (Ok(cut_time), CutPrecision::NearestKeyframe) => SplitFeedback::Added(cut_time),
+            (Ok(cut_time), CutPrecision::ExactFrame) => SplitFeedback::AddedExactly(cut_time),
+            (Err(refusal), _) => SplitFeedback::Refused(refusal),
         }
     }
 
@@ -482,7 +501,10 @@ impl ReviewSession {
     }
 
     fn add_split_near(&mut self, time: f64) -> Result<f64, AddCutError> {
-        self.edit_plan(|plan| plan.add_cut_near(time))
+        match self.new_split_precision {
+            CutPrecision::NearestKeyframe => self.edit_plan(|plan| plan.add_cut_near(time)),
+            CutPrecision::ExactFrame => self.edit_plan(|plan| plan.add_cut_exactly_at(time)),
+        }
     }
 
     fn selected_layouts(&self) -> Vec<SceneLayout> {
@@ -897,6 +919,68 @@ mod tests {
             session.scene_ends(),
             vec![20.0, 40.0, 50.0, 60.0, 80.0, 100.0]
         );
+    }
+
+    #[test]
+    fn with_exact_cuts_a_split_from_the_player_stays_on_the_chosen_picture() {
+        let mut session = Session::five_scenes();
+        session.0.place_new_splits(CutPrecision::ExactFrame);
+        assert_eq!(session.0.split_time_near(47.36), Some(47.36));
+
+        let feedback = session.0.split_near(47.36);
+
+        assert_eq!(feedback, SplitFeedback::AddedExactly(47.36));
+        assert!(!feedback.is_refusal());
+        assert_eq!(
+            feedback.in_words(),
+            "Split at exactly 00:00:47.360. A few seconds around it are encoded again when you split."
+        );
+        assert_eq!(
+            session.scene_ends(),
+            vec![20.0, 40.0, 47.36, 60.0, 80.0, 100.0]
+        );
+    }
+
+    #[test]
+    fn with_exact_cuts_a_typed_split_stays_at_the_time_typed() {
+        let mut session = Session::five_scenes();
+        session.0.place_new_splits(CutPrecision::ExactFrame);
+        session.add_split_at("0:47.5");
+
+        assert_eq!(
+            session.0.new_split_feedback(),
+            Some(&SplitFeedback::AddedExactly(47.5))
+        );
+        assert_eq!(
+            session.scene_ends(),
+            vec![20.0, 40.0, 47.5, 60.0, 80.0, 100.0]
+        );
+        // Like any other change, it can be taken back.
+        session.ask(ReviewRequest::Undo);
+        assert_eq!(session.scene_ends(), vec![20.0, 40.0, 60.0, 80.0, 100.0]);
+    }
+
+    #[test]
+    fn turning_exact_cuts_off_again_puts_new_splits_back_on_keyframes() {
+        let mut session = Session::five_scenes();
+        session.0.place_new_splits(CutPrecision::ExactFrame);
+        session.0.place_new_splits(CutPrecision::NearestKeyframe);
+
+        assert_eq!(session.0.split_time_near(47.36), Some(50.0));
+        assert_eq!(session.0.split_near(47.36), SplitFeedback::Added(50.0));
+    }
+
+    #[test]
+    fn an_exact_split_outside_the_video_is_refused() {
+        let mut session = Session::five_scenes();
+        session.0.place_new_splits(CutPrecision::ExactFrame);
+
+        assert_eq!(session.0.split_time_near(100.0), None);
+        assert_eq!(
+            session.0.split_near(100.0),
+            SplitFeedback::Refused(AddCutError::OutsideVideo)
+        );
+        assert!(!session.0.is_edited());
     }
 
     #[test]

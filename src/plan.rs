@@ -9,6 +9,7 @@
 use std::fmt;
 use std::ops::RangeInclusive;
 
+use crate::exact_cut::CutPrecision;
 use crate::scenes::{self, CutTimes};
 use crate::timecode::TimeSpan;
 
@@ -324,11 +325,38 @@ impl SplitPlan {
             .ok_or(AddCutError::NoKeyframeToCutOn)
     }
 
+    /// Where a cut asked for at `requested_time` would land with the given
+    /// precision: on the nearest keyframe, or at the very time asked for.
+    pub fn cut_time_for(
+        &self,
+        requested_time: f64,
+        precision: CutPrecision,
+    ) -> Result<f64, AddCutError> {
+        match precision {
+            CutPrecision::NearestKeyframe => self.cut_time_near(requested_time),
+            CutPrecision::ExactFrame if self.whole_video.has_strictly_inside(requested_time) => {
+                Ok(requested_time)
+            }
+            CutPrecision::ExactFrame => Err(AddCutError::OutsideVideo),
+        }
+    }
+
     /// Adds a cut on the keyframe nearest to `requested_time` and returns the
     /// time it landed on.
     pub fn add_cut_near(&mut self, requested_time: f64) -> Result<f64, AddCutError> {
-        let time = self.cut_time_near(requested_time)?;
+        let time = self.cut_time_for(requested_time, CutPrecision::NearestKeyframe)?;
+        self.add_cut_at(time)
+    }
 
+    /// Adds a cut at the very time asked for, which only a split that
+    /// encodes the pictures around its cuts again can cut at.
+    pub fn add_cut_exactly_at(&mut self, requested_time: f64) -> Result<f64, AddCutError> {
+        let time = self.cut_time_for(requested_time, CutPrecision::ExactFrame)?;
+        self.add_cut_at(time)
+    }
+
+    /// `time` is one that `cut_time_for` gave.
+    fn add_cut_at(&mut self, time: f64) -> Result<f64, AddCutError> {
         let position = self.cuts.partition_point(|cut| cut.time < time);
         let existing_cut = self.cuts.get_mut(position).filter(|cut| cut.time == time);
         if let Some(cut) = existing_cut {
@@ -604,6 +632,37 @@ mod tests {
         let mut plan = plan_with_cuts(&[]);
         assert_eq!(plan.add_cut_near(12.0), Err(AddCutError::OutsideVideo));
         assert_eq!(plan.add_cut_near(0.0), Err(AddCutError::OutsideVideo));
+    }
+
+    #[test]
+    fn an_exact_cut_stays_at_the_time_asked_for() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        assert_eq!(plan.cut_time_for(5.3, CutPrecision::ExactFrame), Ok(5.3));
+        assert_eq!(plan.add_cut_exactly_at(5.3), Ok(5.3));
+        assert_eq!(plan.accepted_cuts().as_slice(), [4.0, 5.3]);
+        // The same request on keyframes lands on the keyframe at 6 s.
+        assert_eq!(plan.add_cut_near(5.3), Ok(6.0));
+    }
+
+    #[test]
+    fn an_exact_cut_outside_the_video_is_refused() {
+        let mut plan = plan_with_cuts(&[]);
+        for outside in [WHOLE_VIDEO.start, WHOLE_VIDEO.end, 12.0, -1.0] {
+            assert_eq!(
+                plan.add_cut_exactly_at(outside),
+                Err(AddCutError::OutsideVideo)
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_cut_given_twice_is_refused_the_second_time() {
+        let mut plan = plan_with_cuts(&[]);
+        plan.add_cut_exactly_at(5.3).unwrap();
+        assert_eq!(
+            plan.add_cut_exactly_at(5.3),
+            Err(AddCutError::AlreadyProposed { at: 5.3 })
+        );
     }
 
     #[test]

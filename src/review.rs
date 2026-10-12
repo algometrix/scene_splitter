@@ -17,7 +17,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::detect::ScanKind;
-use crate::export::{ExportOptions, TRASH_NAME};
+use crate::export::{ExportOptions, SplitMethod, TRASH_NAME};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::{CutIndex, SceneIndex, SceneLayout, SegmentIndex, SplitPlan};
@@ -1258,18 +1258,33 @@ fn show_export_options(
 ) -> Option<ReviewRequest> {
     let mut wanted = export_options;
     ui.horizontal_wrapped(|ui| {
-        let recycle_label = format!(
-            "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
-        );
-        settings_controls::show_original_policy_checkbox(
-            ui,
-            &mut wanted.original_policy,
-            recycle_label,
-        )
-        .on_hover_text(format!(
-            "The check compares the new files with the original. If anything is missing \
-             or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
-        ));
+        match export_options.split_method() {
+            SplitMethod::CopyAtKeyframes { .. } => {
+                let recycle_label = format!(
+                    "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
+                );
+                settings_controls::show_original_policy_checkbox(
+                    ui,
+                    &mut wanted.original_policy,
+                    recycle_label,
+                )
+                .on_hover_text(format!(
+                    "The check compares the new files with the original. If anything is missing \
+                     or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
+                ));
+            }
+            // The original is kept whatever was chosen for it, so the choice
+            // gives way to saying so, before the split.
+            SplitMethod::ExactFrames => {
+                ui.label(theme::muted(
+                    settings_controls::ORIGINAL_KEPT_WITH_EXACT_CUTS,
+                ))
+                .on_hover_text(format!(
+                    "Turn off \"{}\" in Settings to cut without encoding.",
+                    settings_controls::EXACT_CUT_LABEL
+                ));
+            }
+        }
         settings_controls::show_scene_location_checkbox(ui, &mut wanted.scene_location);
         if let Ok(dir) = split::scene_dir(video, wanted.scene_location) {
             let destination = dir.display().to_string();
