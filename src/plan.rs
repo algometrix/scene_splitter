@@ -2083,8 +2083,8 @@ mod tests {
                 8 => drop(plan.set_scene_fate(scene, SceneFate::Keep)),
                 9 => plan.merge_chapter_cuts(),
                 10 => drop(plan.move_splits_to_cut_points()),
-                _ if next_pick(&mut state) % 8 == 0 => plan.reset_to_detected(),
-                _ if next_pick(&mut state) % 2 == 0 => snapshots.push(plan.snapshot()),
+                _ if next_pick(&mut state).is_multiple_of(8) => plan.reset_to_detected(),
+                _ if next_pick(&mut state).is_multiple_of(2) => snapshots.push(plan.snapshot()),
                 _ => {
                     if let Some(snapshot) = snapshots.pop() {
                         plan.restore(snapshot);
