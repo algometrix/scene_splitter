@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::exact_cut::CutPrecision;
-use crate::exact_fallback::{CannotMoveSplits, ExactCutFallback, NoWayToCut, WhyNotExact};
+use crate::exact_fallback::{
+    CannotMoveSplits, ExactCutFallback, ExactCutForecast, ExactCutLook, NoWayToCut, WhyNotExact,
+};
 use crate::exact_split::{self, Encoder, ExactCutError, Unsupported};
 use crate::exact_verify::{self, ExactCutProof, NotProven, VerifyError, WrittenScenes};
 use crate::export::{
@@ -636,11 +638,15 @@ fn a_video_in_another_codec_is_cut_at_the_nearest_points_and_the_result_says_so(
     let out_dir = video.folder().join("scenes");
 
     // What the person is told before the split.
-    let known_before = exact_split::why_no_exact_cut_at_a_glance(&other_codec).unwrap();
+    let known_before = exact_split::look_at_exact_cut(&other_codec);
     let not_h264 = WhyNotExact::KindOfVideo(Unsupported::Codec {
         name: "mpeg4".to_owned(),
     });
-    assert_eq!(known_before, Some(not_h264.clone()));
+    assert_eq!(known_before, ExactCutLook::CannotBeCut(not_h264.clone()));
+    assert_eq!(
+        known_before.forecast_for(&cuts),
+        ExactCutForecast::CannotBeCut(not_h264.clone())
+    );
 
     let report = export::export_scenes(
         &other_codec,
@@ -659,12 +665,61 @@ fn a_video_in_another_codec_is_cut_at_the_nearest_points_and_the_result_says_so(
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
-fn a_video_that_can_be_cut_exactly_has_nothing_against_it_at_a_glance() {
-    let video = TestVideo::with_reordered_pictures("exact_at_a_glance");
-    assert_eq!(
-        exact_split::why_no_exact_cut_at_a_glance(&video.path).unwrap(),
-        None
+fn a_video_that_can_be_cut_exactly_has_nothing_to_tell_before_the_split() {
+    let video = TestVideo::with_reordered_pictures("exact_look_nothing_to_tell");
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+
+    let look = exact_split::look_at_exact_cut(&video.path);
+
+    assert!(
+        matches!(look, ExactCutLook::PicturesListed(_)),
+        "the pictures were not listed: {look:?}"
     );
+    let forecast = look.forecast_for(&cuts);
+    assert_eq!(forecast, ExactCutForecast::NothingToTell);
+    assert_eq!(forecast.notice_before_the_split(), None);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_video_whose_later_keyframes_are_no_clean_starts_is_said_to_be_encoded_again_as_a_whole() {
+    let video = TestVideo::with_open_picture_groups("exact_look_mostly_encoded");
+    let cuts = cuts_at(REORDERED_VIDEO_SECONDS, &[time_of(CUT_FRAME)]);
+
+    let look = exact_split::look_at_exact_cut(&video.path);
+    let forecast = look.forecast_for(&cuts);
+
+    let ExactCutForecast::MostlyEncodedAgain(estimate) = &forecast else {
+        panic!("no warning for a video with open groups: {forecast:?}");
+    };
+    assert_eq!(estimate.pictures_encoded_again, REORDERED_FRAMES);
+    assert_eq!(estimate.pictures, REORDERED_FRAMES);
+    assert!(
+        (estimate.seconds_encoded_again - REORDERED_VIDEO_SECONDS).abs() < MILLISECOND,
+        "{estimate:?}"
+    );
+    assert!(estimate.is_most_of_the_video());
+    assert_eq!(
+        forecast.notice_before_the_split().unwrap(),
+        "An exact cut encodes all of this video again (9 s). \
+         That takes much longer than cutting at the nearest points instead."
+    );
+
+    // The warning is what the split then does: it is not refused, it is
+    // cut on the chosen picture, and every picture is encoded again.
+    let report = split_exactly(&video.path, video.folder(), &cuts);
+    assert_eq!(
+        proof_of(&report).pictures_encoded_again,
+        estimate.pictures_encoded_again
+    );
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![CUT_FRAME, REORDERED_FRAMES - CUT_FRAME]
+    );
+
+    // Not cut at all, the same video is copied and there is nothing to warn of.
+    let uncut = cuts_at(REORDERED_VIDEO_SECONDS, &[]);
+    assert_eq!(look.forecast_for(&uncut), ExactCutForecast::NothingToTell);
 }
 
 #[test]

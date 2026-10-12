@@ -4,14 +4,17 @@
 //! Such a video is cut the normal way instead: copied, at the points where
 //! it can be cut that are nearest to the splits that were chosen. This
 //! module says why, moves the splits, and words what the person is told. It
-//! runs nothing and reads no files.
+//! also says before the split what an exact cut will come to
+//! (`ExactCutForecast`): cut another way, or cut exactly at the price of
+//! encoding most of the video again. It runs nothing and reads no files.
 
 use std::fmt;
+use std::sync::Arc;
 
-use crate::exact_cut::PlanError;
+use crate::exact_cut::{plan_exact_cuts, EncodedAgainEstimate, FrameTable, PlanError};
 use crate::exact_split::{ExactCutError, Unsupported};
 use crate::scenes::{self, CutTimes};
-use crate::timecode::{format_timestamp, TimeSpan};
+use crate::timecode::{format_rough_length, format_timestamp, TimeSpan};
 
 /// A split this close to a point where the video can be cut is on it. Times
 /// kept as fractions of a second rarely match to the last digit.
@@ -23,6 +26,43 @@ const WILL_BE_CUT_AT_THE_NEAREST_POINTS: &str =
     "It will be cut at the nearest points where it can be cut instead.";
 const WAS_CUT_AT_THE_NEAREST_POINTS: &str =
     "It was cut at the nearest points where it can be cut instead.";
+
+/// From this much video to encode again on, an exact cut is said to take
+/// hours. Encoding at the quality an exact cut uses runs at a fraction of
+/// playing speed on a slow machine or on large pictures, so half an hour of
+/// video can keep one busy for more than an hour.
+const ENCODING_CAN_TAKE_HOURS_FROM_SECONDS: f64 = 30.0 * 60.0;
+/// What an exact cut that encodes most of a long video again costs, and
+/// what the person can have instead.
+const ENCODING_CAN_TAKE_HOURS: &str =
+    "That can take hours. Cutting at the nearest points instead takes seconds.";
+/// The same for a video too short for the split to take hours.
+const ENCODING_TAKES_MUCH_LONGER: &str =
+    "That takes much longer than cutting at the nearest points instead.";
+
+/// What the person is told before an exact cut that encodes most of the
+/// video again: how much, what that costs, and what costs less. They asked
+/// for exact cuts, so the split is neither refused nor changed.
+pub fn mostly_encoded_again_in_plain_words(estimate: &EncodedAgainEstimate) -> String {
+    let how_much = if estimate.pictures_encoded_again >= estimate.pictures {
+        format!(
+            "all of this video again ({})",
+            format_rough_length(estimate.seconds)
+        )
+    } else {
+        format!(
+            "most of this video again (about {} of {})",
+            format_rough_length(estimate.seconds_encoded_again),
+            format_rough_length(estimate.seconds)
+        )
+    };
+    let cost = if estimate.seconds_encoded_again >= ENCODING_CAN_TAKE_HOURS_FROM_SECONDS {
+        ENCODING_CAN_TAKE_HOURS
+    } else {
+        ENCODING_TAKES_MUCH_LONGER
+    };
+    format!("An exact cut encodes {how_much}. {cost}")
+}
 
 /// Why a video is not cut on the exact pictures that were chosen.
 #[derive(Debug, Clone, PartialEq)]
@@ -155,7 +195,8 @@ fn pictures_in_plain_words(problem: &PlanError) -> String {
 }
 
 /// What a look at a video's file says about cutting it on exact pictures,
-/// for telling the person before the split.
+/// wherever the splits are. What that means for the splits of the moment is
+/// an [`ExactCutForecast`].
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ExactCutLook {
     /// Nobody has looked yet.
@@ -163,22 +204,73 @@ pub enum ExactCutLook {
     NotLooked,
     /// A look is under way.
     Looking,
-    /// Nothing that shows at a glance speaks against an exact cut. It can
-    /// still turn out not to work once every picture is listed, or fail its
-    /// check, which only the split finds out.
+    /// Nothing that shows at a glance speaks against an exact cut, and the
+    /// pictures could not be listed. The split finds out the rest.
     CanBeTried,
     CannotBeCut(WhyNotExact),
+    /// Nothing that shows at a glance speaks against an exact cut, and these
+    /// are the video's pictures. With them the cut can be planned for any
+    /// splits without reading the file again, so what the person is told
+    /// stays true while they move splits about. The cut can still fail its
+    /// check, which only the split finds out.
+    PicturesListed(Arc<FrameTable>),
 }
 
 impl ExactCutLook {
-    /// What to tell the person before the split, when the look found that
-    /// the video will be cut another way.
+    /// What an exact cut at `cuts` will come to, as far as the look says.
+    ///
+    /// This plans the cut. That reads no file, but it does go through the
+    /// pictures of each scene, which takes well under a millisecond for a
+    /// film.
+    pub fn forecast_for(&self, cuts: &CutTimes) -> ExactCutForecast {
+        match self {
+            Self::NotLooked | Self::Looking | Self::CanBeTried => ExactCutForecast::NothingToTell,
+            Self::CannotBeCut(why_not_exact) => {
+                ExactCutForecast::CannotBeCut(why_not_exact.clone())
+            }
+            Self::PicturesListed(pictures) => match plan_exact_cuts(pictures, cuts) {
+                // The split would find the same and cut the normal way.
+                Err(problem) => ExactCutForecast::CannotBeCut(WhyNotExact::Pictures(problem)),
+                Ok(plan) => ExactCutForecast::of_estimate(plan.encoded_again_estimate()),
+            },
+        }
+    }
+}
+
+/// What an exact cut of a video at the splits of the moment will come to,
+/// as far as that is known before the split.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExactCutForecast {
+    /// Not known, or the cut encodes only what is around the splits, as
+    /// the person expects of it.
+    NothingToTell,
+    /// The video will be cut at the nearest points instead.
+    CannotBeCut(WhyNotExact),
+    /// The video can be cut on the exact pictures, but most of it is
+    /// encoded again for that. The person is told and decides.
+    MostlyEncodedAgain(EncodedAgainEstimate),
+}
+
+impl ExactCutForecast {
+    fn of_estimate(estimate: EncodedAgainEstimate) -> Self {
+        if estimate.is_most_of_the_video() {
+            Self::MostlyEncodedAgain(estimate)
+        } else {
+            Self::NothingToTell
+        }
+    }
+
+    /// What to tell the person before the split, when there is something
+    /// about it they would not expect.
     pub fn notice_before_the_split(&self) -> Option<String> {
         match self {
+            Self::NothingToTell => None,
             Self::CannotBeCut(why_not_exact) => {
                 Some(why_not_exact.before_the_split_in_plain_words())
             }
-            Self::NotLooked | Self::Looking | Self::CanBeTried => None,
+            Self::MostlyEncodedAgain(estimate) => {
+                Some(mostly_encoded_again_in_plain_words(estimate))
+            }
         }
     }
 }
@@ -432,6 +524,7 @@ fn nearest_cut_point(time: f64, cut_points: &[f64], whole_video: TimeSpan) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exact_cut::StoredFrame;
 
     const WHOLE_VIDEO: TimeSpan = TimeSpan {
         start: 0.0,
@@ -591,23 +684,192 @@ mod tests {
         );
     }
 
+    const FRAME_SECONDS: f64 = 0.04;
+    const KEYFRAME_EVERY: usize = 50;
+
+    /// A look that listed a video of `frame_count` pictures, 25 a second,
+    /// with a keyframe every two seconds wherever `is_clean_start` allows
+    /// one.
+    fn pictures(frame_count: usize, is_clean_start: impl Fn(usize) -> bool) -> ExactCutLook {
+        let stored = (0..frame_count)
+            .map(|frame| StoredFrame {
+                shown_at: frame as f64 * FRAME_SECONDS,
+                decoded_at: Some(frame as f64 * FRAME_SECONDS),
+                reorder_ticks: Some(0),
+                is_keyframe: frame % KEYFRAME_EVERY == 0 && is_clean_start(frame),
+            })
+            .collect();
+        ExactCutLook::PicturesListed(Arc::new(FrameTable::from_stored_order(stored).unwrap()))
+    }
+
+    fn cuts_at_times(frame_count: usize, times: Vec<f64>) -> CutTimes {
+        let whole_video = TimeSpan {
+            start: 0.0,
+            end: frame_count as f64 * FRAME_SECONDS,
+        };
+        CutTimes::inside(whole_video, times).unwrap()
+    }
+
+    fn cuts_on(frame_count: usize, cut_frames: &[usize]) -> CutTimes {
+        let times = cut_frames
+            .iter()
+            .map(|&frame| frame as f64 * FRAME_SECONDS)
+            .collect();
+        cuts_at_times(frame_count, times)
+    }
+
     #[test]
-    fn only_a_look_that_found_a_reason_has_something_to_say_before_the_split() {
+    fn a_look_that_listed_no_pictures_forecasts_only_a_reason_it_found() {
+        let cuts = cuts_on(225, &[73]);
         for nothing_to_say in [
             ExactCutLook::NotLooked,
             ExactCutLook::Looking,
             ExactCutLook::CanBeTried,
         ] {
-            assert_eq!(nothing_to_say.notice_before_the_split(), None);
+            let forecast = nothing_to_say.forecast_for(&cuts);
+            assert_eq!(forecast, ExactCutForecast::NothingToTell);
+            assert_eq!(forecast.notice_before_the_split(), None);
         }
+        let forecast = ExactCutLook::CannotBeCut(not_h264()).forecast_for(&cuts);
+        assert_eq!(forecast, ExactCutForecast::CannotBeCut(not_h264()));
         assert_eq!(
-            ExactCutLook::CannotBeCut(not_h264()).notice_before_the_split(),
+            forecast.notice_before_the_split(),
             Some(
                 "This video cannot be cut on the exact picture because its pictures are stored \
                  as mpeg4, and exact cuts only work for pictures stored as H.264. It will be \
                  cut at the nearest points where it can be cut instead."
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn a_cut_that_encodes_only_what_is_around_the_splits_has_nothing_to_tell() {
+        let every_keyframe_is_a_clean_start = pictures(225, |_| true);
+        let forecast = every_keyframe_is_a_clean_start.forecast_for(&cuts_on(225, &[73]));
+        assert_eq!(forecast, ExactCutForecast::NothingToTell);
+        assert_eq!(forecast.notice_before_the_split(), None);
+    }
+
+    #[test]
+    fn a_video_with_one_clean_start_is_forecast_to_be_encoded_again_wherever_it_is_split() {
+        let only_the_first_is_a_clean_start = pictures(225, |frame| frame == 0);
+        for cut_frames in [&[73][..], &[100], &[20, 200]] {
+            let forecast = only_the_first_is_a_clean_start.forecast_for(&cuts_on(225, cut_frames));
+            let ExactCutForecast::MostlyEncodedAgain(estimate) = forecast else {
+                panic!("splits on {cut_frames:?}: {forecast:?}");
+            };
+            assert_eq!(estimate.pictures_encoded_again, 225);
+            assert_eq!(estimate.pictures, 225);
+        }
+        // Cut nowhere, it is copied whole.
+        assert_eq!(
+            only_the_first_is_a_clean_start.forecast_for(&cuts_on(225, &[])),
+            ExactCutForecast::NothingToTell
+        );
+    }
+
+    #[test]
+    fn the_forecast_follows_the_splits() {
+        let look = pictures(300, |frame| frame == 0 || frame == 200);
+
+        // A split on the clean start encodes nothing.
+        assert_eq!(
+            look.forecast_for(&cuts_on(300, &[200])),
+            ExactCutForecast::NothingToTell
+        );
+        // A split just after it encodes the last 100 pictures, a third.
+        assert_eq!(
+            look.forecast_for(&cuts_on(300, &[201])),
+            ExactCutForecast::NothingToTell
+        );
+        // A split before it encodes the first 200 pictures, two thirds.
+        let forecast = look.forecast_for(&cuts_on(300, &[73]));
+        let ExactCutForecast::MostlyEncodedAgain(estimate) = forecast else {
+            panic!("{forecast:?}");
+        };
+        assert_eq!(estimate.pictures_encoded_again, 200);
+        assert_eq!(estimate.pictures, 300);
+    }
+
+    #[test]
+    fn splits_that_leave_no_way_to_plan_the_cut_are_forecast_to_be_cut_the_normal_way() {
+        let look = pictures(225, |_| true);
+        let picture_73 = 73.0 * FRAME_SECONDS;
+        let half_a_picture_before = picture_73 - FRAME_SECONDS / 2.0;
+        // Both splits choose picture 73.
+        let on_one_picture = cuts_at_times(225, vec![half_a_picture_before, picture_73]);
+
+        let forecast = look.forecast_for(&on_one_picture);
+        let ExactCutForecast::CannotBeCut(WhyNotExact::Pictures(problem)) = &forecast else {
+            panic!("{forecast:?}");
+        };
+        assert!(matches!(problem, PlanError::SceneWithoutPictures { .. }));
+        assert!(forecast
+            .notice_before_the_split()
+            .unwrap()
+            .ends_with(WILL_BE_CUT_AT_THE_NEAREST_POINTS));
+    }
+
+    fn estimate_of(seconds_encoded_again: f64, seconds: f64) -> EncodedAgainEstimate {
+        const PICTURES_A_SECOND: f64 = 25.0;
+        EncodedAgainEstimate {
+            pictures_encoded_again: (seconds_encoded_again * PICTURES_A_SECOND) as usize,
+            pictures: (seconds * PICTURES_A_SECOND) as usize,
+            seconds_encoded_again,
+            seconds,
+        }
+    }
+
+    #[test]
+    fn a_film_that_is_mostly_encoded_again_is_said_to_take_hours() {
+        const FILM_SECONDS: f64 = 7080.0;
+        assert_eq!(
+            mostly_encoded_again_in_plain_words(&estimate_of(6720.0, FILM_SECONDS)),
+            "An exact cut encodes most of this video again (about 1 h 52 min of 1 h 58 min). \
+             That can take hours. Cutting at the nearest points instead takes seconds."
+        );
+        assert_eq!(
+            mostly_encoded_again_in_plain_words(&estimate_of(FILM_SECONDS, FILM_SECONDS)),
+            "An exact cut encodes all of this video again (1 h 58 min). \
+             That can take hours. Cutting at the nearest points instead takes seconds."
+        );
+    }
+
+    #[test]
+    fn a_short_video_that_is_mostly_encoded_again_is_not_said_to_take_hours() {
+        assert_eq!(
+            mostly_encoded_again_in_plain_words(&estimate_of(533.0, 533.0)),
+            "An exact cut encodes all of this video again (8 min 53 s). \
+             That takes much longer than cutting at the nearest points instead."
+        );
+        assert_eq!(
+            mostly_encoded_again_in_plain_words(&estimate_of(40.0, 65.0)),
+            "An exact cut encodes most of this video again (about 40 s of 1 min 05 s). \
+             That takes much longer than cutting at the nearest points instead."
+        );
+    }
+
+    #[test]
+    fn hours_are_spoken_of_from_half_an_hour_of_encoding_on() {
+        let just_under = mostly_encoded_again_in_plain_words(&estimate_of(1799.0, 1900.0));
+        let half_an_hour = mostly_encoded_again_in_plain_words(&estimate_of(1800.0, 1900.0));
+        assert!(
+            just_under.ends_with(ENCODING_TAKES_MUCH_LONGER),
+            "{just_under}"
+        );
+        assert!(
+            half_an_hour.ends_with(ENCODING_CAN_TAKE_HOURS),
+            "{half_an_hour}"
+        );
+    }
+
+    #[test]
+    fn the_warning_is_what_the_person_is_told_before_the_split() {
+        let estimate = estimate_of(6720.0, 7080.0);
+        assert_eq!(
+            ExactCutForecast::MostlyEncodedAgain(estimate).notice_before_the_split(),
+            Some(mostly_encoded_again_in_plain_words(&estimate))
         );
     }
 

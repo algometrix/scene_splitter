@@ -67,7 +67,7 @@ use clap::Parser;
 use chapters::ChapterSplits;
 use detect::{Detection, ScanDepth, ScanKind, ScanMode};
 use exact_cut::CutPrecision;
-use exact_fallback::NoWayToCut;
+use exact_fallback::{ExactCutForecast, NoWayToCut};
 use exact_split::ExactCutError;
 use export::{ExistingListFile, OriginalPolicy, SplitMethod, SplitOrder};
 use fates::ScenesToWrite;
@@ -503,10 +503,14 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     }
 
     let started = Instant::now();
-    let order = SplitOrder::new(scenes, method);
     if method == SplitMethod::ExactFrames {
-        println!("{}", notice_before_an_exact_cut(video));
+        let forecast = exact_split::look_at_exact_cut(video).forecast_for(scenes.cuts());
+        println!("{}", notice_before_an_exact_cut(&forecast));
+        if let Some(warning) = warning_before_an_exact_cut(&forecast) {
+            eprintln!("Warning: {warning}");
+        }
     }
+    let order = SplitOrder::new(scenes, method);
     let report = export::export_scenes(video, &order, &out_dir, scene_names)
         .map_err(with_the_way_back_to_a_normal_cut)?;
     // So that these scenes are still known as scenes of this video after
@@ -649,15 +653,41 @@ const EXACT_CUT_NOTICE: &str =
     "Cutting on the exact pictures. A few seconds around each cut are encoded again, \
      and the original is kept.";
 
+/// Said in its place before an exact split that encodes most of the video
+/// again. How much that is goes into a warning of its own.
+const EXACT_CUT_OF_MOST_OF_THE_VIDEO_NOTICE: &str =
+    "Cutting on the exact pictures. The original is kept.";
+
+/// Ends the warning about an exact split that encodes most of the video
+/// again: the run goes on as asked, and this is how to ask for the other.
+const NORMAL_CUT_HINT: &str =
+    "To cut at the nearest points, stop this run and start it again without --exact-cuts.";
+
 /// What is said before a split that asked for exact pictures starts. A
 /// video that cannot be cut that way is known by a look at its file, and
 /// then the notice says how it will be cut instead.
-fn notice_before_an_exact_cut(video: &Path) -> String {
-    match exact_split::why_no_exact_cut_at_a_glance(video) {
-        Ok(Some(why_not_exact)) => why_not_exact.before_the_split_in_plain_words(),
+fn notice_before_an_exact_cut(forecast: &ExactCutForecast) -> String {
+    match forecast {
+        ExactCutForecast::CannotBeCut(why_not_exact) => {
+            why_not_exact.before_the_split_in_plain_words()
+        }
+        ExactCutForecast::MostlyEncodedAgain(_) => EXACT_CUT_OF_MOST_OF_THE_VIDEO_NOTICE.to_owned(),
         // A video that could not be looked at fails in the split itself,
         // which says why.
-        Ok(None) | Err(_) => EXACT_CUT_NOTICE.to_owned(),
+        ExactCutForecast::NothingToTell => EXACT_CUT_NOTICE.to_owned(),
+    }
+}
+
+/// The warning before an exact split that encodes most of the video again.
+/// The split goes ahead all the same: exact cuts were asked for, and the
+/// person can stop the run once they know what it costs.
+fn warning_before_an_exact_cut(forecast: &ExactCutForecast) -> Option<String> {
+    match forecast {
+        ExactCutForecast::MostlyEncodedAgain(estimate) => Some(format!(
+            "{} {NORMAL_CUT_HINT}",
+            exact_fallback::mostly_encoded_again_in_plain_words(estimate)
+        )),
+        ExactCutForecast::CannotBeCut(_) | ExactCutForecast::NothingToTell => None,
     }
 }
 
@@ -710,6 +740,47 @@ fn print_scenes(scenes: &[TimeSpan], chapter_splits: &ChapterSplits) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exact_cut_of_most_of_the_video_is_warned_about_and_still_goes_ahead() {
+        let all_of_a_film = exact_cut::EncodedAgainEstimate {
+            pictures_encoded_again: 177_000,
+            pictures: 177_000,
+            seconds_encoded_again: 7080.0,
+            seconds: 7080.0,
+        };
+        let forecast = ExactCutForecast::MostlyEncodedAgain(all_of_a_film);
+
+        assert_eq!(
+            warning_before_an_exact_cut(&forecast).unwrap(),
+            "An exact cut encodes all of this video again (1 h 58 min). That can take hours. \
+             Cutting at the nearest points instead takes seconds. To cut at the nearest \
+             points, stop this run and start it again without --exact-cuts."
+        );
+        // The notice no longer speaks of a few seconds around each cut.
+        assert_eq!(
+            notice_before_an_exact_cut(&forecast),
+            "Cutting on the exact pictures. The original is kept."
+        );
+    }
+
+    #[test]
+    fn an_exact_cut_with_nothing_special_about_it_has_no_warning() {
+        let nothing_to_tell = ExactCutForecast::NothingToTell;
+        assert_eq!(warning_before_an_exact_cut(&nothing_to_tell), None);
+        assert_eq!(
+            notice_before_an_exact_cut(&nothing_to_tell),
+            EXACT_CUT_NOTICE
+        );
+
+        let why_not_exact = exact_fallback::WhyNotExact::EncoderMissing;
+        let cannot_be_cut = ExactCutForecast::CannotBeCut(why_not_exact.clone());
+        assert_eq!(warning_before_an_exact_cut(&cannot_be_cut), None);
+        assert_eq!(
+            notice_before_an_exact_cut(&cannot_be_cut),
+            why_not_exact.before_the_split_in_plain_words()
+        );
+    }
 
     #[test]
     fn the_refusal_to_replace_earlier_scenes_names_every_one_of_them() {

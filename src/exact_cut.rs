@@ -26,6 +26,46 @@ const MICROSECONDS_PER_SECOND: f64 = 1_000_000.0;
 /// words they look for are the words on the checkbox.
 pub const EXACT_CUT_SETTING: &str = "Cut on the exact picture (slower)";
 
+/// From this share of a video's pictures on, an exact cut encodes most of
+/// the video again and the person is warned before the split.
+///
+/// An exact cut is meant to encode the few pictures between each split and
+/// the nearest places a copy can start or end. That is a few seconds for
+/// each split, a small share even of a short video with many splits. Past
+/// one half, encoding and no longer copying decides how long the split
+/// takes. Such a video has hardly any place a copy can start, and splitting
+/// a film of that kind takes about as long as encoding the film.
+pub const MOST_OF_THE_VIDEO: f64 = 0.5;
+
+/// How much of a video an exact cut encodes again, known from its plan
+/// before anything is written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EncodedAgainEstimate {
+    pub pictures_encoded_again: usize,
+    /// How many pictures the video has.
+    pub pictures: usize,
+    /// How long the pictures that are encoded again are shown.
+    pub seconds_encoded_again: f64,
+    /// How long the whole video is shown.
+    pub seconds: f64,
+}
+
+impl EncodedAgainEstimate {
+    /// The pictures encoded again as a share of all pictures, from 0 to 1.
+    pub fn share_encoded_again(&self) -> f64 {
+        if self.pictures == 0 {
+            return 0.0;
+        }
+        self.pictures_encoded_again as f64 / self.pictures as f64
+    }
+
+    /// Whether the cut encodes so much that it deserves a warning. See
+    /// [`MOST_OF_THE_VIDEO`].
+    pub fn is_most_of_the_video(&self) -> bool {
+        self.share_encoded_again() >= MOST_OF_THE_VIDEO
+    }
+}
+
 /// Where a split may cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CutPrecision {
@@ -335,6 +375,21 @@ impl ExactCutPlan {
             .filter(|part| !part.is_copied())
             .map(|part| part.frames.len())
             .sum()
+    }
+
+    /// How much of the video the plan encodes again, for telling the person
+    /// before the split what it will cost.
+    pub fn encoded_again_estimate(&self) -> EncodedAgainEstimate {
+        let parts = || self.scenes.iter().flat_map(|scene| &scene.parts);
+        EncodedAgainEstimate {
+            pictures_encoded_again: self.frames_encoded_again(),
+            pictures: self.frame_count,
+            seconds_encoded_again: parts()
+                .filter(|part| !part.is_copied())
+                .map(|part| part.seconds)
+                .sum(),
+            seconds: parts().map(|part| part.seconds).sum(),
+        }
     }
 
     /// How many scenes have no stretch that can be copied and are encoded
@@ -950,6 +1005,81 @@ mod tests {
         let table = table_with_open_groups(225, 50);
         let plan = plan_exact_cuts(&table, &cuts(&table, &[])).unwrap();
         assert_eq!(parts_in_short(&plan.scenes()[0]), vec![("copy", 0, 225)]);
+    }
+
+    fn close_to(seconds: f64, expected: f64) -> bool {
+        (seconds - expected).abs() < 1e-9
+    }
+
+    #[test]
+    fn the_estimate_counts_the_pictures_around_a_cut_and_how_long_they_are_shown() {
+        // Keyframes at 0, 50, 100, 150, 200. The cut on picture 73 has the
+        // pictures from 50 to 100 encoded again.
+        let table = table(225, 50);
+        let plan = plan_exact_cuts(&table, &cuts(&table, &[time_of(73)])).unwrap();
+        let estimate = plan.encoded_again_estimate();
+
+        assert_eq!(estimate.pictures_encoded_again, 50);
+        assert_eq!(estimate.pictures, 225);
+        assert!(close_to(estimate.seconds_encoded_again, time_of(50)));
+        assert!(close_to(estimate.seconds, time_of(225)));
+        assert!(close_to(estimate.share_encoded_again(), 50.0 / 225.0));
+        assert!(!estimate.is_most_of_the_video());
+    }
+
+    #[test]
+    fn a_cut_on_a_keyframe_is_estimated_to_encode_nothing() {
+        let table = table(225, 50);
+        let plan = plan_exact_cuts(&table, &cuts(&table, &[time_of(100)])).unwrap();
+        let estimate = plan.encoded_again_estimate();
+
+        assert_eq!(estimate.pictures_encoded_again, 0);
+        assert_eq!(estimate.seconds_encoded_again, 0.0);
+        assert_eq!(estimate.share_encoded_again(), 0.0);
+        assert!(!estimate.is_most_of_the_video());
+    }
+
+    #[test]
+    fn one_cut_into_a_video_with_open_groups_is_estimated_to_encode_all_of_it() {
+        let table = table_with_open_groups(225, 50);
+        let plan = plan_exact_cuts(&table, &cuts(&table, &[time_of(73)])).unwrap();
+        let estimate = plan.encoded_again_estimate();
+
+        assert_eq!(estimate.pictures_encoded_again, 225);
+        assert!(close_to(estimate.seconds_encoded_again, estimate.seconds));
+        assert_eq!(estimate.share_encoded_again(), 1.0);
+        assert!(estimate.is_most_of_the_video());
+
+        // Cut nowhere, the same video is copied whole.
+        let uncut = plan_exact_cuts(&table, &cuts(&table, &[])).unwrap();
+        assert!(!uncut.encoded_again_estimate().is_most_of_the_video());
+    }
+
+    #[test]
+    fn an_estimate_is_most_of_the_video_from_one_half_of_its_pictures_on() {
+        let encoding = |pictures_encoded_again| EncodedAgainEstimate {
+            pictures_encoded_again,
+            pictures: 1000,
+            seconds_encoded_again: pictures_encoded_again as f64 * FRAME_SECONDS,
+            seconds: 1000.0 * FRAME_SECONDS,
+        };
+        assert_eq!(MOST_OF_THE_VIDEO, 0.5);
+        assert!(!encoding(0).is_most_of_the_video());
+        assert!(!encoding(499).is_most_of_the_video());
+        assert!(encoding(500).is_most_of_the_video());
+        assert!(encoding(1000).is_most_of_the_video());
+    }
+
+    #[test]
+    fn an_estimate_of_no_pictures_has_no_share() {
+        let nothing = EncodedAgainEstimate {
+            pictures_encoded_again: 0,
+            pictures: 0,
+            seconds_encoded_again: 0.0,
+            seconds: 0.0,
+        };
+        assert_eq!(nothing.share_encoded_again(), 0.0);
+        assert!(!nothing.is_most_of_the_video());
     }
 
     #[test]
