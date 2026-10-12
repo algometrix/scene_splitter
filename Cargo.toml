@@ -1,0 +1,25 @@
+[package]
+name = "scene_splitter"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+repository = "https://github.com/algometrix/scene_splitter"
+readme = "README.md"
+description = "Splits a video into scenes at stretches of black screen"
+
+[dependencies]
+anyhow = "1"
+eframe = "0.29"
+sha2 = "0.10"
+ureq = "2"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+rodio = { version = "0.20", default-features = false }
+trash = "5"
+
+[profile.release]
+lto = true
+codegen-units = 1

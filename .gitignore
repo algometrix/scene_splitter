@@ -1,0 +1,41 @@
+# Build output
+/target/
+*.old.exe
+*.pdb
+
+# Third-party design screenshots used as visual reference. Not ours to publish.
+/assets/design-ideas/
+
+# Local test videos and the scene files a split writes
+*.mp4
+*.mkv
+*.mov
+*.m4v
+*.avi
+*.webm
+*.wmv
+*.flv
+*.m2ts
+*.mpg
+*.mpeg
+
+# Editors
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+*.rs.bk
+
+# Local tool settings
+.claude/
+.env
+.env.*
+
+# OS clutter
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

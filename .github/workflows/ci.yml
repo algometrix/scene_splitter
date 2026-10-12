@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Lint and test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One system failing should not hide the result of the others.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sound output and the window need these headers to build on Linux.
+      # ffmpeg is for the end-to-end tests, which split a generated video.
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev ffmpeg
+
+      - name: Install ffmpeg on macOS
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg on Windows
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      # No display is needed: the window is driven with simulated input.
+      - name: Test, including the end-to-end tests that run ffmpeg
+        run: cargo test --release -- --include-ignored
