@@ -13,10 +13,10 @@ use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::black::TimeSpan;
 use crate::probe::VideoPacket;
-use crate::scan;
+use crate::scan::{self, FrameProgress, OnProgress, UndecodedFrames};
 use crate::scenes;
+use crate::timecode::TimeSpan;
 use crate::windows::FrameWindow;
 
 /// How many frames on each side a change is compared with.
@@ -86,15 +86,34 @@ pub struct HardCutCandidate {
     pub strength: u8,
 }
 
-/// Decodes every frame of the video and returns the abrupt changes in it.
+/// What decoding every frame of a video found.
+#[derive(Debug, PartialEq)]
+pub struct HardCutScan {
+    pub candidates: Vec<HardCutCandidate>,
+    pub undecoded: Vec<UndecodedFrames>,
+}
+
+/// Decodes every frame of the video and returns the abrupt changes in it,
+/// reporting progress as the share of the frames decoded so far.
 pub fn find_candidates(
     video: &Path,
     packets: &[VideoPacket],
     windows: &[FrameWindow],
-) -> Result<Vec<HardCutCandidate>> {
-    let changes = measure_frame_changes(video, packets, windows)?;
+    on_progress: OnProgress,
+) -> Result<HardCutScan> {
+    let measured = measure_frame_changes(video, packets, windows, on_progress)?;
     let frame_times: Vec<f64> = packets.iter().map(|packet| packet.time).collect();
-    Ok(abrupt_changes(&changes, &frame_times))
+    Ok(HardCutScan {
+        candidates: candidates_among(&measured.changes, &frame_times),
+        undecoded: measured.undecoded,
+    })
+}
+
+/// What decoding the whole video learned.
+struct FrameChanges {
+    /// For every frame, how much it differs from the frame before it.
+    changes: Vec<u8>,
+    undecoded: Vec<UndecodedFrames>,
 }
 
 /// What one window's decode learned.
@@ -104,6 +123,7 @@ struct WindowChanges {
     changes: Vec<u8>,
     first_thumbnail: Option<Vec<u8>>,
     last_thumbnail: Option<Vec<u8>>,
+    undecoded: Option<UndecodedFrames>,
 }
 
 /// Returns, for every frame, how much it differs from the frame before it.
@@ -112,11 +132,14 @@ fn measure_frame_changes(
     video: &Path,
     packets: &[VideoPacket],
     windows: &[FrameWindow],
-) -> Result<Vec<u8>> {
+    on_progress: OnProgress,
+) -> Result<FrameChanges> {
+    let progress = FrameProgress::new(windows.iter().map(FrameWindow::len).sum(), on_progress);
     let changes_per_window = windows
         .par_iter()
-        .map(|window| measure_window(video, packets, window))
+        .map(|window| measure_window(video, packets, window, &progress))
         .collect::<Result<Vec<_>>>()?;
+    progress.finish();
 
     let mut changes = vec![0u8; packets.len()];
     let mut last_thumbnail_before: Option<&Vec<u8>> = None;
@@ -129,32 +152,41 @@ fn measure_frame_changes(
         }
         last_thumbnail_before = measured.last_thumbnail.as_ref();
     }
-    Ok(changes)
+    let undecoded = changes_per_window
+        .iter()
+        .filter_map(|measured| measured.undecoded)
+        .collect();
+    Ok(FrameChanges { changes, undecoded })
 }
 
 fn measure_window(
     video: &Path,
     packets: &[VideoPacket],
     window: &FrameWindow,
+    progress: &FrameProgress,
 ) -> Result<WindowChanges> {
     let mut changes = Vec::with_capacity(window.len());
     let mut first_thumbnail = None;
     let mut previous: Option<Vec<u8>> = None;
-    scan::decode_thumbnails(video, packets, window, |thumbnail| match &mut previous {
-        Some(previous) => {
-            changes.push(mean_difference(previous, thumbnail));
-            previous.copy_from_slice(thumbnail);
+    let undecoded = scan::decode_thumbnails(video, packets, window, |thumbnail| {
+        match &mut previous {
+            Some(previous) => {
+                changes.push(mean_difference(previous, thumbnail));
+                previous.copy_from_slice(thumbnail);
+            }
+            None => {
+                changes.push(0);
+                first_thumbnail = Some(thumbnail.to_vec());
+                previous = Some(thumbnail.to_vec());
+            }
         }
-        None => {
-            changes.push(0);
-            first_thumbnail = Some(thumbnail.to_vec());
-            previous = Some(thumbnail.to_vec());
-        }
+        progress.frame_decoded();
     })?;
     Ok(WindowChanges {
         changes,
         first_thumbnail,
         last_thumbnail: previous,
+        undecoded,
     })
 }
 
@@ -172,7 +204,7 @@ fn mean_difference(one: &[u8], other: &[u8]) -> u8 {
 }
 
 /// The frames whose change stands far above that of the frames around them.
-fn abrupt_changes(changes: &[u8], frame_times: &[f64]) -> Vec<HardCutCandidate> {
+fn candidates_among(changes: &[u8], frame_times: &[f64]) -> Vec<HardCutCandidate> {
     changes
         .iter()
         .enumerate()
@@ -294,7 +326,7 @@ mod tests {
         let mut changes = vec![2u8; 40];
         changes[20] = 60;
         assert_eq!(
-            abrupt_changes(&changes, &times(40)),
+            candidates_among(&changes, &times(40)),
             vec![candidate(20.0, 60)]
         );
     }
@@ -302,14 +334,14 @@ mod tests {
     #[test]
     fn fast_action_that_changes_every_frame_is_not_a_cut() {
         let changes = vec![40u8; 40];
-        assert!(abrupt_changes(&changes, &times(40)).is_empty());
+        assert!(candidates_among(&changes, &times(40)).is_empty());
     }
 
     #[test]
     fn a_faint_change_is_ignored_even_in_still_footage() {
         let mut changes = vec![0u8; 40];
         changes[20] = WEAKEST_CANDIDATE - 1;
-        assert!(abrupt_changes(&changes, &times(40)).is_empty());
+        assert!(candidates_among(&changes, &times(40)).is_empty());
     }
 
     #[test]
@@ -317,7 +349,7 @@ mod tests {
         let mut changes = vec![1u8; 10];
         changes[0] = 80;
         changes[9] = 80;
-        let found = abrupt_changes(&changes, &times(10));
+        let found = candidates_among(&changes, &times(10));
         assert_eq!(found, vec![candidate(0.0, 80), candidate(9.0, 80)]);
     }
 
@@ -433,7 +465,7 @@ mod tests {
 
     #[test]
     fn a_video_with_no_frames_has_no_candidates() {
-        assert!(abrupt_changes(&[], &[]).is_empty());
+        assert!(candidates_among(&[], &[]).is_empty());
     }
 
     #[test]
@@ -472,7 +504,7 @@ mod tests {
     fn a_sharp_change_is_found_in_a_video_shorter_than_the_neighbourhood() {
         let changes = [1, 50, 1];
         assert_eq!(
-            abrupt_changes(&changes, &times(changes.len())),
+            candidates_among(&changes, &times(changes.len())),
             vec![candidate(1.0, 50)]
         );
     }
@@ -485,12 +517,12 @@ mod tests {
 
         changes[MIDDLE_FRAME] = SPIKE;
         assert_eq!(
-            abrupt_changes(&changes, &times(FRAME_COUNT)),
+            candidates_among(&changes, &times(FRAME_COUNT)),
             vec![candidate(MIDDLE_FRAME as f64, SPIKE)]
         );
 
         changes[MIDDLE_FRAME] = SPIKE - 1;
-        assert!(abrupt_changes(&changes, &times(FRAME_COUNT)).is_empty());
+        assert!(candidates_among(&changes, &times(FRAME_COUNT)).is_empty());
     }
 
     #[test]
@@ -498,7 +530,7 @@ mod tests {
         let mut changes = vec![0u8; FRAME_COUNT];
         changes[MIDDLE_FRAME] = WEAKEST_CANDIDATE;
         assert_eq!(
-            abrupt_changes(&changes, &times(FRAME_COUNT)),
+            candidates_among(&changes, &times(FRAME_COUNT)),
             vec![candidate(MIDDLE_FRAME as f64, WEAKEST_CANDIDATE)]
         );
     }
@@ -513,7 +545,7 @@ mod tests {
         changes[MIDDLE_FRAME + 1] = FLASH_CHANGE;
 
         assert_eq!(
-            abrupt_changes(&changes, &times(FRAME_COUNT)),
+            candidates_among(&changes, &times(FRAME_COUNT)),
             vec![
                 candidate(MIDDLE_FRAME as f64, FLASH_CHANGE),
                 candidate((MIDDLE_FRAME + 1) as f64, FLASH_CHANGE)

@@ -11,18 +11,23 @@ mod detect;
 #[cfg(test)]
 mod e2e_tests;
 mod export;
+mod ffmpeg;
 mod folders;
 mod hardcut;
+mod keyboard;
 mod library;
 mod plan;
 mod player;
 mod prescan;
 mod probe;
+mod queue;
 mod review;
+mod review_session;
 mod scan;
 mod scenes;
 mod selection;
 mod settings;
+mod settings_controls;
 mod split;
 #[cfg(test)]
 mod test_videos;
@@ -39,11 +44,11 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use black::TimeSpan;
-use detect::{ScanDepth, ScanMode};
+use detect::{ScanDepth, ScanKind, ScanMode};
 use export::OriginalPolicy;
+use scenes::CutTimes;
 use settings::Settings;
-use timecode::format_timestamp;
+use timecode::{format_timestamp, TimeSpan};
 
 /// How often the download of ffmpeg reports its progress on the console.
 const PROGRESS_STEP_PERCENT: u32 = 10;
@@ -121,7 +126,7 @@ fn main() -> Result<()> {
 
     let Some(path) = &arguments.video else {
         refuse_overrides_for_the_window(&arguments)?;
-        return app::run(loaded, None, ScanDepth::BlackScreens);
+        return app::run(loaded, None, ScanKind::BlackScreens);
     };
     if !path.exists() {
         bail!("{} does not exist", path.display());
@@ -139,7 +144,8 @@ fn main() -> Result<()> {
     // The window gets the tools itself, with a progress bar.
     if !arguments.scan_only && (arguments.review || path.is_dir()) {
         refuse_overrides_for_the_window(&arguments)?;
-        return app::run(loaded, Some(path.clone()), scan_depth(&arguments));
+        let first_scan = scan_kind(&arguments, &loaded.settings);
+        return app::run(loaded, Some(path.clone()), first_scan);
     }
     let settings = settings_for_this_run(loaded.settings, &arguments)?;
 
@@ -213,16 +219,28 @@ fn settings_for_this_run(mut settings: Settings, arguments: &Arguments) -> Resul
     Ok(settings)
 }
 
-fn scan_depth(arguments: &Arguments) -> ScanDepth {
+/// The scan the arguments ask for. A hard-cut scan thins its cuts with the
+/// saved settings.
+fn scan_kind(arguments: &Arguments, settings: &Settings) -> ScanKind {
     if arguments.hard_cuts {
-        ScanDepth::WithHardCuts
+        ScanKind::HardCuts(settings.hard_cuts)
     } else {
-        ScanDepth::BlackScreens
+        ScanKind::BlackScreens
     }
 }
 
+fn scan_depth(arguments: &Arguments, settings: &Settings) -> ScanDepth {
+    scan_kind(arguments, settings).depth()
+}
+
 fn scan_ahead(path: &Path, arguments: &Arguments, settings: &Settings) -> Result<()> {
-    let summary = prescan::scan_ahead(path, &settings.scan, scan_depth(arguments))?;
+    let depth = scan_depth(arguments, settings);
+    let summary = prescan::scan_ahead(path, &settings.scan, depth, |video_done| {
+        println!("{video_done}");
+        for stretch in &video_done.undecoded {
+            eprintln!("Warning: in {}, {stretch}", video_done.video.display());
+        }
+    })?;
     if summary.is_empty() {
         println!("No videos were found in {}.", path.display());
         return Ok(());
@@ -244,9 +262,27 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     };
 
     let started = Instant::now();
-    let detection = detect::detect_scene_changes(video, &settings.scan, scan_depth(arguments))?;
+    // A run from the command line shows no progress bar.
+    let scan = detect::scan_for_scene_changes(
+        video,
+        &settings.scan,
+        scan_depth(arguments, settings),
+        &detect::no_scan_progress,
+    )?;
     let detection_seconds = started.elapsed().as_secs_f64();
-    let cuts = detection.cuts_with_hard_cuts(&settings.hard_cuts);
+    for stretch in &scan.undecoded {
+        eprintln!("Warning: in {}, {stretch}", video.display());
+    }
+    let detection = scan.detection;
+    // Checked once, here, so that neither the listing nor the split can be
+    // handed a cut that is not inside the video.
+    let cuts = CutTimes::inside(
+        detection.video,
+        detection.cuts_for(scan_kind(arguments, settings)),
+    )
+    .map_err(|outside| {
+        anyhow::anyhow!("the scan of {} made no sense: {outside}", video.display())
+    })?;
 
     println!(
         "Decoded {} of {} frames in {} windows.",
@@ -255,12 +291,12 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     print_black_screens(&detection.black_screens);
     if let Some(candidates) = &detection.hard_cut_candidates {
         println!(
-            "Abrupt picture changes: {}, of which {} became cuts.",
+            "Sudden picture changes: {}, of which {} became cuts.",
             candidates.len(),
             cuts.len() - detection.cuts.len()
         );
     }
-    print_scenes(&scenes::scenes_between(&cuts, detection.video));
+    print_scenes(&cuts.scenes());
     println!("Detection took {detection_seconds:.2}s.");
 
     if arguments.list_only {

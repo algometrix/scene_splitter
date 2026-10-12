@@ -3,6 +3,8 @@
 //! numbers. Colours and shared building blocks live here so every screen
 //! draws from the same set.
 
+use std::time::Duration;
+
 use eframe::egui;
 use egui::{Color32, FontFamily, FontId, RichText};
 
@@ -21,6 +23,15 @@ pub const DANGER: Color32 = Color32::from_rgb(0xC8, 0x32, 0x3F);
 pub const WARNING_TEXT: Color32 = Color32::from_rgb(0xC2, 0x41, 0x0C);
 /// The outline of buttons and boxes, visible against the page and cards.
 const CONTROL_OUTLINE: Color32 = Color32::from_rgb(0xC3, 0xC7, 0xD9);
+
+/// How dark the page goes behind a dialog that has to be answered first.
+const BACKDROP: Color32 = Color32::from_rgba_premultiplied(14, 16, 25, 110);
+/// The part of a progress bar that is still to do.
+const PROGRESS_TRACK: Color32 = CONTROL_OUTLINE;
+/// How long a "Copy details" button says that it has copied.
+const COPIED_NOTE_SECONDS: f64 = 2.0;
+pub const COPY_DETAILS_LABEL: &str = "Copy details";
+const COPIED_LABEL: &str = "Copied";
 
 pub const TEXT: Color32 = Color32::from_rgb(0x1F, 0x23, 0x37);
 /// Grey, but dark enough to read at caption size on every background used
@@ -344,6 +355,74 @@ pub fn primary_button(text: impl Into<String>) -> egui::Button<'static> {
         .min_size(egui::vec2(0.0, PRIMARY_BUTTON_HEIGHT))
 }
 
+/// Text the person may want to take elsewhere, such as the reason for an
+/// error. It can be selected with the mouse, unlike the rest of the app's
+/// text.
+pub fn selectable(text: RichText) -> egui::Label {
+    egui::Label::new(text).selectable(true).wrap()
+}
+
+/// A button that puts `details` on the clipboard, whole, however little of
+/// it is in view. It says so for a moment afterwards.
+pub fn copy_details_button(ui: &mut egui::Ui, details: &str) -> egui::Response {
+    let copied_at_id = ui.auto_id_with("details_copied_at");
+    let now = ui.input(|input| input.time);
+    let copied_at: Option<f64> = ui.data(|data| data.get_temp(copied_at_id));
+    let just_copied = copied_at.is_some_and(|copied_at| now - copied_at < COPIED_NOTE_SECONDS);
+    let label = if just_copied {
+        COPIED_LABEL
+    } else {
+        COPY_DETAILS_LABEL
+    };
+
+    let button = ui
+        .button(label)
+        .on_hover_text("Puts the whole text on the clipboard, so you can paste it somewhere.");
+    if button.clicked() {
+        ui.ctx().copy_text(details.to_owned());
+        ui.data_mut(|data| data.insert_temp(copied_at_id, now));
+        // Nothing else redraws the window when the note is due to go away.
+        ui.ctx()
+            .request_repaint_after(Duration::from_secs_f64(COPIED_NOTE_SECONDS));
+    }
+    button
+}
+
+/// A bar as wide as the room there is, filled as far as `fraction` of the
+/// way. It draws its own track, so it shows on a white card too.
+pub fn progress_bar(ui: &mut egui::Ui, fraction: f32, height: f32) -> egui::Response {
+    let size = egui::vec2(ui.available_width(), height);
+    let (track, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let rounding = height / 2.0;
+    let painter = ui.painter();
+    painter.rect_filled(track, rounding, PROGRESS_TRACK);
+
+    let done_width = track.width() * fraction.clamp(0.0, 1.0);
+    if done_width > 0.0 {
+        // Never narrower than it is high, or its round ends would not fit.
+        let width = done_width.max(height).min(track.width());
+        let done = egui::Rect::from_min_size(track.min, egui::vec2(width, height));
+        painter.rect_filled(done, rounding, ACCENT);
+    }
+    response
+}
+
+/// Dims everything drawn below `order` behind a dialog, and takes the clicks
+/// meant for it. Returns true when the person clicked the dimmed part, which
+/// closes the dialog like a click beside any menu does.
+pub fn show_backdrop(ctx: &egui::Context, id: &'static str, order: egui::Order) -> bool {
+    egui::Area::new(egui::Id::new(id))
+        .order(order)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.screen_rect();
+            let response = ui.allocate_rect(screen, egui::Sense::click());
+            ui.painter().rect_filled(screen, 0.0, BACKDROP);
+            response.clicked()
+        })
+        .inner
+}
+
 pub fn scene_color(scene: usize) -> Color32 {
     SCENE_COLORS[scene % SCENE_COLORS.len()]
 }
@@ -426,6 +505,9 @@ mod tests {
                 ui.label(semibold("3", 22.0));
                 stat_tile(ui, "3", "scenes", MINT_TILE, TEXT);
                 let _ = ui.add(primary_button("Split"));
+                let _ = progress_bar(ui, 0.4, 8.0);
+                let _ = copy_details_button(ui, "the reason");
+                let _ = ui.add(selectable(muted("the reason")));
             });
         });
     }

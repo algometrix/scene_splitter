@@ -45,7 +45,7 @@ pub fn suspicious_windows(packets: &[VideoPacket], min_black_seconds: f64) -> Ve
         packets[later.start].time - packets[earlier.end - 1].time <= MAX_GAP_INSIDE_STRETCH_SECONDS
     });
 
-    // Half the duration, because the frames at either edge of a black screen
+    // Half the shortest black screen, because the frames at either edge of one
     // can be larger transition frames that the tiny run does not cover.
     let padded = stretches
         .into_iter()

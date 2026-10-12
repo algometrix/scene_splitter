@@ -8,7 +8,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 
+use crate::ffmpeg::{self, Program, TimeLimit, ToolCommand};
 use crate::folders;
 
 pub const FFMPEG_VERSION: &str = "6.1.1";
@@ -31,25 +32,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_CHUNK_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Program {
-    Ffmpeg,
-    Ffprobe,
-}
-
-impl Program {
-    /// The name to run when the program is on the PATH.
-    fn command_name(self) -> &'static str {
-        match self {
-            Self::Ffmpeg => "ffmpeg",
-            Self::Ffprobe => "ffprobe",
-        }
-    }
-
-    fn file_name(self) -> String {
-        format!("{}{}", self.command_name(), std::env::consts::EXE_SUFFIX)
-    }
-}
+/// Printing a version needs no video and no decoding, so a program that
+/// takes longer than this to do it is not one that works.
+const STARTUP_CHECK_LIMIT: TimeLimit = TimeLimit::WholeRun(Duration::from_secs(10));
 
 /// One gzipped program to fetch, and what it must hash to.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -156,25 +141,28 @@ struct Tools {
 
 static TOOLS: OnceLock<Tools> = OnceLock::new();
 
-/// A command that runs ffmpeg. Before the tools have been located this runs
-/// whatever `ffmpeg` is on the PATH.
-pub fn ffmpeg_command() -> Command {
-    let program = TOOLS
-        .get()
-        .map_or(Path::new(Program::Ffmpeg.command_name()), |tools| {
-            &tools.ffmpeg
-        });
-    Command::new(program)
+/// A run of ffmpeg or ffprobe that ends by itself, with a time limit.
+/// Before the tools have been located this runs whatever is on the PATH.
+pub fn command(program: Program) -> ToolCommand {
+    ToolCommand::at(program, located(program))
 }
 
-/// A command that runs ffprobe, found the same way as ffmpeg.
-pub fn ffprobe_command() -> Command {
-    let program = TOOLS
-        .get()
-        .map_or(Path::new(Program::Ffprobe.command_name()), |tools| {
-            &tools.ffprobe
-        });
-    Command::new(program)
+/// A bare command that runs ffmpeg, for the player. Its decoders run for as
+/// long as a video plays, so it starts and stops them itself.
+pub fn ffmpeg_command() -> Command {
+    let mut command = Command::new(located(Program::Ffmpeg));
+    ffmpeg::hide_console_window(&mut command);
+    command
+}
+
+fn located(program: Program) -> PathBuf {
+    let Some(tools) = TOOLS.get() else {
+        return PathBuf::from(program.command_name());
+    };
+    match program {
+        Program::Ffmpeg => tools.ffmpeg.clone(),
+        Program::Ffprobe => tools.ffprobe.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -201,10 +189,9 @@ pub fn find_installed() -> Availability {
         ffmpeg: PathBuf::from(Program::Ffmpeg.command_name()),
         ffprobe: PathBuf::from(Program::Ffprobe.command_name()),
     };
-    let found = own_copy
-        .into_iter()
-        .chain([on_the_path])
-        .find(|tools| runs(&tools.ffmpeg) && runs(&tools.ffprobe));
+    let found = own_copy.into_iter().chain([on_the_path]).find(|tools| {
+        runs(Program::Ffmpeg, &tools.ffmpeg) && runs(Program::Ffprobe, &tools.ffprobe)
+    });
     match found {
         Some(tools) => {
             remember(tools);
@@ -220,14 +207,11 @@ fn remember(tools: Tools) {
     let _ = TOOLS.set(tools);
 }
 
-fn runs(program: &Path) -> bool {
-    Command::new(program)
+fn runs(program: Program, path: &Path) -> bool {
+    ToolCommand::at(program, path)
         .arg("-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .run(STARTUP_CHECK_LIMIT)
+        .is_ok()
 }
 
 /// The app keeps its copy of the programs with its other per-user data.

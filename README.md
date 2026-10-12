@@ -26,7 +26,7 @@ cargo run --release
 2. Review the proposed scenes. Drag one scene card onto another to merge them.
 3. Press "Split into N files".
 
-By default the original video moves to the Recycle Bin or Trash once the scene files pass verification. Untick that option on the review screen to keep it.
+By default the original video moves to the Recycle Bin or Trash once the scene files pass verification. The first time a split would do that, the app explains it and asks. Untick that option on the review screen to keep the original.
 
 ## Contents
 
@@ -86,21 +86,28 @@ You can also run it through Cargo: `cargo run --release -- <arguments>`.
 ## Using the window
 
 1. Drop videos or a folder onto the window. Or press "Add videos" in the left panel (Ctrl+O) to choose videos or a folder with the system's file picker, or to paste a path. A folder queues every video directly inside it. Subfolders are not searched, and scene files from an earlier split are left out.
-2. The app scans the queued videos in the background, one at a time. The queue on the left shows the state of each video.
-3. When a scan finishes, the video is ready for review. Each scene is a colour-coded card with preview pictures. A timeline above the cards shows the whole video with one block per scene. Click a block to jump to that scene's card. A scene longer than 45 minutes is marked in red, as a hint that a scene change may have been missed.
+2. The app scans the queued videos in the background, one at a time. The queue on the left shows the state of each video. The video being scanned shows a progress bar with a percentage, in the queue and on its own page.
+3. When a scan finishes, the video is ready for review. Each scene is a colour-coded card with preview pictures. A timeline above the cards shows the whole video with one block per scene. Point at a block to see the scene's number and times, and click it to jump to that scene's card. A block shows its scene number, and the scene's length, when there is room for them. A scene longer than 45 minutes is marked in red, as a hint that a scene change may have been missed.
 4. Edit the scenes:
    - Drag a scene card onto another to merge them and everything between. The small "Join scenes N and N+1" button between two cards merges just those two.
    - Click, Ctrl-click or Shift-click cards to select several, then press M or "Merge selected". A selection with gaps merges the scenes between as well.
    - "Undo merge" takes the selected merged scenes apart again. Inside a merged scene, "Separate here" restores a single split, and "Move out to its own scene" takes one part out of it.
+   - A merged scene with more than 6 parts shows its first two and last two. "Show all N parts" shows the rest, and "Show fewer parts" hides them again. The app remembers this for each scene while the review is open.
    - "Add a split at" takes a time such as `1:03:12`. The split lands on the nearest point where the video can be cut (a keyframe).
    - Undo takes back the last change. "Reset scenes" returns to the scenes as found.
 5. If the video has scene changes with no black screen, press "Scenes missed?" under the toolbar. Choose how much to detect (only obvious changes, most changes, or even subtle changes) and the shortest scene to allow, then press "Look for sudden picture changes". This scan looks at every picture and is much slower.
-6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
+6. Under the video's name, choose whether the original is moved to the Recycle Bin or Trash and whether the scenes go in a new folder. Then press "Split into N files". The first time a split would move an original to the Recycle Bin or Trash, the app says what will happen and that it only happens if the new files pass the check. Choose "Move it to the Recycle Bin" (or Trash), "Keep the original", or cancel. The app remembers that you answered and does not ask again. If scene files from an earlier split are in the way, the app asks before it replaces them. "Skip this video" writes nothing, and a skipped video can be taken up again.
 7. When the split is done, the app shows whether the check passed and what happened to the original. "Open folder" shows the scene files.
+
+When something goes wrong, the app says so in plain words and shows the technical reason under it. You can select that text, and "Copy details" puts all of it on the clipboard.
+
+If the scan could not read a stretch of the video, a note above the scenes says where, because a scene change there may have been missed.
 
 The first time, a "How to use this screen" card sits above the scenes with three tips. "Hide tips" removes it, and Settings or "Show tips" brings it back. A scan or rescan asks first if it would throw away merges or splits you made.
 
-The window can be made as small as 900 by 600. Below the name and the toolbar, everything scrolls with the scenes.
+The window can be made as small as 900 by 600. Below the name and the toolbar, everything scrolls with the scenes. Only the scene cards in view are drawn, to keep a long list of scenes quick to scroll.
+
+On a high-resolution screen the preview pictures and the player's picture are decoded larger, so they stay sharp.
 
 Scene files are named `<video name>_scene_001`, `_scene_002` and so on, with the extension of the original.
 
@@ -116,11 +123,11 @@ On macOS, use Cmd where this page says Ctrl.
 | Ctrl+O | Add videos |
 | Ctrl+A | Select every scene |
 | Ctrl+Z | Undo the last change |
-| Esc | Clear the selection |
+| Esc | Clear the selection (when the player is open, it closes the player first) |
 
 ### The player
 
-Click a preview picture to play the video from that moment. A line on the timeline shows where the player is. The player starts muted, and asks before it turns the sound on.
+Click a preview picture to play the video from that moment. A line on the timeline shows where the player is. The player starts muted, and asks before it turns the sound on. The question appears in front of the player with the rest of the window dimmed. Esc, or a click outside it, keeps the sound off and leaves the player open.
 
 | Key or control | Action |
 | --- | --- |
@@ -132,7 +139,7 @@ Click a preview picture to play the video from that moment. A line on the timeli
 | Position slider | Jump to any moment |
 | 1x, 2x, 4x buttons | Playback speed |
 | Mute box | Sound off or on |
-| Esc | Close the player |
+| Esc | Close the player, or cancel the question about sound |
 
 A split made in the player lands on the nearest point where the video can be cut (a keyframe). Once you pause, the player says how far that point is from the picture you are on. Skipping or dragging the slider while paused stays paused. The player sizes itself to fit the window.
 
@@ -197,7 +204,9 @@ The Settings section is at the bottom of the left panel. It holds:
 - Whether the tips are shown on the review screen.
 - For missed scenes: how much to detect, and the shortest scene to allow.
 - Under "Advanced: what counts as a black screen": the shortest black screen, how dark counts as black, how much of the picture must be black, and "Check every picture", the slow scan for grainy black screens.
-- "Restore default settings".
+- "Restore default settings". This leaves your choice about originals as it is, and does not bring back the one-time question about the Recycle Bin or Trash.
+
+If the settings could not be loaded or saved, the reason is shown at the top of the section, with "Copy details".
 
 The app saves settings as you change them, to `scene_splitter/settings.json` in the settings folder (see [Where files are kept](#where-files-are-kept)). Changed detection settings apply to videos scanned from then on. The window and the command line share the file.
 
@@ -250,6 +259,8 @@ Inside each, the app uses a `scene_splitter` folder:
 **Hard cuts.** The hard-cut scan decodes every frame and compares it with the frame before. A hard cut is a single frame that differs sharply from its predecessor while its neighbours barely change. Films cut between camera angles every few seconds, so the app keeps the strongest changes and drops the rest until every scene is at least as long as the shortest scene you set.
 
 **Keyframe cuts.** The split copies the compressed streams, and a copy can only start a file on a keyframe, because every other frame depends on the frames before it. Each cut goes on the keyframe nearest to its black screen. A keyframe inside the black screen gives a clean cut. Otherwise the cut lands slightly before or after it, and one scene keeps a moment of its neighbour.
+
+**Nothing half-written.** The split writes the scenes into a folder named `unfinished_` and a number, inside the folder they go to. Only when every scene is there does it move them to their names and remove that folder. A split that fails or stalls leaves no partial scene files, and leaves the scene files of an earlier split as they were. In the window, a video whose split failed offers "Back to review", which brings back the scenes as you left them, and "Try again", which scans it afresh.
 
 **Verification before recycling.** After the split, the app checks three things:
 

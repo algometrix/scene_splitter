@@ -7,6 +7,7 @@
 //! pause on every jump.
 
 use std::io::Read;
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,18 +15,24 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use eframe::egui;
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 
+use crate::keyboard::{self, KeyboardOwner};
+use crate::plan::SceneIndex;
+use crate::review_session::SplitFeedback;
 use crate::theme;
-use crate::timecode::format_timestamp;
+use crate::thumbnails::{self, DecoderThreads, PictureSize};
+use crate::timecode::{format_clock, format_timestamp, TimeSpan};
 use crate::tools;
 
-const FRAME_WIDTH: usize = 640;
-const FRAME_HEIGHT: usize = 360;
-const FRAME_BYTES: usize = FRAME_WIDTH * FRAME_HEIGHT * 3;
+/// How wide the picture is decoded, in pixels. The narrowest is enough for
+/// a screen of ordinary sharpness. On a sharper screen the picture is
+/// decoded larger, up to the widest: beyond that, decoding and showing
+/// thirty pictures a second costs more than the sharpness is worth.
+const FRAME_WIDTHS: RangeInclusive<usize> = 640..=1280;
 /// Pictures shown per second of watching, whatever the playback speed.
 const FRAMES_PER_SECOND: f64 = 30.0;
 
@@ -42,11 +49,27 @@ const AUDIO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 pub const SKIP_SECONDS: f64 = 10.0;
 /// The picture is drawn as large as the window allows, between these widths.
 const MIN_PICTURE_WIDTH: f32 = 320.0;
-const MAX_PICTURE_WIDTH: f32 = FRAME_WIDTH as f32;
-const PICTURE_ASPECT: f32 = FRAME_HEIGHT as f32 / FRAME_WIDTH as f32;
+const MAX_PICTURE_WIDTH: f32 = 640.0;
+const PICTURE_ASPECT: f32 = 9.0 / 16.0;
 /// Room the player's title, slider and controls need around the picture.
 const PLAYER_CHROME_WIDTH: f32 = 48.0;
 const PLAYER_CHROME_HEIGHT: f32 = 340.0;
+/// The bar under the picture that shows the scenes and the place in the
+/// video. It is the only place the scenes can be seen in a small window,
+/// where the player covers the timeline of the review screen.
+const SCENE_BAR_HEIGHT: f32 = 26.0;
+const SCENE_BAR_BLOCK_HEIGHT: f32 = 14.0;
+const SCENE_BAR_CURRENT_BLOCK_HEIGHT: f32 = 22.0;
+const SCENE_BAR_GAP: f32 = 2.0;
+const SCENE_BAR_ROUNDING: f32 = 4.0;
+const SCENE_BAR_HANDLE_RADIUS: f32 = 7.0;
+/// How strongly the scenes that are not playing are faded on the bar.
+const OTHER_SCENE_OPACITY: f32 = 0.45;
+/// The frame around the picture, in the colour of the scene on screen.
+const PICTURE_FRAME_WIDTH: f32 = 4.0;
+/// How long the picture says which scene has just begun.
+const SCENE_NOTICE_SECONDS: f64 = 2.5;
+const SCENE_NOTICE_MARGIN: f32 = 12.0;
 /// How far from the corner of the window the player first appears.
 const PLAYER_CORNER_GAP: f32 = 16.0;
 /// On a touchpad, which scrolls smoothly, this much scrolling steps one frame.
@@ -111,6 +134,8 @@ struct PlaybackState {
 struct Playback {
     started_at: f64,
     speed: PlaybackSpeed,
+    /// The size its pictures are decoded at.
+    frame_size: PictureSize,
     state: Arc<PlaybackState>,
     picture_process: Child,
     /// Absent when the sound decoder could not be started.
@@ -123,18 +148,19 @@ impl Playback {
         position: f64,
         speed: PlaybackSpeed,
         sound: Sound,
+        frame_size: PictureSize,
         ctx: &egui::Context,
     ) -> Result<Self> {
         let state = Arc::new(PlaybackState::default());
 
-        let mut picture_process = spawn_picture_decoder(video, position, speed)?;
+        let mut picture_process = spawn_picture_decoder(video, position, speed, frame_size)?;
         let frames = picture_process
             .stdout
             .take()
             .context("ffmpeg has no picture pipe")?;
         let picture_state = Arc::clone(&state);
         let ctx = ctx.clone();
-        std::thread::spawn(move || show_frames_on_time(frames, &picture_state, &ctx));
+        std::thread::spawn(move || show_frames_on_time(frames, frame_size, &picture_state, &ctx));
 
         // A video without sound, or a machine without a sound card, still
         // plays its pictures.
@@ -153,6 +179,7 @@ impl Playback {
         Ok(Self {
             started_at: position,
             speed,
+            frame_size,
             state,
             picture_process,
             sound_process,
@@ -183,12 +210,16 @@ fn position_after(started_at: f64, frames_shown: u64, speed: PlaybackSpeed) -> f
     started_at + frames_shown as f64 / FRAMES_PER_SECOND * speed.factor()
 }
 
-fn spawn_picture_decoder(video: &Path, position: f64, speed: PlaybackSpeed) -> Result<Child> {
+fn spawn_picture_decoder(
+    video: &Path,
+    position: f64,
+    speed: PlaybackSpeed,
+    frame_size: PictureSize,
+) -> Result<Child> {
     let filter = format!(
-        "setpts=PTS/{},fps={FRAMES_PER_SECOND},\
-         scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease,\
-         pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2",
-        speed.factor()
+        "setpts=PTS/{},fps={FRAMES_PER_SECOND},{}",
+        speed.factor(),
+        frame_size.letterbox_filter()
     );
     tools::ffmpeg_command()
         .args(["-nostdin", "-v", "error"])
@@ -224,8 +255,13 @@ fn spawn_sound_decoder(video: &Path, position: f64, speed: PlaybackSpeed) -> Res
 /// Hands each decoded picture to the window at its moment. ffmpeg decodes
 /// faster than real time and simply waits whenever this thread is not
 /// reading.
-fn show_frames_on_time(mut frames: ChildStdout, state: &PlaybackState, ctx: &egui::Context) {
-    let mut frame = vec![0u8; FRAME_BYTES];
+fn show_frames_on_time(
+    mut frames: ChildStdout,
+    frame_size: PictureSize,
+    state: &PlaybackState,
+    ctx: &egui::Context,
+) {
+    let mut frame = vec![0u8; frame_size.rgb_bytes()];
     let mut first_frame_at = None;
     let mut frames_shown = 0u64;
     // The read fails when the video ends or when the decoder is stopped.
@@ -289,30 +325,19 @@ fn play_sound(mut samples: ChildStdout, state: &PlaybackState) {
     }
 }
 
-/// Decodes the one picture shown at `position`, at the player's size.
-fn grab_still(video: &Path, position: f64) -> Result<Vec<u8>> {
-    let filter = format!(
-        "scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=decrease,\
-         pad={FRAME_WIDTH}:{FRAME_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
-    );
-    let output = tools::ffmpeg_command()
-        .args(["-nostdin", "-v", "error"])
-        .args(["-ss", &format!("{position:.6}")])
-        .arg("-i")
-        .arg(video)
-        .args(["-map", "0:v:0", "-frames:v", "1", "-vf", &filter])
-        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
-        .stdin(Stdio::null())
-        .output()
-        .context("could not start ffmpeg, is it on PATH?")?;
-    if !output.status.success() || output.stdout.len() != FRAME_BYTES {
-        bail!(
-            "ffmpeg returned {} bytes instead of a picture at {position:.3}s: {}",
-            output.stdout.len(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(output.stdout)
+/// Decodes the one picture shown at `position`, at `frame_size`. Only one
+/// is grabbed at a time, so ffmpeg may use every core for it.
+fn grab_still(video: &Path, position: f64, frame_size: PictureSize) -> Result<Vec<u8>> {
+    thumbnails::grab_frame(video, position, frame_size, DecoderThreads::Automatic)
+        .with_context(|| format!("could not get the picture at {position:.3}s"))
+}
+
+/// The size to decode the player's picture at on a screen that puts
+/// `pixels_per_point` pixels in every point. It goes by the largest the
+/// picture is ever drawn and not by its size right now, so resizing the
+/// window never restarts the decoder.
+fn frame_size_for(pixels_per_point: f32) -> PictureSize {
+    thumbnails::pixel_size_for(MAX_PICTURE_WIDTH, pixels_per_point, FRAME_WIDTHS)
 }
 
 /// How many frames one turn of the wheel moves. Scrolling down, a negative
@@ -375,7 +400,7 @@ pub enum PlayerEvent {
 
 pub struct Player {
     video: Arc<Path>,
-    video_length: f64,
+    video_end: f64,
     speed: PlaybackSpeed,
     sound: Sound,
     state: PlayState,
@@ -388,8 +413,11 @@ pub struct Player {
     close_requested: bool,
     /// True while the "turn the sound on?" question is on screen.
     asking_to_turn_sound_on: bool,
-    /// What the last split did, as told by the review screen.
-    split_feedback: String,
+    /// What the last split asked for here did, once one was.
+    split_feedback: Option<SplitFeedback>,
+    /// Why the picture at the place the person stepped to could not be
+    /// shown, until a picture can be shown again.
+    still_problem: Option<String>,
     /// How long one frame of the video lasts, the size of one wheel step.
     frame_seconds: f64,
     stills_sender: Sender<Still>,
@@ -403,28 +431,57 @@ pub struct Player {
     still_wanted_next: Option<f64>,
     /// Smooth scrolling that has not yet added up to a whole frame.
     scroll_points_left_over: f32,
-    /// How large the picture is drawn in this window.
+    /// How large the picture is drawn in this window, in points.
     picture_size: egui::Vec2,
+    /// How large the picture is decoded, in pixels, for this screen.
+    frame_size: PictureSize,
+    /// The scene the position was in when the player was last drawn.
+    scene_on_screen: Option<SceneIndex>,
+    /// The scene that has just begun, said over the picture until the time
+    /// given (in the clock of the window).
+    scene_notice: Option<SceneNotice>,
+}
+
+/// "Scene 3" written over the picture for a moment after the video moves
+/// into another scene.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SceneNotice {
+    scene: SceneIndex,
+    shown_until: f64,
 }
 
 /// One paused picture, grabbed after stepping to a frame.
 struct Still {
     request: u64,
+    size: PictureSize,
     picture: Result<Vec<u8>>,
 }
 
 impl Player {
     pub fn play_from(
         video: Arc<Path>,
-        video_length: f64,
+        video_end: f64,
+        frame_seconds: f64,
+        position: f64,
+        ctx: &egui::Context,
+    ) -> Self {
+        let mut player = Self::paused_at(video, video_end, frame_seconds, position, ctx);
+        player.play_at(position, ctx);
+        player
+    }
+
+    /// A player that shows nothing yet and has started no decoder.
+    pub(crate) fn paused_at(
+        video: Arc<Path>,
+        video_end: f64,
         frame_seconds: f64,
         position: f64,
         ctx: &egui::Context,
     ) -> Self {
         let (stills_sender, stills) = mpsc::channel();
-        let mut player = Self {
+        Self {
             video,
-            video_length,
+            video_end,
             speed: PlaybackSpeed::Normal,
             // Sound starts off, so opening the player never blares.
             sound: Sound::Muted,
@@ -434,7 +491,8 @@ impl Player {
             split_requested: false,
             close_requested: false,
             asking_to_turn_sound_on: false,
-            split_feedback: String::new(),
+            split_feedback: None,
+            still_problem: None,
             frame_seconds,
             stills_sender,
             stills,
@@ -443,9 +501,10 @@ impl Player {
             still_wanted_next: None,
             scroll_points_left_over: 0.0,
             picture_size: picture_size_for(ctx.screen_rect().size()),
-        };
-        player.play_at(position, ctx);
-        player
+            frame_size: frame_size_for(ctx.pixels_per_point()),
+            scene_on_screen: None,
+            scene_notice: None,
+        }
     }
 
     pub fn position(&self) -> f64 {
@@ -454,20 +513,28 @@ impl Player {
             PlayState::Paused { position } => *position,
             PlayState::Failed(_) => 0.0,
         };
-        position.clamp(0.0, self.video_length)
+        position.clamp(0.0, self.video_end)
     }
 
     /// Jumps to `position`, playing from there. Also used to restart
     /// playback after a speed change.
     pub fn play_at(&mut self, position: f64, ctx: &egui::Context) {
-        let position = position.clamp(0.0, self.video_length);
+        let position = position.clamp(0.0, self.video_end);
         // A still that is on its way must not replace the moving picture.
         self.still_request += 1;
         self.still_wanted_next = None;
         // The old decoders are stopped before new ones start, so two sound
         // tracks never play over each other.
         self.state = PlayState::Paused { position };
-        self.state = match Playback::start(&self.video, position, self.speed, self.sound, ctx) {
+        let started = Playback::start(
+            &self.video,
+            position,
+            self.speed,
+            self.sound,
+            self.frame_size,
+            ctx,
+        );
+        self.state = match started {
             Ok(playback) => PlayState::Playing(playback),
             Err(error) => PlayState::Failed(format!("{error:#}")),
         };
@@ -491,7 +558,7 @@ impl Player {
 
     /// Stops at `position` and shows the picture there.
     fn pause_at(&mut self, position: f64, ctx: &egui::Context) {
-        let position = position.clamp(0.0, self.video_length);
+        let position = position.clamp(0.0, self.video_end);
         self.state = PlayState::Paused { position };
 
         // One picture is grabbed at a time. Turning the wheel quickly would
@@ -508,13 +575,18 @@ impl Player {
         self.still_being_grabbed = true;
         self.still_request += 1;
         let request = self.still_request;
+        let size = self.frame_size;
         let video = Arc::clone(&self.video);
         let stills_sender = self.stills_sender.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let picture = grab_still(&video, position);
+            let still = Still {
+                request,
+                size,
+                picture: grab_still(&video, position, size),
+            };
             // The send only fails once the player is closed.
-            if stills_sender.send(Still { request, picture }).is_ok() {
+            if stills_sender.send(still).is_ok() {
                 ctx.request_repaint();
             }
         });
@@ -538,14 +610,24 @@ impl Player {
         self.seek(self.position() + seconds, ctx);
     }
 
-    fn ask_before_turning_sound_on(&mut self, ctx: &egui::Context) {
+    /// Asks in front of the player, in the middle of it, with everything
+    /// else dimmed and out of reach until the person has answered. A click
+    /// on the dimmed part, like Escape, means no.
+    fn ask_before_turning_sound_on(&mut self, ctx: &egui::Context, player_window: egui::Rect) {
         if !self.asking_to_turn_sound_on {
             return;
         }
-        egui::Window::new("Turn the sound on?")
+        // The player is a floating window, so the dimming has to go on a
+        // layer above floating windows to cover it.
+        let clicked_outside =
+            theme::show_backdrop(ctx, "sound_question_backdrop", egui::Order::Foreground);
+        let question = egui::Window::new("Turn the sound on?")
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .fixed_pos(player_window.center())
+            .constrain_to(ctx.screen_rect())
             .show(ctx, |ui| {
                 ui.label("The video's sound will play through your speakers.");
                 ui.horizontal(|ui| {
@@ -558,6 +640,14 @@ impl Player {
                     }
                 });
             });
+        // The dimming shares its layer order with the question. A click on
+        // it would otherwise bring it to the front, over the question.
+        if let Some(question) = question {
+            ctx.move_to_top(question.response.layer_id);
+        }
+        if clicked_outside {
+            self.asking_to_turn_sound_on = false;
+        }
     }
 
     fn set_sound(&mut self, sound: Sound, ctx: &egui::Context) {
@@ -577,15 +667,23 @@ impl Player {
         }
     }
 
-    /// Draws the player window and handles its buttons and keys.
+    /// Draws the player window and handles its buttons. Its keys are taken
+    /// by `take_keys`, which the app calls earlier in the frame.
     ///
     /// `split_would_land_at` is the keyframe a split at the current position
     /// would be cut on, if a split is possible there.
-    pub fn show(&mut self, ctx: &egui::Context, split_would_land_at: Option<f64>) -> PlayerEvent {
+    /// `scenes` are the scenes of the video as the review has them now, in
+    /// order. The player shows which one is on screen.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        scenes: &[TimeSpan],
+        split_would_land_at: Option<f64>,
+    ) -> PlayerEvent {
         self.take_newest_frame(ctx);
         self.take_newest_still(ctx);
         self.pause_at_the_end();
-        self.handle_keys(ctx);
+        self.decode_for_the_sharpness_of_the_screen(ctx);
 
         // The window can be resized under the player, and the player must
         // still fit inside it with its controls in reach.
@@ -593,7 +691,7 @@ impl Player {
         self.picture_size = picture_size_for(screen.size());
 
         let mut open = true;
-        egui::Window::new("Player")
+        let player_window = egui::Window::new("Player")
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
@@ -603,14 +701,17 @@ impl Player {
             .default_pos(screen.right_bottom() - egui::vec2(PLAYER_CORNER_GAP, PLAYER_CORNER_GAP))
             .constrain_to(screen)
             .show(ctx, |ui| {
-                let pointer_over_picture = self.show_picture(ui);
+                let scene = scene_at(scenes, self.position());
+                self.notice_a_new_scene(scene, ui.ctx());
+                let pointer_over_picture = self.show_picture(ui, scene);
                 if pointer_over_picture {
                     self.step_frames_with_the_wheel(ui.ctx());
                 }
-                self.show_position_slider(ui);
-                self.show_controls(ui, split_would_land_at);
-            });
-        self.ask_before_turning_sound_on(ctx);
+                self.show_scene_bar(ui, scenes, scene);
+                self.show_controls(ui, scenes, scene, split_would_land_at);
+            })
+            .map_or(screen, |shown| shown.response.rect);
+        self.ask_before_turning_sound_on(ctx, player_window);
         if !open || self.close_requested {
             return PlayerEvent::Closed;
         }
@@ -621,8 +722,8 @@ impl Player {
     }
 
     /// Shows the outcome of a split in the player window.
-    pub fn show_split_feedback(&mut self, feedback: String) {
-        self.split_feedback = feedback;
+    pub fn show_split_feedback(&mut self, feedback: SplitFeedback) {
+        self.split_feedback = Some(feedback);
     }
 
     fn take_newest_frame(&mut self, ctx: &egui::Context) {
@@ -635,8 +736,23 @@ impl Player {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        let size = playback.frame_size;
         if let Some(frame) = newest_frame {
-            self.set_picture(ctx, &frame);
+            self.set_picture(ctx, size, &frame);
+        }
+    }
+
+    /// Moving the window to a sharper or coarser screen, or zooming, changes
+    /// how many pixels the picture covers. The picture is then decoded
+    /// afresh at the size that suits, from where the video is.
+    fn decode_for_the_sharpness_of_the_screen(&mut self, ctx: &egui::Context) {
+        let wanted = frame_size_for(ctx.pixels_per_point());
+        if wanted == self.frame_size {
+            return;
+        }
+        self.frame_size = wanted;
+        if !matches!(self.state, PlayState::Failed(_)) {
+            self.seek(self.position(), ctx);
         }
     }
 
@@ -648,8 +764,8 @@ impl Player {
                 continue;
             }
             match still.picture {
-                Ok(frame) => self.set_picture(ctx, &frame),
-                Err(error) => eprintln!("Could not show the frame: {error:#}"),
+                Ok(frame) => self.set_picture(ctx, still.size, &frame),
+                Err(error) => self.still_problem = Some(format!("{error:#}")),
             }
         }
         if !self.still_being_grabbed {
@@ -682,8 +798,10 @@ impl Player {
         }
     }
 
-    fn set_picture(&mut self, ctx: &egui::Context, frame: &[u8]) {
-        let image = egui::ColorImage::from_rgb([FRAME_WIDTH, FRAME_HEIGHT], frame);
+    fn set_picture(&mut self, ctx: &egui::Context, size: PictureSize, frame: &[u8]) {
+        // The picture on screen is that of the place the video is at again.
+        self.still_problem = None;
+        let image = egui::ColorImage::from_rgb([size.width, size.height], frame);
         match &mut self.picture {
             Some(picture) => picture.set(image, egui::TextureOptions::LINEAR),
             None => {
@@ -701,12 +819,28 @@ impl Player {
         }
     }
 
-    fn handle_keys(&mut self, ctx: &egui::Context) {
-        // Keys typed into a text box belong to the text box.
-        if ctx.wants_keyboard_input() {
+    /// Acts on the keys pressed in this frame that are the player's.
+    ///
+    /// The app calls this before it draws the review screen, which is behind
+    /// the player. Escape closes the innermost thing that is open, so the
+    /// player has to take it before the review screen can read it as "clear
+    /// the selection".
+    pub fn take_keys(&mut self, ctx: &egui::Context, keyboard: KeyboardOwner) {
+        if !keyboard.lets_screens_use_keys(ctx) {
             return;
         }
-        let (back, forward, pause, split, escape) = ctx.input(|input| {
+        if self.asking_to_turn_sound_on {
+            // The question is answered before anything else is done with
+            // the player. Escape says no to it, and the player stays open.
+            if keyboard::take_escape(ctx) {
+                self.asking_to_turn_sound_on = false;
+            }
+            return;
+        }
+        if keyboard::take_escape(ctx) {
+            self.close_requested = true;
+        }
+        let (back, forward, pause, split) = ctx.input(|input| {
             // With Ctrl held a letter is a shortcut of the review screen,
             // such as "select all", and not the player's.
             let plain_key = |key| input.key_pressed(key) && !input.modifiers.command;
@@ -715,17 +849,8 @@ impl Player {
                 input.key_pressed(egui::Key::ArrowRight) || plain_key(egui::Key::D),
                 input.key_pressed(egui::Key::Space),
                 plain_key(egui::Key::S),
-                input.key_pressed(egui::Key::Escape),
             )
         });
-        if escape {
-            // Escape backs out of the innermost thing that is open.
-            if self.asking_to_turn_sound_on {
-                self.asking_to_turn_sound_on = false;
-            } else {
-                self.close_requested = true;
-            }
-        }
         if split {
             self.split_requested = true;
         }
@@ -740,8 +865,32 @@ impl Player {
         }
     }
 
+    /// Remembers that the video has moved into another scene, so that the
+    /// picture can say so for a moment. Opening the player is not a move.
+    fn notice_a_new_scene(&mut self, scene: Option<SceneIndex>, ctx: &egui::Context) {
+        let now = ctx.input(|input| input.time);
+        if let (Some(before), Some(scene)) = (self.scene_on_screen, scene) {
+            if before != scene {
+                self.scene_notice = Some(SceneNotice {
+                    scene,
+                    shown_until: now + SCENE_NOTICE_SECONDS,
+                });
+            }
+        }
+        self.scene_on_screen = scene;
+
+        match self.scene_notice {
+            Some(notice) if notice.shown_until > now => {
+                // A paused player draws nothing by itself, and the notice
+                // still has to go away.
+                ctx.request_repaint_after(Duration::from_secs_f64(notice.shown_until - now));
+            }
+            _ => self.scene_notice = None,
+        }
+    }
+
     /// Draws the picture and returns whether the pointer is over it.
-    fn show_picture(&self, ui: &mut egui::Ui) -> bool {
+    fn show_picture(&self, ui: &mut egui::Ui, scene: Option<SceneIndex>) -> bool {
         let size = self.picture_size;
         let response = match (&self.state, &self.picture) {
             (PlayState::Failed(reason), _) => {
@@ -762,25 +911,110 @@ impl Player {
                 response
             }
         };
+        if let Some(scene) = scene {
+            // The frame changes colour the moment the scene does, which is
+            // seen without reading anything.
+            let frame =
+                egui::Stroke::new(PICTURE_FRAME_WIDTH, theme::scene_color(scene.position()));
+            ui.painter()
+                .rect_stroke(response.rect.shrink(PICTURE_FRAME_WIDTH / 2.0), 0.0, frame);
+        }
+        if let Some(notice) = self.scene_notice {
+            show_scene_notice(ui, response.rect, notice.scene);
+        }
         response.contains_pointer()
     }
 
-    fn show_position_slider(&mut self, ui: &mut egui::Ui) {
-        let mut position = self.scrubbing_to.unwrap_or_else(|| self.position());
-        ui.spacing_mut().slider_width = self.picture_size.x;
-        let slider =
-            ui.add(egui::Slider::new(&mut position, 0.0..=self.video_length).show_value(false));
-        if slider.dragged() {
+    /// The scenes of the video as coloured blocks, with the place in the
+    /// video marked. Clicking or dragging on it moves there.
+    fn show_scene_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        scenes: &[TimeSpan],
+        scene: Option<SceneIndex>,
+    ) {
+        let size = egui::vec2(self.picture_size.x, SCENE_BAR_HEIGHT);
+        let (bar, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+        // The handle is a circle, and half of it must not hang over the end.
+        let track = bar.shrink2(egui::vec2(SCENE_BAR_HANDLE_RADIUS, 0.0));
+        let video_end = self.video_end;
+        let x_at = |time: f64| track.left() + track.width() * share_of_video(time, video_end);
+
+        let painter = ui.painter();
+        if scenes.is_empty() {
+            let block = egui::Rect::from_center_size(
+                track.center(),
+                egui::vec2(track.width(), SCENE_BAR_BLOCK_HEIGHT),
+            );
+            painter.rect_filled(block, SCENE_BAR_ROUNDING, theme::MUTED_TEXT);
+        }
+        for (position, span) in scenes.iter().enumerate() {
+            let is_on_screen = scene == Some(SceneIndex::new(position));
+            let height = if is_on_screen {
+                SCENE_BAR_CURRENT_BLOCK_HEIGHT
+            } else {
+                SCENE_BAR_BLOCK_HEIGHT
+            };
+            let left = x_at(span.start);
+            let right = (x_at(span.end) - SCENE_BAR_GAP).max(left + 1.0);
+            let block = egui::Rect::from_min_max(
+                egui::pos2(left, track.center().y - height / 2.0),
+                egui::pos2(right, track.center().y + height / 2.0),
+            );
+            let colour = theme::scene_color(position);
+            let fill = if is_on_screen {
+                colour
+            } else {
+                colour.gamma_multiply(OTHER_SCENE_OPACITY)
+            };
+            painter.rect_filled(block, SCENE_BAR_ROUNDING, fill);
+        }
+
+        let position = self.scrubbing_to.unwrap_or_else(|| self.position());
+        let handle = egui::pos2(x_at(position), track.center().y);
+        painter.circle(
+            handle,
+            SCENE_BAR_HANDLE_RADIUS,
+            egui::Color32::WHITE,
+            egui::Stroke::new(2.0_f32, theme::TEXT),
+        );
+
+        let pointed_time = response
+            .interact_pointer_pos()
+            .or(response.hover_pos())
+            .map(|pointer| {
+                let share = (pointer.x - track.left()) / track.width().max(1.0);
+                f64::from(share.clamp(0.0, 1.0)) * video_end
+            });
+        if let (true, Some(time)) = (response.dragged(), pointed_time) {
             // Hold the handle where the person has it. Restarting playback
             // on every pixel of the drag would stutter.
-            self.scrubbing_to = Some(position);
-        } else if slider.drag_stopped() || slider.changed() {
-            self.scrubbing_to = None;
-            self.seek(position, ui.ctx());
+            self.scrubbing_to = Some(time);
+        } else if let Some(time) = self.scrubbing_to.take() {
+            self.seek(time, ui.ctx());
+        } else if let (true, Some(time)) = (response.clicked(), pointed_time) {
+            self.seek(time, ui.ctx());
+        }
+        if let Some(time) = pointed_time {
+            let place = match scene_at(scenes, time) {
+                Some(pointed_scene) => {
+                    format!("Scene {}, {}", pointed_scene.number(), format_clock(time))
+                }
+                None => format_clock(time),
+            };
+            response
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text_at_pointer(place);
         }
     }
 
-    fn show_controls(&mut self, ui: &mut egui::Ui, split_would_land_at: Option<f64>) {
+    fn show_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        scenes: &[TimeSpan],
+        scene: Option<SceneIndex>,
+        split_would_land_at: Option<f64>,
+    ) {
         ui.set_max_width(self.picture_size.x);
         let paused = !matches!(self.state, PlayState::Playing(_));
         ui.horizontal_wrapped(|ui| {
@@ -855,14 +1089,44 @@ impl Player {
             if split_button.clicked() {
                 self.split_requested = true;
             }
+            if let Some((scene, span)) =
+                scene.and_then(|scene| Some((scene, *scenes.get(scene.position())?)))
+            {
+                theme::pill(
+                    ui,
+                    theme::semibold(scene_name(scene, scenes.len()), 14.0)
+                        .color(egui::Color32::WHITE),
+                    theme::scene_color(scene.position()),
+                )
+                .on_hover_text(scene_times(span));
+            }
+            // The place is exact, for finding a picture. The length is only
+            // for orientation, and short enough that the row does not wrap.
             ui.label(format!(
                 "{} / {}",
                 format_timestamp(self.position()),
-                format_timestamp(self.video_length)
+                format_clock(self.video_end)
             ));
         });
-        if !self.split_feedback.is_empty() {
-            ui.add(egui::Label::new(&self.split_feedback).wrap());
+        if let Some(feedback) = &self.split_feedback {
+            // A split that was not made is said in the colour of a warning,
+            // so it is not taken for one that was.
+            let words = egui::RichText::new(feedback.in_words());
+            let words = if feedback.is_refusal() {
+                words.color(theme::WARNING_TEXT)
+            } else {
+                words
+            };
+            ui.add(egui::Label::new(words).wrap());
+        }
+        if let Some(problem) = &self.still_problem {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    theme::DANGER,
+                    "The picture at this place could not be shown.",
+                );
+                theme::copy_details_button(ui, problem);
+            });
         }
         // While playing the answer would change many times a second, so it
         // is shown once the person has stopped on a picture.
@@ -884,6 +1148,59 @@ impl Player {
     }
 }
 
+/// The scene that `position` of the video is in. A scene owns its first
+/// moment and not its last, so the moment of a cut belongs to the scene
+/// that begins there. The very end of the video is still the last scene.
+fn scene_at(scenes: &[TimeSpan], position: f64) -> Option<SceneIndex> {
+    let scenes_begun = scenes
+        .iter()
+        .take_while(|scene| scene.start <= position)
+        .count();
+    match scenes_begun {
+        // Before the first scene only by a rounding error, if at all.
+        0 if scenes.is_empty() => None,
+        0 => Some(SceneIndex::new(0)),
+        begun => Some(SceneIndex::new(begun - 1)),
+    }
+}
+
+/// How far along the video `time` is, from 0 at the start to 1 at the end.
+fn share_of_video(time: f64, video_end: f64) -> f32 {
+    // A video of a single frame has no length to take a share of.
+    (time / video_end.max(f64::MIN_POSITIVE)).clamp(0.0, 1.0) as f32
+}
+
+fn scene_name(scene: SceneIndex, scene_count: usize) -> String {
+    format!("Scene {} of {scene_count}", scene.number())
+}
+
+fn scene_times(scene: TimeSpan) -> String {
+    format!(
+        "This scene runs from {} to {}.",
+        format_clock(scene.start),
+        format_clock(scene.end)
+    )
+}
+
+/// Writes the scene that has just begun over the top of the picture, large
+/// enough to be seen while watching the video and not the controls.
+fn show_scene_notice(ui: &egui::Ui, picture: egui::Rect, scene: SceneIndex) {
+    let painter = ui.painter();
+    let text = painter.layout_no_wrap(
+        format!("Scene {}", scene.number()),
+        egui::FontId::proportional(22.0),
+        egui::Color32::WHITE,
+    );
+    let padding = egui::vec2(14.0, 6.0);
+    let label = egui::Rect::from_min_size(
+        picture.left_top() + egui::vec2(SCENE_NOTICE_MARGIN, SCENE_NOTICE_MARGIN),
+        text.size() + padding * 2.0,
+    );
+    painter.rect_filled(label, 8.0, theme::scene_color(scene.position()));
+    painter.rect_stroke(label, 8.0, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
+    painter.galley(label.min + padding, text, egui::Color32::WHITE);
+}
+
 /// How large to draw the picture so that the whole player fits a window of
 /// `screen` size.
 fn picture_size_for(screen: egui::Vec2) -> egui::Vec2 {
@@ -901,6 +1218,228 @@ fn picture_size_for(screen: egui::Vec2) -> egui::Vec2 {
 mod tests {
     use super::*;
     use crate::test_videos::TestVideo;
+
+    /// The picture as it is decoded for a screen of ordinary sharpness.
+    const ORDINARY_FRAME: PictureSize = PictureSize {
+        width: 640,
+        height: 360,
+    };
+
+    #[test]
+    fn on_an_ordinary_screen_the_picture_is_decoded_as_large_as_it_is_drawn() {
+        assert_eq!(frame_size_for(1.0), ORDINARY_FRAME);
+    }
+
+    #[test]
+    fn on_a_sharp_screen_the_picture_is_decoded_larger() {
+        assert_eq!(
+            frame_size_for(1.5),
+            PictureSize {
+                width: 960,
+                height: 540
+            }
+        );
+        assert_eq!(
+            frame_size_for(2.0),
+            PictureSize {
+                width: 1280,
+                height: 720
+            }
+        );
+    }
+
+    #[test]
+    fn the_picture_is_never_decoded_larger_than_the_widest_frame() {
+        assert_eq!(frame_size_for(3.0).width, *FRAME_WIDTHS.end());
+    }
+
+    /// A player on a video that does not exist, paused, with no decoder
+    /// started, driven with simulated keys.
+    struct PausedPlayer {
+        ctx: egui::Context,
+        player: Player,
+        keyboard: KeyboardOwner,
+    }
+
+    impl PausedPlayer {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let video: Arc<Path> = Arc::from(Path::new("no_such_video.mp4"));
+            let player = Player::paused_at(video, 100.0, 0.04, 10.0, &ctx);
+            Self {
+                ctx,
+                player,
+                keyboard: KeyboardOwner::Screens,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> PlayerEvent {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut event = PlayerEvent::StillOpen;
+            let _ = self.ctx.run(input, |ctx| {
+                self.player.take_keys(ctx, self.keyboard);
+                event = self.player.show(ctx, &three_scenes(), None);
+            });
+            event
+        }
+
+        fn press(&mut self, key: egui::Key) -> PlayerEvent {
+            self.frame(vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }])
+        }
+    }
+
+    #[test]
+    fn escape_cancels_the_sound_question_and_leaves_the_player_open() {
+        let mut paused = PausedPlayer::new();
+        paused.player.asking_to_turn_sound_on = true;
+
+        assert_eq!(paused.press(egui::Key::Escape), PlayerEvent::StillOpen);
+        assert!(!paused.player.asking_to_turn_sound_on);
+        assert_eq!(paused.player.sound, Sound::Muted);
+
+        // With no question open, Escape closes the player as before.
+        assert_eq!(paused.press(egui::Key::Escape), PlayerEvent::Closed);
+    }
+
+    #[test]
+    fn the_player_keys_wait_while_the_sound_question_is_open() {
+        let mut paused = PausedPlayer::new();
+        paused.player.asking_to_turn_sound_on = true;
+
+        assert_eq!(paused.press(egui::Key::S), PlayerEvent::StillOpen);
+        assert!(paused.player.asking_to_turn_sound_on);
+
+        paused.player.asking_to_turn_sound_on = false;
+        assert_eq!(
+            paused.press(egui::Key::S),
+            PlayerEvent::SplitRequested(10.0)
+        );
+    }
+
+    #[test]
+    fn the_player_leaves_every_key_alone_behind_a_dialog() {
+        let mut paused = PausedPlayer::new();
+        paused.keyboard = KeyboardOwner::Dialog;
+
+        assert_eq!(paused.press(egui::Key::S), PlayerEvent::StillOpen);
+        assert_eq!(paused.press(egui::Key::Escape), PlayerEvent::StillOpen);
+        assert_eq!(paused.press(egui::Key::ArrowRight), PlayerEvent::StillOpen);
+        assert_eq!(paused.player.position(), 10.0);
+    }
+
+    #[test]
+    fn the_escape_that_closes_the_player_is_not_left_for_what_is_behind_it() {
+        let mut paused = PausedPlayer::new();
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let input = egui::RawInput {
+            events: vec![escape],
+            ..Default::default()
+        };
+        let mut left_for_the_review_screen = true;
+        let _ = paused.ctx.run(input, |ctx| {
+            paused.player.take_keys(ctx, KeyboardOwner::Screens);
+            left_for_the_review_screen = keyboard::take_escape(ctx);
+        });
+
+        assert!(paused.player.close_requested);
+        assert!(!left_for_the_review_screen);
+    }
+
+    #[test]
+    fn a_picture_that_cannot_be_shown_is_said_until_one_can() {
+        let mut paused = PausedPlayer::new();
+        paused.player.still_request = 1;
+        paused
+            .player
+            .stills_sender
+            .send(Still {
+                request: 1,
+                size: ORDINARY_FRAME,
+                picture: Err(anyhow::anyhow!("the decoder gave no picture")),
+            })
+            .unwrap();
+        paused.frame(Vec::new());
+        assert_eq!(
+            paused.player.still_problem.as_deref(),
+            Some("the decoder gave no picture")
+        );
+
+        let black_picture = vec![0u8; ORDINARY_FRAME.rgb_bytes()];
+        paused
+            .player
+            .stills_sender
+            .send(Still {
+                request: 1,
+                size: ORDINARY_FRAME,
+                picture: Ok(black_picture),
+            })
+            .unwrap();
+        paused.frame(Vec::new());
+        assert_eq!(paused.player.still_problem, None);
+    }
+
+    #[test]
+    fn the_outcome_of_a_split_is_kept_to_be_shown() {
+        let mut paused = PausedPlayer::new();
+        assert_eq!(paused.player.split_feedback, None);
+
+        paused
+            .player
+            .show_split_feedback(SplitFeedback::Added(12.0));
+        paused.frame(Vec::new());
+        assert_eq!(
+            paused.player.split_feedback,
+            Some(SplitFeedback::Added(12.0))
+        );
+    }
+
+    #[test]
+    fn the_sound_question_is_drawn_in_front_of_the_player() {
+        let mut paused = PausedPlayer::new();
+        paused.player.asking_to_turn_sound_on = true;
+        // Areas take their place in the first frame they are drawn.
+        paused.frame(Vec::new());
+        paused.frame(Vec::new());
+
+        let ctx = &paused.ctx;
+        let question =
+            egui::LayerId::new(egui::Order::Foreground, egui::Id::new("Turn the sound on?"));
+        let backdrop = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("sound_question_backdrop"),
+        );
+        let topmost = ctx.memory(|memory| memory.areas().top_layer_id(egui::Order::Foreground));
+        assert_eq!(topmost, Some(question));
+        // The dimming covers the whole window, so it takes every click that
+        // misses the question: in an empty corner, and on the player, which
+        // sits in the bottom right corner.
+        assert_eq!(ctx.layer_id_at(egui::pos2(2.0, 2.0)), Some(backdrop));
+        let on_the_player = egui::pos2(
+            900.0 - 2.0 * PLAYER_CORNER_GAP,
+            600.0 - 2.0 * PLAYER_CORNER_GAP,
+        );
+        assert_eq!(ctx.layer_id_at(on_the_player), Some(backdrop));
+    }
 
     #[test]
     fn position_advances_one_second_per_thirty_frames_at_normal_speed() {
@@ -940,6 +1479,7 @@ mod tests {
             START,
             PlaybackSpeed::Double,
             Sound::Muted,
+            ORDINARY_FRAME,
             &egui::Context::default(),
         )
         .unwrap();
@@ -961,7 +1501,65 @@ mod tests {
         assert!((1.0..=3.0).contains(&covered), "covered {covered} seconds");
 
         let newest_frame = playback.state.newest_frame.lock().unwrap().take();
-        assert_eq!(newest_frame.map(|frame| frame.len()), Some(FRAME_BYTES));
+        assert_eq!(
+            newest_frame.map(|frame| frame.len()),
+            Some(ORDINARY_FRAME.rgb_bytes())
+        );
+    }
+
+    fn three_scenes() -> Vec<TimeSpan> {
+        [(0.0, 160.0), (160.0, 288.0), (288.0, 533.0)]
+            .into_iter()
+            .map(|(start, end)| TimeSpan { start, end })
+            .collect()
+    }
+
+    #[test]
+    fn a_position_is_in_the_scene_that_holds_it() {
+        let scenes = three_scenes();
+        assert_eq!(scene_at(&scenes, 0.0), Some(SceneIndex::new(0)));
+        assert_eq!(scene_at(&scenes, 159.9), Some(SceneIndex::new(0)));
+        assert_eq!(scene_at(&scenes, 200.0), Some(SceneIndex::new(1)));
+        assert_eq!(scene_at(&scenes, 400.0), Some(SceneIndex::new(2)));
+    }
+
+    #[test]
+    fn the_moment_of_a_cut_belongs_to_the_scene_that_begins_there() {
+        assert_eq!(scene_at(&three_scenes(), 160.0), Some(SceneIndex::new(1)));
+    }
+
+    #[test]
+    fn the_end_of_the_video_is_still_the_last_scene() {
+        let scenes = three_scenes();
+        assert_eq!(scene_at(&scenes, 533.0), Some(SceneIndex::new(2)));
+        assert_eq!(scene_at(&scenes, 540.0), Some(SceneIndex::new(2)));
+    }
+
+    #[test]
+    fn a_position_before_the_first_scene_counts_as_the_first() {
+        let scenes = [TimeSpan {
+            start: 0.04,
+            end: 10.0,
+        }];
+        assert_eq!(scene_at(&scenes, 0.0), Some(SceneIndex::new(0)));
+    }
+
+    #[test]
+    fn a_video_with_no_scenes_has_no_scene_on_screen() {
+        assert_eq!(scene_at(&[], 5.0), None);
+    }
+
+    #[test]
+    fn the_share_of_the_video_stays_between_nothing_and_all() {
+        assert_eq!(share_of_video(50.0, 200.0), 0.25);
+        assert_eq!(share_of_video(-1.0, 200.0), 0.0);
+        assert_eq!(share_of_video(300.0, 200.0), 1.0);
+        assert_eq!(share_of_video(0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_scene_is_named_with_how_many_there_are() {
+        assert_eq!(scene_name(SceneIndex::new(1), 4), "Scene 2 of 4");
     }
 
     #[test]
@@ -1025,9 +1623,9 @@ mod tests {
         let video = TestVideo::two_scenes_with_a_black_screen("still");
         let one_frame_later = 1.0 + crate::test_videos::FRAME_SECONDS;
 
-        let first = grab_still(&video.path, 1.0).unwrap();
-        let next = grab_still(&video.path, one_frame_later).unwrap();
-        assert_eq!(first.len(), FRAME_BYTES);
+        let first = grab_still(&video.path, 1.0, ORDINARY_FRAME).unwrap();
+        let next = grab_still(&video.path, one_frame_later, ORDINARY_FRAME).unwrap();
+        assert_eq!(first.len(), ORDINARY_FRAME.rgb_bytes());
         assert_ne!(first, next, "stepping one frame should change the picture");
     }
 

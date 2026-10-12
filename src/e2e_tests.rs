@@ -5,15 +5,19 @@
 //! the PATH. Run them with `cargo test --release -- --include-ignored`.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use crate::black::{BlackCriteria, TimeSpan};
-use crate::detect::{self, Detection, ScanDepth, ScanMode, ScanSettings};
+use crate::black::BlackCriteria;
+use crate::detect::{self, Detection, ScanDepth, ScanMode, ScanProgress, ScanSettings, ScanStage};
 use crate::export::{self, OriginalOutcome, OriginalPolicy, Verification};
+use crate::ffmpeg::FfmpegError;
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::probe;
+use crate::scenes::CutTimes;
 use crate::split;
 use crate::test_videos::{TestVideo, BLACK_SECONDS, FRAME_RATE, FRAME_SECONDS, SCENE_SECONDS};
 use crate::thumbnails::{self, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH};
+use crate::timecode::TimeSpan;
 use crate::verify;
 
 const BYTES_PER_RGB_PIXEL: usize = 3;
@@ -29,7 +33,14 @@ fn scan_settings(mode: ScanMode) -> ScanSettings {
 }
 
 fn scan(video: &TestVideo, mode: ScanMode, depth: ScanDepth) -> Detection {
-    detect::detect_scene_changes(&video.path, &scan_settings(mode), depth).unwrap()
+    detect::scan_for_scene_changes(
+        &video.path,
+        &scan_settings(mode),
+        depth,
+        &detect::no_scan_progress,
+    )
+    .unwrap()
+    .detection
 }
 
 /// Timestamps come back from the container rounded, so they are compared
@@ -50,7 +61,21 @@ fn assert_one_black_screen_between_the_scenes(black_screens: &[TimeSpan]) {
 /// Splits the video at its black screen and returns the scene files.
 fn split_at_the_black_screen(video: &TestVideo) -> Vec<PathBuf> {
     let detection = scan(video, ScanMode::EveryFrame, ScanDepth::BlackScreens);
-    split::split_at_keyframes(&video.path, &detection.cuts, video.folder()).unwrap()
+    split::split_at_keyframes(&video.path, &detected_cuts(&detection), video.folder()).unwrap()
+}
+
+/// The black-screen cuts of a scan, as what a split takes.
+fn detected_cuts(detection: &Detection) -> CutTimes {
+    CutTimes::inside(detection.video, detection.cuts.clone()).unwrap()
+}
+
+/// Cuts at the given times of the test video with a black screen.
+fn cuts_at(times: &[f64]) -> CutTimes {
+    let whole_video = TimeSpan {
+        start: 0.0,
+        end: 2.0 * SCENE_SECONDS + BLACK_SECONDS,
+    };
+    CutTimes::inside(whole_video, times.to_vec()).unwrap()
 }
 
 #[test]
@@ -135,6 +160,109 @@ fn the_hard_cut_scan_finds_the_change_of_scene() {
     assert_close(cuts[0], SCENE_SECONDS);
 }
 
+/// Scans the video and returns every progress report in the order given.
+fn progress_of_a_scan(video: &TestVideo, depth: ScanDepth) -> Vec<ScanProgress> {
+    let reports = Mutex::new(Vec::new());
+    detect::scan_for_scene_changes(
+        &video.path,
+        &scan_settings(ScanMode::EveryFrame),
+        depth,
+        &|progress| reports.lock().unwrap().push(progress),
+    )
+    .unwrap();
+    reports.into_inner().unwrap()
+}
+
+fn largest_fraction(reports: &[ScanProgress], stage: ScanStage) -> f32 {
+    reports
+        .iter()
+        .filter(|progress| progress.stage == stage)
+        .map(|progress| progress.fraction)
+        .fold(0.0, f32::max)
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_scan_for_black_screens_reports_progress_up_to_the_end() {
+    let video = TestVideo::two_scenes_with_a_black_screen("progress");
+    let reports = progress_of_a_scan(&video, ScanDepth::BlackScreens);
+
+    assert!(reports.len() > 10, "{} reports", reports.len());
+    assert!(reports
+        .iter()
+        .all(|progress| progress.stage == ScanStage::BlackScreens
+            && (0.0..=1.0).contains(&progress.fraction)));
+    assert_eq!(largest_fraction(&reports, ScanStage::BlackScreens), 1.0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_hard_cut_scan_reports_progress_through_both_stages() {
+    let video = TestVideo::two_scenes_with_a_hard_cut("progress_two_stages");
+    let reports = progress_of_a_scan(&video, ScanDepth::WithHardCuts);
+
+    // Both stages decode every frame here, so each is half of the scan.
+    assert_eq!(largest_fraction(&reports, ScanStage::BlackScreens), 0.5);
+    assert_eq!(largest_fraction(&reports, ScanStage::HardCuts), 1.0);
+    let first_of_the_second_stage = reports
+        .iter()
+        .find(|progress| progress.stage == ScanStage::HardCuts)
+        .unwrap();
+    assert!(first_of_the_second_stage.fraction > 0.5);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_healthy_video_has_no_stretches_that_could_not_be_decoded() {
+    let video = TestVideo::two_scenes_with_a_hard_cut("nothing_undecoded");
+    let outcome = detect::scan_for_scene_changes(
+        &video.path,
+        &scan_settings(ScanMode::EveryFrame),
+        ScanDepth::WithHardCuts,
+        &detect::no_scan_progress,
+    )
+    .unwrap();
+    assert!(outcome.undecoded.is_empty(), "{:?}", outcome.undecoded);
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_file_that_is_not_a_video_fails_with_what_ffprobe_said() {
+    let video = TestVideo::two_scenes_with_a_black_screen("not_a_video");
+    let not_a_video = video.folder().join("notes.mp4");
+    std::fs::write(&not_a_video, b"these are not pictures").unwrap();
+
+    let error = probe::read_packet_index(&not_a_video).unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<FfmpegError>(),
+            Some(FfmpegError::Failed { stderr_tail, .. }) if !stderr_tail.is_empty()
+        ),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("notes.mp4"), "{error:#}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_picture_past_the_end_of_the_video_is_not_understood() {
+    let video = TestVideo::two_scenes_with_a_black_screen("past_the_end");
+    let past_the_end = 10.0 * (2.0 * SCENE_SECONDS + BLACK_SECONDS);
+
+    let Err(error) =
+        thumbnails::grab_thumbnail(&video.path, past_the_end, thumbnails::SMALLEST_THUMBNAIL)
+    else {
+        panic!("a picture was returned from past the end of the video");
+    };
+    assert!(
+        matches!(
+            error.downcast_ref::<FfmpegError>(),
+            Some(FfmpegError::OutputNotUnderstood { .. })
+        ),
+        "{error:#}"
+    );
+}
+
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
 fn splitting_writes_one_file_per_scene_and_they_pass_verification() {
@@ -143,7 +271,7 @@ fn splitting_writes_one_file_per_scene_and_they_pass_verification() {
 
     let report = export::export_scenes(
         &video.path,
-        &detection.cuts,
+        &detected_cuts(&detection),
         video.folder(),
         OriginalPolicy::Keep,
     )
@@ -215,9 +343,9 @@ fn splitting_again_into_fewer_scenes_leaves_no_old_files_behind() {
 
     // One second into the first scene, then again with a single cut later:
     // the first split writes three files, the second only two.
-    split::split_at_keyframes(&video.path, &[1.0, BLACK_START], video.folder()).unwrap();
+    split::split_at_keyframes(&video.path, &cuts_at(&[1.0, BLACK_START]), video.folder()).unwrap();
     let scene_files =
-        split::split_at_keyframes(&video.path, &[BLACK_START], video.folder()).unwrap();
+        split::split_at_keyframes(&video.path, &cuts_at(&[BLACK_START]), video.folder()).unwrap();
 
     let found = split::scene_files_from_earlier_splits(&video.path, video.folder()).unwrap();
     assert_eq!(found, scene_files);
@@ -226,9 +354,76 @@ fn splitting_again_into_fewer_scenes_leaves_no_old_files_behind() {
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
+fn a_video_with_a_percent_sign_in_its_name_is_split() {
+    let video = TestVideo::two_scenes_with_a_black_screen("percent_sign");
+    // ffmpeg reads the name it is given for the scene files as a pattern,
+    // in which a percent sign means something.
+    let named_with_percent = video.folder().join("100% fun.mp4");
+    std::fs::copy(&video.path, &named_with_percent).unwrap();
+
+    let scene_files = split::split_at_keyframes(
+        &named_with_percent,
+        &cuts_at(&[BLACK_START]),
+        video.folder(),
+    )
+    .unwrap();
+    assert_eq!(
+        scene_files,
+        vec![
+            video.folder().join("100% fun_scene_001.mp4"),
+            video.folder().join("100% fun_scene_002.mp4"),
+        ]
+    );
+    assert!(verify::verify_scenes(&named_with_percent, &scene_files).is_ok());
+    assert_no_folder_is_left_in(video.folder());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_split_that_fails_leaves_the_scenes_of_an_earlier_split_as_they_were() {
+    let video = TestVideo::two_scenes_with_a_black_screen("failed_split");
+    let earlier_scenes = split_at_the_black_screen(&video);
+    let earlier_bytes: Vec<Vec<u8>> = earlier_scenes
+        .iter()
+        .map(|scene| std::fs::read(scene).unwrap())
+        .collect();
+
+    // The video is replaced by something ffmpeg cannot read, so the next
+    // split of it fails.
+    std::fs::write(&video.path, b"this is not a video").unwrap();
+    let error = split::split_at_keyframes(&video.path, &cuts_at(&[1.0, 2.0, 3.0]), video.folder())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("could not split"),
+        "{error:#}"
+    );
+
+    let scenes_now = split::scene_files_from_earlier_splits(&video.path, video.folder()).unwrap();
+    assert_eq!(scenes_now, earlier_scenes);
+    for (scene, bytes) in earlier_scenes.iter().zip(&earlier_bytes) {
+        assert_eq!(&std::fs::read(scene).unwrap(), bytes, "{}", scene.display());
+    }
+    // Nothing half-written stays behind, in a folder or otherwise.
+    assert_no_folder_is_left_in(video.folder());
+}
+
+/// The folder scenes are written into before they get their names is gone
+/// once a split is over, however it ended.
+fn assert_no_folder_is_left_in(folder: &std::path::Path) {
+    let folders_left: Vec<PathBuf> = std::fs::read_dir(folder)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert!(folders_left.is_empty(), "{folders_left:?}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
 fn a_preview_picture_can_be_grabbed() {
     let video = TestVideo::two_scenes_with_a_black_screen("preview");
-    let thumbnail = thumbnails::grab_thumbnail(&video.path, 2.0).unwrap();
+    let thumbnail =
+        thumbnails::grab_thumbnail(&video.path, 2.0, thumbnails::SMALLEST_THUMBNAIL).unwrap();
 
     assert_eq!(
         thumbnail.rgb.len(),
@@ -242,8 +437,12 @@ fn a_preview_picture_can_be_grabbed() {
 #[ignore = "needs ffmpeg on the PATH"]
 fn a_preview_inside_the_black_screen_is_dark() {
     let video = TestVideo::two_scenes_with_a_black_screen("dark_preview");
-    let thumbnail =
-        thumbnails::grab_thumbnail(&video.path, BLACK_START + BLACK_SECONDS / 2.0).unwrap();
+    let thumbnail = thumbnails::grab_thumbnail(
+        &video.path,
+        BLACK_START + BLACK_SECONDS / 2.0,
+        thumbnails::SMALLEST_THUMBNAIL,
+    )
+    .unwrap();
 
     assert!(thumbnail.rgb.iter().all(|&value| value < 40));
 }

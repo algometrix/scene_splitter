@@ -26,6 +26,19 @@ pub struct Settings {
     pub hard_cuts: HardCutSettings,
     /// Whether the review screen explains how to use it.
     pub show_tips: bool,
+    /// Whether the person has already been asked what should happen to the
+    /// original of a video they split.
+    pub recycling_question: RecyclingQuestion,
+}
+
+/// The first split that would move an original to the Recycle Bin or Trash
+/// is explained and confirmed. After that the person is not asked again.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub enum RecyclingQuestion {
+    /// Also what a settings file from before the question existed means.
+    #[default]
+    NotAskedYet,
+    Answered,
 }
 
 impl Default for Settings {
@@ -36,8 +49,18 @@ impl Default for Settings {
             export: ExportOptions::default(),
             hard_cuts: HardCutSettings::default(),
             show_tips: true,
+            recycling_question: RecyclingQuestion::NotAskedYet,
         }
     }
+}
+
+/// One change to the settings, asked for on a screen that only draws them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettingsChange {
+    ExportOptions(ExportOptions),
+    HardCuts(HardCutSettings),
+    ShowTips,
+    HideTips,
 }
 
 /// What loading the settings gave.
@@ -86,6 +109,40 @@ impl Settings {
         let mut settings = Self::default();
         settings.export.original_policy = OriginalPolicy::Keep;
         settings
+    }
+
+    /// Whether a split started now has to wait for the person to say what
+    /// happens to the original. Only a split that would recycle it does, and
+    /// only until they have answered once.
+    pub fn must_ask_before_recycling(&self) -> bool {
+        self.export.original_policy == OriginalPolicy::RecycleOnceVerified
+            && self.recycling_question == RecyclingQuestion::NotAskedYet
+    }
+
+    /// Every setting as it was at first, except what happens to originals.
+    ///
+    /// That is the person's answer to a question, not a preference with a
+    /// default: someone who said "keep the original" and later resets the
+    /// detection settings must not find their originals in the Recycle Bin.
+    /// So their choice is kept, and with it the fact that they were asked.
+    pub fn restored_to_defaults(&self) -> Self {
+        let mut restored = Self {
+            recycling_question: self.recycling_question,
+            ..Self::default()
+        };
+        restored.export.original_policy = self.export.original_policy;
+        restored
+    }
+
+    /// The settings after one change the person made on a screen.
+    pub fn changed_by(mut self, change: SettingsChange) -> Self {
+        match change {
+            SettingsChange::ExportOptions(export) => self.export = export,
+            SettingsChange::HardCuts(hard_cuts) => self.hard_cuts = hard_cuts,
+            SettingsChange::ShowTips => self.show_tips = true,
+            SettingsChange::HideTips => self.show_tips = false,
+        }
+        self
     }
 
     pub fn save(&self) -> Result<()> {
@@ -179,6 +236,7 @@ mod tests {
         settings.hard_cuts.sensitivity = Sensitivity::High;
         settings.hard_cuts.min_scene_seconds = 300.0;
         settings.show_tips = false;
+        settings.recycling_question = RecyclingQuestion::Answered;
         settings
     }
 
@@ -213,6 +271,116 @@ mod tests {
         assert_eq!(loaded.scan, ScanSettings::default());
         assert_eq!(loaded.hard_cuts, HardCutSettings::default());
         assert!(loaded.show_tips);
+    }
+
+    #[test]
+    fn a_file_from_before_the_recycling_question_loads_as_not_asked_yet() {
+        let file = SettingsFile::for_test("before_recycling_question");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file.0,
+            r#"{ "export": { "original_policy": "RecycleOnceVerified" }, "show_tips": false }"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.recycling_question, RecyclingQuestion::NotAskedYet);
+        assert!(loaded.must_ask_before_recycling());
+        assert!(!loaded.show_tips);
+    }
+
+    #[test]
+    fn the_recycling_question_starts_unanswered() {
+        assert_eq!(
+            Settings::default().recycling_question,
+            RecyclingQuestion::NotAskedYet
+        );
+        assert!(Settings::default().must_ask_before_recycling());
+    }
+
+    #[test]
+    fn the_recycling_question_is_asked_only_once() {
+        let settings = Settings {
+            recycling_question: RecyclingQuestion::Answered,
+            ..Settings::default()
+        };
+        assert!(!settings.must_ask_before_recycling());
+    }
+
+    #[test]
+    fn nothing_is_asked_when_the_original_is_kept_anyway() {
+        let mut settings = Settings::default();
+        settings.export.original_policy = OriginalPolicy::Keep;
+        assert!(!settings.must_ask_before_recycling());
+    }
+
+    #[test]
+    fn restoring_the_defaults_does_not_ask_the_recycling_question_again() {
+        let restored = changed_settings().restored_to_defaults();
+        assert_eq!(restored.recycling_question, RecyclingQuestion::Answered);
+        assert!(!restored.must_ask_before_recycling());
+    }
+
+    #[test]
+    fn restoring_the_defaults_keeps_what_the_person_chose_for_originals() {
+        // They answered "Keep the original", then changed other settings.
+        let chosen = changed_settings();
+        assert_eq!(chosen.export.original_policy, OriginalPolicy::Keep);
+
+        let restored = chosen.restored_to_defaults();
+        assert_eq!(restored.export.original_policy, OriginalPolicy::Keep);
+        // Everything else is as it was at first.
+        let mut expected = Settings::default();
+        expected.export.original_policy = OriginalPolicy::Keep;
+        expected.recycling_question = RecyclingQuestion::Answered;
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn restoring_the_defaults_never_turns_recycling_on_unasked() {
+        for recycling_question in [RecyclingQuestion::NotAskedYet, RecyclingQuestion::Answered] {
+            let mut keeping = Settings {
+                recycling_question,
+                ..Settings::default()
+            };
+            keeping.export.original_policy = OriginalPolicy::Keep;
+            assert_eq!(
+                keeping.restored_to_defaults().export.original_policy,
+                OriginalPolicy::Keep
+            );
+        }
+    }
+
+    #[test]
+    fn a_change_made_on_a_screen_touches_only_what_it_names() {
+        let before = Settings::default();
+
+        let export = ExportOptions {
+            scene_location: SceneLocation::NewFolder,
+            original_policy: OriginalPolicy::Keep,
+        };
+        let changed = before.changed_by(SettingsChange::ExportOptions(export));
+        assert_eq!(changed, Settings { export, ..before });
+
+        let hard_cuts = HardCutSettings {
+            sensitivity: Sensitivity::Low,
+            min_scene_seconds: 600.0,
+        };
+        let changed = before.changed_by(SettingsChange::HardCuts(hard_cuts));
+        assert_eq!(
+            changed,
+            Settings {
+                hard_cuts,
+                ..before
+            }
+        );
+    }
+
+    #[test]
+    fn the_tips_can_be_hidden_and_shown_again() {
+        let hidden = Settings::default().changed_by(SettingsChange::HideTips);
+        assert!(!hidden.show_tips);
+        assert!(hidden.changed_by(SettingsChange::ShowTips).show_tips);
     }
 
     #[test]

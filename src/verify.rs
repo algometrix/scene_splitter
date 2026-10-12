@@ -8,17 +8,24 @@
 //! subtitles. It is the gate in front of removing the original.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
+use crate::ffmpeg::{
+    NotUnderstood, Program, TimeLimit, COPY_SCENE_STREAMS, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT,
+};
 use crate::tools;
 
 /// How much of each scene is decoded to make sure a player can open it.
 const DECODE_CHECK_SECONDS: &str = "2";
+
+/// The decode check opens one scene and decodes its first two seconds, which
+/// takes a fraction of a second. A minute covers a slow drive and a picture
+/// that is costly to decode, with every scene being checked at once.
+const DECODE_CHECK_LIMIT: TimeLimit = TimeLimit::WholeRun(Duration::from_secs(60));
 
 /// The video stream comes first in every file this program reads or writes.
 const VIDEO_STREAM: u32 = 0;
@@ -66,26 +73,17 @@ pub fn verify_scenes(original: &Path, scene_files: &[PathBuf]) -> Result<()> {
 
 /// One line per stream of the video: its index and its kind.
 fn list_streams(video: &Path) -> Result<String> {
-    let output = tools::ffprobe_command()
+    tools::command(Program::Ffprobe)
         .args(["-v", "error"])
         .args(["-show_entries", "stream=index,codec_type", "-of", "csv=p=0"])
         .arg(video)
-        .stdin(Stdio::null())
-        .output()
-        .context("could not start ffprobe, is it on PATH?")?;
-    if !output.status.success() {
-        bail!(
-            "ffprobe could not list the streams of {}: {}",
-            video.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8(output.stdout).context("ffprobe printed non UTF-8 output")
+        .run_for_text(QUICK_ANSWER_LIMIT)
+        .with_context(|| format!("could not list the streams of {}", video.display()))
 }
 
 /// Names the streams a split does not copy: everything except the first
-/// video stream and the audio streams. Cover art counts as a second video
-/// stream, so it is named too.
+/// video stream and the audio streams, which is what `COPY_SCENE_STREAMS`
+/// selects. Cover art counts as a second video stream, so it is named too.
 fn streams_left_behind(stream_listing: &str) -> Vec<String> {
     let mut first_video_seen = false;
     let mut left_behind = Vec::new();
@@ -113,34 +111,24 @@ fn streams_left_behind(stream_listing: &str) -> Vec<String> {
 
 /// Has ffmpeg list a checksum for every packet, without decoding anything.
 fn read_packet_checksums(video: &Path) -> Result<PacketsByStream> {
-    let mut ffmpeg = tools::ffmpeg_command()
+    let mut packets = PacketsByStream::new();
+    // The listing grows with the video and is printed as the file is read.
+    tools::command(Program::Ffmpeg)
         .args(["-nostdin", "-v", "error"])
         .arg("-i")
         .arg(video)
-        .args(["-map", "0:v:0", "-map", "0:a?", "-c", "copy"])
+        .args(COPY_SCENE_STREAMS)
         .args(["-f", "framecrc", "-"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .context("could not start ffmpeg, is it on PATH?")?;
-    let listing = ffmpeg.stdout.take().context("ffmpeg has no output pipe")?;
-
-    let mut packets = PacketsByStream::new();
-    for line in BufReader::new(listing).lines() {
-        let line = line.context("reading packet checksums from ffmpeg")?;
-        if is_header_line(&line) {
-            continue;
-        }
-        let (stream, packet) = parse_checksum_line(&line)
-            .with_context(|| format!("unexpected checksum line {line:?}"))?;
-        packets.entry(stream).or_default().push(packet);
-    }
-
-    let status = ffmpeg.wait().context("waiting for ffmpeg")?;
-    if !status.success() {
-        bail!("ffmpeg could not read {} ({status})", video.display());
-    }
+        .stream_lines(STEADY_OUTPUT_LIMIT, |line| {
+            if is_header_line(line) {
+                return Ok(());
+            }
+            let (stream, packet) = parse_checksum_line(line)
+                .map_err(|error| NotUnderstood(format!("checksum line {line:?}, {error:#}")))?;
+            packets.entry(stream).or_default().push(packet);
+            Ok(())
+        })
+        .with_context(|| format!("could not read the packets of {}", video.display()))?;
     Ok(packets)
 }
 
@@ -210,21 +198,13 @@ fn first_difference(original: &PacketsByStream, scenes: &PacketsByStream) -> Opt
 /// Identical packets do not help if the file's headers are broken, so the
 /// start of each scene is also decoded.
 fn check_scene_decodes(scene: &PathBuf) -> Result<()> {
-    let output = tools::ffmpeg_command()
+    tools::command(Program::Ffmpeg)
         .args(["-nostdin", "-v", "error", "-xerror"])
         .arg("-i")
         .arg(scene)
         .args(["-t", DECODE_CHECK_SECONDS, "-f", "null", "-"])
-        .stdin(Stdio::null())
-        .output()
-        .context("could not start ffmpeg, is it on PATH?")?;
-    if !output.status.success() {
-        bail!(
-            "{} does not decode: {}",
-            scene.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+        .run(DECODE_CHECK_LIMIT)
+        .with_context(|| format!("{} does not decode", scene.display()))?;
     Ok(())
 }
 

@@ -4,8 +4,9 @@
 //! know exactly where every scene change is.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::time::Duration;
 
+use crate::ffmpeg::{Program, TimeLimit};
 use crate::tools;
 
 pub const FRAME_RATE: u32 = 25;
@@ -18,6 +19,9 @@ const PICTURE_SIZE: &str = "320x180";
 /// Noise makes every frame costly to compress, as real footage is. Without
 /// it the test patterns compress as well as a black screen does.
 const NOISE: &str = "noise=alls=20:allf=t";
+/// Encoding nine seconds of small pictures takes about a second. Two
+/// minutes allows for a machine busy running every other test at once.
+const ENCODING_LIMIT: TimeLimit = TimeLimit::WholeRun(Duration::from_secs(120));
 
 /// A generated video in a folder of its own, removed when the test ends.
 pub struct TestVideo {
@@ -81,13 +85,12 @@ impl TestVideo {
         std::fs::create_dir_all(&folder).expect("could not create a folder for the test video");
         let path = folder.join("video.mp4");
 
-        let mut ffmpeg = tools::ffmpeg_command();
-        ffmpeg.args(["-nostdin", "-v", "error", "-y"]);
+        let mut ffmpeg = tools::command(Program::Ffmpeg).args(["-nostdin", "-v", "error", "-y"]);
         for pattern in patterns {
-            ffmpeg.args(["-f", "lavfi", "-i", pattern]);
+            ffmpeg = ffmpeg.args(["-f", "lavfi", "-i", pattern]);
         }
         let sound_input = patterns.len().to_string();
-        let output = ffmpeg
+        let encoded = ffmpeg
             .args(["-f", "lavfi", "-i", "sine=frequency=440"])
             .args(["-filter_complex", picture_graph])
             .args(["-map", "[picture]", "-map", &format!("{sound_input}:a")])
@@ -96,14 +99,10 @@ impl TestVideo {
             .args(["-g", &FRAME_RATE.to_string(), "-sc_threshold", "0"])
             .args(["-c:a", "aac", "-shortest"])
             .arg(&path)
-            .stdin(Stdio::null())
-            .output()
-            .expect("could not start ffmpeg, is it on PATH?");
-        assert!(
-            output.status.success(),
-            "ffmpeg could not make the test video: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .run(ENCODING_LIMIT);
+        if let Err(error) = encoded {
+            panic!("ffmpeg could not make the test video: {error}");
+        }
         Self { folder, path }
     }
 }

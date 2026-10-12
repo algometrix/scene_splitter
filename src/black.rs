@@ -2,18 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A stretch of the video, in seconds from its start. `end` is exclusive.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct TimeSpan {
-    pub start: f64,
-    pub end: f64,
-}
-
-impl TimeSpan {
-    pub fn seconds(&self) -> f64 {
-        self.end - self.start
-    }
-}
+use crate::timecode::TimeSpan;
 
 /// What counts as a black screen.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

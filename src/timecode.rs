@@ -1,7 +1,29 @@
-//! Timestamps as people read and type them.
+//! Time in a video: stretches of it, and timestamps as people read and
+//! type them.
 
-const SECONDS_PER_MINUTE: f64 = 60.0;
+use serde::{Deserialize, Serialize};
+
+pub const SECONDS_PER_MINUTE: f64 = 60.0;
 const MAX_TIMESTAMP_PARTS: usize = 3;
+
+/// A stretch of the video, in seconds from its start. `end` is exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TimeSpan {
+    pub start: f64,
+    pub end: f64,
+}
+
+impl TimeSpan {
+    pub fn seconds(&self) -> f64 {
+        self.end - self.start
+    }
+
+    /// Whether `time` is inside the span and on neither of its edges. A cut
+    /// on an edge would leave nothing on one side of it.
+    pub fn has_strictly_inside(&self, time: f64) -> bool {
+        time > self.start && time < self.end
+    }
+}
 
 /// Formats seconds as HH:MM:SS.mmm.
 pub fn format_timestamp(seconds: f64) -> String {
@@ -32,7 +54,7 @@ pub fn format_clock(seconds: f64) -> String {
 
 /// Formats a length of time the way people say it: "50 s", "3 min 44 s",
 /// "1 h 05 min 10 s".
-pub fn format_duration(seconds: f64) -> String {
+pub fn format_length(seconds: f64) -> String {
     let total_seconds = seconds.max(0.0).round() as u64;
     let hours = total_seconds / 3600;
     let minutes = total_seconds / 60 % 60;
@@ -68,6 +90,32 @@ pub fn parse_timestamp(text: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    const SPAN: TimeSpan = TimeSpan {
+        start: 2.0,
+        end: 6.0,
+    };
+
+    #[test]
+    fn a_span_is_as_long_as_the_gap_between_its_edges() {
+        assert_eq!(SPAN.seconds(), 4.0);
+    }
+
+    #[test]
+    fn a_time_between_the_edges_is_strictly_inside_a_span() {
+        assert!(SPAN.has_strictly_inside(2.5));
+    }
+
+    #[test]
+    fn the_edges_of_a_span_are_not_strictly_inside_it() {
+        assert!(!SPAN.has_strictly_inside(SPAN.start));
+        assert!(!SPAN.has_strictly_inside(SPAN.end));
+    }
+
+    #[test]
+    fn a_time_that_is_not_a_number_is_not_inside_a_span() {
+        assert!(!SPAN.has_strictly_inside(f64::NAN));
+    }
+
     #[test]
     fn timestamps_read_as_hours_minutes_seconds() {
         assert_eq!(format_timestamp(3792.267), "01:03:12.267");
@@ -87,11 +135,11 @@ mod tests {
     }
 
     #[test]
-    fn durations_read_the_way_people_say_them() {
-        assert_eq!(format_duration(50.0), "50 s");
-        assert_eq!(format_duration(224.0), "3 min 44 s");
-        assert_eq!(format_duration(3910.0), "1 h 05 min 10 s");
-        assert_eq!(format_duration(7719.0), "2 h 08 min 39 s");
+    fn lengths_read_the_way_people_say_them() {
+        assert_eq!(format_length(50.0), "50 s");
+        assert_eq!(format_length(224.0), "3 min 44 s");
+        assert_eq!(format_length(3910.0), "1 h 05 min 10 s");
+        assert_eq!(format_length(7719.0), "2 h 08 min 39 s");
     }
 
     #[test]
@@ -150,31 +198,31 @@ mod tests {
     }
 
     #[test]
-    fn a_duration_rounds_to_the_nearest_second() {
-        assert_eq!(format_duration(49.25), "49 s");
-        assert_eq!(format_duration(49.75), "50 s");
+    fn a_length_rounds_to_the_nearest_second() {
+        assert_eq!(format_length(49.25), "49 s");
+        assert_eq!(format_length(49.75), "50 s");
     }
 
     #[test]
-    fn a_duration_that_rounds_up_to_a_full_minute_or_hour_carries() {
-        assert_eq!(format_duration(59.5), "1 min 00 s");
-        assert_eq!(format_duration(3599.5), "1 h 00 min 00 s");
+    fn a_length_that_rounds_up_to_a_full_minute_or_hour_carries() {
+        assert_eq!(format_length(59.5), "1 min 00 s");
+        assert_eq!(format_length(3599.5), "1 h 00 min 00 s");
     }
 
     #[test]
-    fn a_duration_under_half_a_second_reads_as_zero_seconds() {
-        assert_eq!(format_duration(0.0), "0 s");
-        assert_eq!(format_duration(0.25), "0 s");
+    fn a_length_under_half_a_second_reads_as_zero_seconds() {
+        assert_eq!(format_length(0.0), "0 s");
+        assert_eq!(format_length(0.25), "0 s");
     }
 
     #[test]
-    fn a_negative_duration_reads_as_zero_seconds() {
-        assert_eq!(format_duration(-5.0), "0 s");
+    fn a_negative_length_reads_as_zero_seconds() {
+        assert_eq!(format_length(-5.0), "0 s");
     }
 
     #[test]
-    fn duration_hours_keep_counting_past_a_day() {
-        assert_eq!(format_duration(TWENTY_FIVE_HOURS), "25 h 00 min 00 s");
+    fn length_hours_keep_counting_past_a_day() {
+        assert_eq!(format_length(TWENTY_FIVE_HOURS), "25 h 00 min 00 s");
     }
 
     #[test]

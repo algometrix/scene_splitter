@@ -10,7 +10,8 @@ use std::time::UNIX_EPOCH;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::detect::{self, Detection, ScanDepth, ScanSettings};
+use crate::detect::{self, Detection, OnScanProgress, ScanDepth, ScanSettings};
+use crate::scan::UndecodedFrames;
 
 /// Raised whenever the stored layout changes, or detection changes in a way
 /// that would give different results for the same settings, so older files
@@ -36,6 +37,9 @@ pub enum DetectionSource {
 pub struct SourcedDetection {
     pub detection: Detection,
     pub source: DetectionSource,
+    /// Stretches a fresh scan could not decode, so scene changes in them may
+    /// have been missed. Empty for a stored scan, which does not keep them.
+    pub undecoded: Vec<UndecodedFrames>,
 }
 
 /// Identifies one version of a video file without reading its contents.
@@ -76,11 +80,13 @@ struct StoredScan {
 }
 
 /// Scans the video, or returns the stored scan when one still applies.
+/// `on_progress` only hears from a scan that really runs.
 pub fn detect_with_cache(
     video: &Path,
     settings: &ScanSettings,
     cache_use: CacheUse,
     depth: ScanDepth,
+    on_progress: OnScanProgress,
 ) -> Result<SourcedDetection> {
     let fingerprint = VideoFingerprint::of(video)?;
     let scans_dir = scans_dir();
@@ -94,11 +100,13 @@ pub fn detect_with_cache(
             return Ok(SourcedDetection {
                 detection,
                 source: DetectionSource::StoredScan,
+                undecoded: Vec::new(),
             });
         }
     }
 
-    let mut detection = detect::detect_scene_changes(video, settings, depth)?;
+    let scan = detect::scan_for_scene_changes(video, settings, depth, on_progress)?;
+    let mut detection = scan.detection;
     if detection.hard_cut_candidates.is_none() {
         // The hard-cut pass takes minutes and does not depend on the
         // black-screen settings, so what an earlier scan of this same file
@@ -114,6 +122,7 @@ pub fn detect_with_cache(
     Ok(SourcedDetection {
         detection,
         source: DetectionSource::FreshScan,
+        undecoded: scan.undecoded,
     })
 }
 
@@ -178,8 +187,10 @@ fn stored_scan_path(scans_dir: &Path, fingerprint: &VideoFingerprint) -> PathBuf
 }
 
 /// A small hash with a fixed definition. The standard library's hasher may
-/// change between Rust versions, which would orphan every stored scan.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
+/// change between Rust versions, which would orphan every stored scan. The
+/// split uses it too, to name a folder after a video without repeating the
+/// video's name.
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     bytes.iter().fold(OFFSET_BASIS, |hash, &byte| {
@@ -190,8 +201,24 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::black::{BlackCriteria, TimeSpan};
+    use crate::black::BlackCriteria;
     use crate::detect::ScanMode;
+    use crate::timecode::TimeSpan;
+
+    /// A stored scan exactly as the version of 548a54e wrote it, for
+    /// `fingerprint()`, `settings()` and `detection()` with one hard cut.
+    const SCAN_STORED_BY_AN_EARLIER_VERSION: &str = concat!(
+        r#"{"version":1,"#,
+        r#""fingerprint":{"path":"E:\\Videos\\film.mp4","size_bytes":700000000,"#,
+        r#""modified_unix_millis":1760000000000},"#,
+        r#""settings":{"mode":"Suspicious","criteria":"#,
+        r#"{"max_dark_luma":32,"min_dark_fraction":0.98,"min_seconds":0.25}},"#,
+        r#""detection":{"video":{"start":0.0,"end":7200.0},"#,
+        r#""keyframe_times":[0.0,2.0,3792.0],"frame_count":216000,"#,
+        r#""black_screens":[{"start":3792.25,"end":3793.6}],"cuts":[3792.0],"#,
+        r#""decoded_frames":1219,"decoded_windows":23,"#,
+        r#""hard_cut_candidates":[{"time":601.5,"strength":77}]}}"#,
+    );
 
     /// A scans folder of its own for one test, removed when the test ends.
     struct ScansDir(PathBuf);
@@ -275,6 +302,45 @@ mod tests {
         assert_eq!(loaded, with_hard_cuts);
         assert!(loaded.satisfies(ScanDepth::WithHardCuts));
         assert!(!detection().satisfies(ScanDepth::WithHardCuts));
+    }
+
+    #[test]
+    fn a_scan_stored_by_an_earlier_version_still_loads() {
+        let dir = ScansDir::for_test("earlier_version");
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::write(
+            stored_scan_path(&dir.0, &fingerprint()),
+            SCAN_STORED_BY_AN_EARLIER_VERSION,
+        )
+        .unwrap();
+
+        let as_stored = Detection {
+            hard_cut_candidates: Some(vec![crate::hardcut::HardCutCandidate {
+                time: 601.5,
+                strength: 77,
+            }]),
+            ..detection()
+        };
+        assert_eq!(
+            load_stored_scan(&dir.0, &fingerprint(), &settings()),
+            Some(as_stored)
+        );
+    }
+
+    #[test]
+    fn a_scan_is_stored_in_the_layout_earlier_versions_wrote() {
+        let dir = ScansDir::for_test("same_layout");
+        let with_hard_cuts = Detection {
+            hard_cut_candidates: Some(vec![crate::hardcut::HardCutCandidate {
+                time: 601.5,
+                strength: 77,
+            }]),
+            ..detection()
+        };
+        store_scan(&dir.0, &fingerprint(), &settings(), &with_hard_cuts).unwrap();
+
+        let written = std::fs::read_to_string(stored_scan_path(&dir.0, &fingerprint())).unwrap();
+        assert_eq!(written, SCAN_STORED_BY_AN_EARLIER_VERSION);
     }
 
     #[test]

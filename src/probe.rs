@@ -5,7 +5,8 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::black::TimeSpan;
+use crate::ffmpeg::{NotUnderstood, Program, ToolCommand, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT};
+use crate::timecode::TimeSpan;
 use crate::tools;
 
 /// One compressed video frame, as stored in the container.
@@ -38,7 +39,12 @@ impl PacketIndex {
 
 pub fn read_packet_index(input: &Path) -> Result<PacketIndex> {
     let container_start = read_container_start(input)?;
-    let listing = run_ffprobe(
+
+    let mut packets = Vec::new();
+    // ffprobe reads through the file and prints each packet as it finds it,
+    // so the time this takes grows with the video while the output never
+    // pauses for long.
+    ffprobe_on(
         input,
         &[
             "-select_streams",
@@ -48,14 +54,18 @@ pub fn read_packet_index(input: &Path) -> Result<PacketIndex> {
             "-of",
             "csv=p=0",
         ],
-    )?;
-
-    let mut packets = Vec::new();
-    for line in listing.lines().filter(|line| !line.trim().is_empty()) {
+    )
+    .stream_lines(STEADY_OUTPUT_LIMIT, |line| {
+        if line.trim().is_empty() {
+            return Ok(());
+        }
         let packet = parse_packet_line(line, container_start)
-            .with_context(|| format!("unexpected ffprobe packet line {line:?}"))?;
+            .map_err(|error| NotUnderstood(format!("packet line {line:?}, {error:#}")))?;
         packets.push(packet);
-    }
+        Ok(())
+    })
+    .with_context(|| format!("could not list the frames of {}", input.display()))?;
+
     if packets.is_empty() {
         bail!("{} has no video frames", input.display());
     }
@@ -71,10 +81,12 @@ pub fn read_packet_index(input: &Path) -> Result<PacketIndex> {
 /// ffprobe reports absolute timestamps, while `ffmpeg -ss` counts from the
 /// container's start time. Subtracting it puts every time on the seek clock.
 fn read_container_start(input: &Path) -> Result<f64> {
-    let output = run_ffprobe(
+    let output = ffprobe_on(
         input,
         &["-show_entries", "format=start_time", "-of", "csv=p=0"],
-    )?;
+    )
+    .run_for_text(QUICK_ANSWER_LIMIT)
+    .with_context(|| format!("could not open {}", input.display()))?;
     let field = output.trim().trim_end_matches(',');
     if field.is_empty() || field == "N/A" {
         return Ok(0.0);
@@ -116,21 +128,11 @@ fn estimate_video_end(packets: &[VideoPacket]) -> f64 {
     last + typical_frame_duration
 }
 
-fn run_ffprobe(input: &Path, arguments: &[&str]) -> Result<String> {
-    let output = tools::ffprobe_command()
+fn ffprobe_on(input: &Path, arguments: &[&str]) -> ToolCommand {
+    tools::command(Program::Ffprobe)
         .args(["-v", "error"])
         .args(arguments)
         .arg(input)
-        .output()
-        .context("could not start ffprobe, is it on PATH?")?;
-    if !output.status.success() {
-        bail!(
-            "ffprobe failed on {}: {}",
-            input.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    String::from_utf8(output.stdout).context("ffprobe printed non UTF-8 output")
 }
 
 #[cfg(test)]

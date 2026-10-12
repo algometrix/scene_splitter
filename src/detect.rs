@@ -8,9 +8,11 @@ use anyhow::Result;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-use crate::black::{self, BlackCriteria, TimeSpan};
+use crate::black::{self, BlackCriteria};
 use crate::hardcut::{self, HardCutCandidate, HardCutSettings};
-use crate::{probe, scan, scenes, windows};
+use crate::scan::{self, UndecodedFrames};
+use crate::timecode::TimeSpan;
+use crate::{probe, scenes, windows};
 
 /// How much of the video to decode while looking for black screens.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -48,6 +50,25 @@ pub enum ScanDepth {
     WithHardCuts,
 }
 
+/// Which scan the person chose for a video: what it looks for, and with
+/// which settings the hard cuts it finds become cuts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScanKind {
+    /// The normal, fast scan.
+    BlackScreens,
+    /// The slow scan that also finds scene changes without a black screen.
+    HardCuts(HardCutSettings),
+}
+
+impl ScanKind {
+    pub fn depth(self) -> ScanDepth {
+        match self {
+            Self::BlackScreens => ScanDepth::BlackScreens,
+            Self::HardCuts(_) => ScanDepth::WithHardCuts,
+        }
+    }
+}
+
 /// Everything the scan learned about one video that later steps need.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Detection {
@@ -75,6 +96,15 @@ impl Detection {
         }
     }
 
+    /// The cuts a review of this scan starts from: its black-screen cuts,
+    /// and for a hard-cut scan the hard cuts its settings choose as well.
+    pub fn cuts_for(&self, scan_kind: ScanKind) -> Vec<f64> {
+        match scan_kind {
+            ScanKind::BlackScreens => self.cuts.clone(),
+            ScanKind::HardCuts(settings) => self.cuts_with_hard_cuts(&settings),
+        }
+    }
+
     /// The black-screen cuts plus the hard cuts chosen by `settings`. Without
     /// a hard-cut scan this is the black-screen cuts alone.
     pub fn cuts_with_hard_cuts(&self, settings: &HardCutSettings) -> Vec<f64> {
@@ -91,11 +121,72 @@ impl Detection {
     }
 }
 
-pub fn detect_scene_changes(
+/// The two parts of a scan, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScanStage {
+    BlackScreens,
+    /// Only part of a scan that also looks for hard cuts.
+    HardCuts,
+}
+
+/// How far a scan has come.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScanProgress {
+    pub stage: ScanStage,
+    /// The share of the whole scan that is done, from 0.0 to 1.0, counted in
+    /// frames to decode. A scan that also looks for hard cuts passes through
+    /// both stages on the way to 1.0.
+    pub fraction: f32,
+}
+
+/// Receives the progress of a scan. Called from the threads that decode, so
+/// two reports close together can arrive out of order.
+pub type OnScanProgress<'a> = &'a (dyn Fn(ScanProgress) + Sync);
+
+/// For callers that do not show progress.
+pub fn no_scan_progress(_progress: ScanProgress) {}
+
+/// A finished scan, and what the person should know about it.
+#[derive(Debug, PartialEq)]
+pub struct ScanOutcome {
+    pub detection: Detection,
+    /// Stretches of the video that could not be decoded, so scene changes in
+    /// them may have been missed. Empty for a healthy video.
+    pub undecoded: Vec<UndecodedFrames>,
+}
+
+/// How many frames each stage of a scan decodes, which is what the scan's
+/// time goes into.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScanWork {
+    black_screen_frames: usize,
+    hard_cut_frames: usize,
+}
+
+impl ScanWork {
+    /// The share of the whole scan done once `stage` is `stage_fraction`
+    /// through its own frames.
+    fn overall_fraction(self, stage: ScanStage, stage_fraction: f32) -> f32 {
+        let all_frames = self.black_screen_frames + self.hard_cut_frames;
+        if all_frames == 0 {
+            return stage_fraction;
+        }
+        let (frames_before, stage_frames) = match stage {
+            ScanStage::BlackScreens => (0, self.black_screen_frames),
+            ScanStage::HardCuts => (self.black_screen_frames, self.hard_cut_frames),
+        };
+        let frames_done = frames_before as f64 + f64::from(stage_fraction) * stage_frames as f64;
+        (frames_done / all_frames as f64) as f32
+    }
+}
+
+/// Finds the black screens of the video and, when asked, its hard cuts.
+pub fn scan_for_scene_changes(
     video: &Path,
     settings: &ScanSettings,
     depth: ScanDepth,
-) -> Result<Detection> {
+    on_progress: OnScanProgress,
+) -> Result<ScanOutcome> {
     let index = probe::read_packet_index(video)?;
     let packets = &index.packets;
     let criteria = &settings.criteria;
@@ -104,12 +195,36 @@ pub fn detect_scene_changes(
         ScanMode::Suspicious => windows::suspicious_windows(packets, criteria.min_seconds),
         ScanMode::EveryFrame => windows::whole_video_windows(packets, rayon::current_num_threads()),
     };
-    let frame_is_black = scan::find_black_frames(video, packets, &windows, criteria)?;
+    let decoded_frames = windows.iter().map(|window| window.len()).sum();
+    let work = ScanWork {
+        black_screen_frames: decoded_frames,
+        hard_cut_frames: match depth {
+            ScanDepth::BlackScreens => 0,
+            ScanDepth::WithHardCuts => packets.len(),
+        },
+    };
+    let report_stage = |stage: ScanStage| {
+        move |stage_fraction: f32| {
+            on_progress(ScanProgress {
+                stage,
+                fraction: work.overall_fraction(stage, stage_fraction),
+            });
+        }
+    };
+
+    let black_frames = scan::find_black_frames(
+        video,
+        packets,
+        &windows,
+        criteria,
+        &report_stage(ScanStage::BlackScreens),
+    )?;
+    let mut undecoded = black_frames.undecoded;
 
     let frame_times: Vec<f64> = packets.iter().map(|packet| packet.time).collect();
     let black_screens = black::black_screens(
         &frame_times,
-        &frame_is_black,
+        &black_frames.frame_is_black,
         index.video.end,
         criteria.min_seconds,
     );
@@ -120,18 +235,110 @@ pub fn detect_scene_changes(
         ScanDepth::BlackScreens => None,
         ScanDepth::WithHardCuts => {
             let whole_video = windows::whole_video_windows(packets, rayon::current_num_threads());
-            Some(hardcut::find_candidates(video, packets, &whole_video)?)
+            let hard_cut_scan = hardcut::find_candidates(
+                video,
+                packets,
+                &whole_video,
+                &report_stage(ScanStage::HardCuts),
+            )?;
+            // Both stages decode the same frames when the black screens are
+            // looked for in every frame, and then report the same stretches.
+            for stretch in hard_cut_scan.undecoded {
+                if !undecoded.contains(&stretch) {
+                    undecoded.push(stretch);
+                }
+            }
+            Some(hard_cut_scan.candidates)
         }
     };
 
-    Ok(Detection {
-        video: index.video,
-        keyframe_times,
-        frame_count: packets.len(),
-        black_screens,
-        cuts,
-        decoded_frames: windows.iter().map(|window| window.len()).sum(),
-        decoded_windows: windows.len(),
-        hard_cut_candidates,
+    Ok(ScanOutcome {
+        detection: Detection {
+            video: index.video,
+            keyframe_times,
+            frame_count: packets.len(),
+            black_screens,
+            cuts,
+            decoded_frames,
+            decoded_windows: windows.len(),
+            hard_cut_candidates,
+        },
+        undecoded,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLACK_SCREENS_ONLY: ScanWork = ScanWork {
+        black_screen_frames: 500,
+        hard_cut_frames: 0,
+    };
+    /// A quick look at a few stretches, then every frame for the hard cuts.
+    const WITH_HARD_CUTS: ScanWork = ScanWork {
+        black_screen_frames: 1_000,
+        hard_cut_frames: 9_000,
+    };
+
+    #[test]
+    fn a_scan_kind_decodes_as_deeply_as_what_it_looks_for() {
+        assert_eq!(ScanKind::BlackScreens.depth(), ScanDepth::BlackScreens);
+        assert_eq!(
+            ScanKind::HardCuts(HardCutSettings::default()).depth(),
+            ScanDepth::WithHardCuts
+        );
+    }
+
+    #[test]
+    fn a_scan_for_black_screens_alone_is_its_only_stage() {
+        let overall =
+            |fraction| BLACK_SCREENS_ONLY.overall_fraction(ScanStage::BlackScreens, fraction);
+        assert_eq!(overall(0.0), 0.0);
+        assert_eq!(overall(0.5), 0.5);
+        assert_eq!(overall(1.0), 1.0);
+    }
+
+    #[test]
+    fn each_stage_counts_for_its_share_of_the_frames() {
+        let black = |fraction| WITH_HARD_CUTS.overall_fraction(ScanStage::BlackScreens, fraction);
+        let hard_cuts = |fraction| WITH_HARD_CUTS.overall_fraction(ScanStage::HardCuts, fraction);
+
+        assert_eq!(black(0.5), 0.05);
+        assert_eq!(black(1.0), 0.1);
+        // The second stage picks up exactly where the first one ended.
+        assert_eq!(hard_cuts(0.0), black(1.0));
+        assert_eq!(hard_cuts(0.5), 0.55);
+        assert_eq!(hard_cuts(1.0), 1.0);
+    }
+
+    #[test]
+    fn a_video_with_nothing_worth_decoding_still_reaches_the_end() {
+        const NOTHING_TO_DECODE: ScanWork = ScanWork {
+            black_screen_frames: 0,
+            hard_cut_frames: 0,
+        };
+        assert_eq!(
+            NOTHING_TO_DECODE.overall_fraction(ScanStage::BlackScreens, 1.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn nothing_suspicious_before_a_hard_cut_scan_starts_that_scan_at_zero() {
+        const ONLY_HARD_CUTS: ScanWork = ScanWork {
+            black_screen_frames: 0,
+            hard_cut_frames: 9_000,
+        };
+        // The first stage has nothing to decode and says it is done, which
+        // is no progress on the whole.
+        assert_eq!(
+            ONLY_HARD_CUTS.overall_fraction(ScanStage::BlackScreens, 1.0),
+            0.0
+        );
+        assert_eq!(
+            ONLY_HARD_CUTS.overall_fraction(ScanStage::HardCuts, 0.5),
+            0.5
+        );
+    }
 }

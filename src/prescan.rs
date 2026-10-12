@@ -2,14 +2,16 @@
 //! anything. The results go into the scan cache, so the window later opens
 //! the same videos ready for review.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
 
 use crate::cache::{self, CacheUse, DetectionSource};
-use crate::detect::{Detection, ScanDepth, ScanSettings};
+use crate::detect::{self, Detection, ScanDepth, ScanSettings};
 use crate::library;
+use crate::scan::UndecodedFrames;
 
 #[derive(Debug)]
 pub struct FailedScan {
@@ -31,6 +33,17 @@ impl ScanAheadSummary {
         self.freshly_scanned == 0 && self.already_stored == 0 && self.failed.is_empty()
     }
 
+    fn count(&mut self, video: &Path, outcome: &VideoOutcome) {
+        match outcome {
+            VideoOutcome::AlreadyScanned { .. } => self.already_stored += 1,
+            VideoOutcome::Scanned { .. } => self.freshly_scanned += 1,
+            VideoOutcome::Failed { reason } => self.failed.push(FailedScan {
+                video: video.to_path_buf(),
+                reason: reason.clone(),
+            }),
+        }
+    }
+
     pub fn describe(&self) -> String {
         format!(
             "{} scanned, {} already scanned, {} failed.",
@@ -41,50 +54,106 @@ impl ScanAheadSummary {
     }
 }
 
-/// Scans the video at `path`, or every video directly inside that folder.
-/// One video failing does not stop the rest. Fails outright only when the
-/// path itself cannot be read.
+/// How scanning one video ahead of time went.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VideoOutcome {
+    /// A stored scan still applied. `found` says what it holds.
+    AlreadyScanned {
+        found: String,
+    },
+    Scanned {
+        found: String,
+        seconds: f64,
+    },
+    Failed {
+        reason: String,
+    },
+}
+
+/// One video of a run is done.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoDone<'a> {
+    /// Counted from one.
+    pub position: usize,
+    pub video_count: usize,
+    pub video: &'a Path,
+    pub outcome: VideoOutcome,
+    /// Stretches of the video a fresh scan could not decode.
+    pub undecoded: Vec<UndecodedFrames>,
+}
+
+impl fmt::Display for VideoDone<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = self.video.file_name().unwrap_or(self.video.as_os_str());
+        write!(
+            formatter,
+            "[{}/{}] {}: ",
+            self.position,
+            self.video_count,
+            name.to_string_lossy()
+        )?;
+        match &self.outcome {
+            VideoOutcome::AlreadyScanned { found } => {
+                write!(formatter, "{found}, already scanned")
+            }
+            VideoOutcome::Scanned { found, seconds } => {
+                write!(formatter, "{found}, scanned in {seconds:.1}s")
+            }
+            VideoOutcome::Failed { reason } => write!(formatter, "failed, {reason}"),
+        }
+    }
+}
+
+/// Scans the video at `path`, or every video directly inside that folder,
+/// and tells `on_video_done` about each one as it finishes. One video
+/// failing does not stop the rest. Fails outright only when the path itself
+/// cannot be read.
 pub fn scan_ahead(
     path: &Path,
     settings: &ScanSettings,
     depth: ScanDepth,
+    mut on_video_done: impl FnMut(&VideoDone),
 ) -> Result<ScanAheadSummary> {
     let videos = library::videos_at(path)?;
     let mut summary = ScanAheadSummary::default();
 
     for (position, video) in videos.iter().enumerate() {
-        let name = video.file_name().unwrap_or(video.as_os_str());
-        let progress = format!(
-            "[{}/{}] {}",
-            position + 1,
-            videos.len(),
-            name.to_string_lossy()
-        );
-
         let started = Instant::now();
-        match cache::detect_with_cache(video, settings, CacheUse::ReuseStoredScan, depth) {
+        // A run from the command line shows no progress bar.
+        let scanned = cache::detect_with_cache(
+            video,
+            settings,
+            CacheUse::ReuseStoredScan,
+            depth,
+            &detect::no_scan_progress,
+        );
+        let (outcome, undecoded) = match scanned {
             Ok(sourced) => {
                 let found = describe_detection(&sourced.detection);
-                match sourced.source {
-                    DetectionSource::StoredScan => {
-                        summary.already_stored += 1;
-                        println!("{progress}: {found}, already scanned");
-                    }
-                    DetectionSource::FreshScan => {
-                        summary.freshly_scanned += 1;
-                        let seconds = started.elapsed().as_secs_f64();
-                        println!("{progress}: {found}, scanned in {seconds:.1}s");
-                    }
-                }
+                let outcome = match sourced.source {
+                    DetectionSource::StoredScan => VideoOutcome::AlreadyScanned { found },
+                    DetectionSource::FreshScan => VideoOutcome::Scanned {
+                        found,
+                        seconds: started.elapsed().as_secs_f64(),
+                    },
+                };
+                (outcome, sourced.undecoded)
             }
-            Err(error) => {
-                println!("{progress}: failed, {error:#}");
-                summary.failed.push(FailedScan {
-                    video: video.clone(),
+            Err(error) => (
+                VideoOutcome::Failed {
                     reason: format!("{error:#}"),
-                });
-            }
-        }
+                },
+                Vec::new(),
+            ),
+        };
+        summary.count(video, &outcome);
+        on_video_done(&VideoDone {
+            position: position + 1,
+            video_count: videos.len(),
+            video,
+            outcome,
+            undecoded,
+        });
     }
     Ok(summary)
 }
@@ -93,7 +162,7 @@ fn describe_detection(detection: &Detection) -> String {
     let black_screens = format!("black screens: {}", detection.black_screens.len());
     match &detection.hard_cut_candidates {
         Some(candidates) => format!(
-            "{black_screens}, abrupt picture changes: {}",
+            "{black_screens}, sudden picture changes: {}",
             candidates.len()
         ),
         None => black_screens,
@@ -103,8 +172,8 @@ fn describe_detection(detection: &Detection) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::black::TimeSpan;
     use crate::hardcut::HardCutCandidate;
+    use crate::timecode::TimeSpan;
 
     fn detection_with(hard_cut_candidates: Option<Vec<HardCutCandidate>>) -> Detection {
         Detection {
@@ -141,7 +210,7 @@ mod tests {
         }];
         assert_eq!(
             describe_detection(&detection_with(Some(candidates))),
-            "black screens: 1, abrupt picture changes: 1"
+            "black screens: 1, sudden picture changes: 1"
         );
     }
 
@@ -152,8 +221,83 @@ mod tests {
             Path::new("no/such/folder"),
             &settings,
             ScanDepth::BlackScreens,
+            |_video_done| {},
         );
         assert!(result.is_err());
+    }
+
+    fn video_done(outcome: VideoOutcome) -> String {
+        VideoDone {
+            position: 2,
+            video_count: 5,
+            video: Path::new("videos/holiday.mp4"),
+            outcome,
+            undecoded: Vec::new(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn a_stored_scan_is_reported_as_already_scanned() {
+        let outcome = VideoOutcome::AlreadyScanned {
+            found: "black screens: 3".to_owned(),
+        };
+        assert_eq!(
+            video_done(outcome),
+            "[2/5] holiday.mp4: black screens: 3, already scanned"
+        );
+    }
+
+    #[test]
+    fn a_fresh_scan_is_reported_with_how_long_it_took() {
+        let outcome = VideoOutcome::Scanned {
+            found: "black screens: 3".to_owned(),
+            seconds: 4.26,
+        };
+        assert_eq!(
+            video_done(outcome),
+            "[2/5] holiday.mp4: black screens: 3, scanned in 4.3s"
+        );
+    }
+
+    #[test]
+    fn a_failed_scan_is_reported_with_its_reason() {
+        let outcome = VideoOutcome::Failed {
+            reason: "not a video".to_owned(),
+        };
+        assert_eq!(
+            video_done(outcome),
+            "[2/5] holiday.mp4: failed, not a video"
+        );
+    }
+
+    #[test]
+    fn each_outcome_is_counted_once() {
+        let mut summary = ScanAheadSummary::default();
+        let video = Path::new("holiday.mp4");
+        let found = || "black screens: 0".to_owned();
+
+        summary.count(video, &VideoOutcome::AlreadyScanned { found: found() });
+        summary.count(
+            video,
+            &VideoOutcome::Scanned {
+                found: found(),
+                seconds: 1.0,
+            },
+        );
+        summary.count(
+            video,
+            &VideoOutcome::Failed {
+                reason: "not a video".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            summary.describe(),
+            "1 scanned, 1 already scanned, 1 failed."
+        );
+        assert_eq!(summary.failed[0].video, video);
+        assert_eq!(summary.failed[0].reason, "not a video");
     }
 
     #[test]
