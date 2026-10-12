@@ -124,11 +124,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p "dist/$PACKAGE"
-          cp "target/$TARGET/release/$BINARY" README.md "dist/$PACKAGE/"
-          # No licence has been chosen yet. Once the file exists it ships.
-          if [ -f LICENSE ]; then
-            cp LICENSE "dist/$PACKAGE/"
-          fi
+          cp "target/$TARGET/release/$BINARY" README.md LICENSE-MIT LICENSE-APACHE "dist/$PACKAGE/"
           cd dist
           if [ "$ARCHIVE" = "zip" ]; then
             7z a -tzip "$PACKAGE.zip" "$PACKAGE"

@@ -14,7 +14,7 @@ use crate::export::{
     self, ExportOptions, ExportReport, OriginalAlwaysKept, OriginalOutcome, SplitOrder,
     Verification,
 };
-use crate::fates::ScenesToWrite;
+use crate::fates::{SceneFate, ScenesToWrite};
 use crate::ffmpeg::{Program, TimeLimit};
 use crate::probe;
 use crate::scene_name::SceneNamePattern;
@@ -136,6 +136,54 @@ fn folders_in(folder: &Path) -> Vec<PathBuf> {
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.is_dir())
         .collect()
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn an_exact_split_leaves_out_a_dropped_scene_and_names_the_rest_by_the_pattern() {
+    let video = TestVideo::with_reordered_pictures("exact_with_a_dropped_scene");
+    let original_bytes = std::fs::read(&video.path).unwrap();
+    let second_cut_frame = CUT_FRAME + 2 * REORDERED_KEYFRAME_EVERY;
+    let cuts = cuts_at(
+        REORDERED_VIDEO_SECONDS,
+        &[time_of(CUT_FRAME), time_of(second_cut_frame)],
+    );
+    let fates = vec![SceneFate::Keep, SceneFate::Drop, SceneFate::Keep];
+    let scenes = ScenesToWrite::new(cuts, fates).unwrap();
+    let order = SplitOrder::new(scenes, exact_cut_options().split_method());
+    let scene_name = SceneNamePattern::new("{number} of {count} {name}").unwrap();
+
+    let report = export::export_scenes(&video.path, &order, video.folder(), scene_name).unwrap();
+
+    // The kept scenes are numbered without a gap where the dropped one was.
+    assert_eq!(
+        report.scene_files,
+        vec![
+            video.folder().join("001 of 2 video.mp4"),
+            video.folder().join("002 of 2 video.mp4"),
+        ]
+    );
+    assert_eq!(report.dropped_scenes, 1);
+    assert_eq!(
+        picture_counts(&report.scene_files),
+        vec![CUT_FRAME, REORDERED_FRAMES - second_cut_frame]
+    );
+    // The check counted every picture of the video before the dropped
+    // scene was left out.
+    assert_eq!(proof_of(&report).pictures, REORDERED_FRAMES);
+    assert!(matches!(
+        report.original,
+        OriginalOutcome::AlwaysKept(OriginalAlwaysKept::ScenesDroppedAndCutIsExact)
+    ));
+    assert!(report.is_clean());
+    assert!(report
+        .plain_summary()
+        .contains("1 scene was dropped and is in no file."));
+    assert_eq!(std::fs::read(&video.path).unwrap(), original_bytes);
+    // Nothing of the dropped scene stays behind.
+    assert!(folders_in(video.folder()).is_empty());
+    let videos_left = std::fs::read_dir(video.folder()).unwrap().count();
+    assert_eq!(videos_left, 3);
 }
 
 #[test]

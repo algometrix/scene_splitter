@@ -706,6 +706,57 @@ mod tests {
         assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
     }
 
+    /// Every part the version before scene names, exact cuts and folder
+    /// settings wrote, with none of its values at their default.
+    const SETTINGS_OF_AN_EARLIER_VERSION: &str = r#"{
+        "scan": {"mode": "EveryFrame", "criteria":
+            {"max_dark_luma": 40, "min_dark_fraction": 0.9, "min_seconds": 0.5}},
+        "export": {"scene_location": "NewFolder", "original_policy": "Keep"},
+        "hard_cuts": {"sensitivity": "High", "min_scene_seconds": 300.0},
+        "show_tips": false,
+        "recycling_question": "Answered"
+    }"#;
+
+    #[test]
+    fn a_whole_file_of_an_earlier_version_loads_and_behaves_as_it_did() {
+        let file = SettingsFile::for_test("whole_earlier_file");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(&file.0, SETTINGS_OF_AN_EARLIER_VERSION).unwrap();
+
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+
+        // What the file says is kept.
+        assert_eq!(loaded.scan.mode, ScanMode::EveryFrame);
+        assert_eq!(loaded.hard_cuts.min_scene_seconds, 300.0);
+        assert_eq!(loaded.export.scene_location, SceneLocation::NewFolder);
+        assert_eq!(loaded.export.original_policy, OriginalPolicy::Keep);
+        assert!(!loaded.show_tips);
+        assert_eq!(loaded.recycling_question, RecyclingQuestion::Answered);
+        // What it could not say yet is as the app always did it: the names
+        // scenes always had, cuts on keyframes, and no folder of its own.
+        assert_eq!(loaded.export.scene_name, SceneNamePattern::default());
+        assert_eq!(loaded.export.cut_precision, CutPrecision::NearestKeyframe);
+        assert!(loaded.folders.is_empty());
+
+        // Saved by this version, it comes back the same.
+        loaded.save_to(&file.0).unwrap();
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(loaded));
+    }
+
+    #[test]
+    fn a_folder_remembers_how_to_find_scenes_and_nothing_about_writing_them() {
+        let mut settings = Settings::default();
+        settings.export.cut_precision = CutPrecision::ExactFrame;
+        settings.export.scene_name = SceneNamePattern::new("{number} {name}").unwrap();
+        settings.remember_detection_for_folder_of(&a_tape());
+
+        let saved = serde_json::to_value(&settings.folders).unwrap().to_string();
+        assert!(saved.contains("hard_cuts"), "{saved}");
+        for written_per_split in ["cut_precision", "scene_name", "original_policy"] {
+            assert!(!saved.contains(written_per_split), "{saved}");
+        }
+    }
+
     #[test]
     fn a_file_from_before_folder_settings_loads_with_none() {
         let file = SettingsFile::for_test("before_folders");

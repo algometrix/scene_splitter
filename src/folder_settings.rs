@@ -7,6 +7,12 @@
 //! app never looks into subfolders when a folder is added either, and with
 //! this rule the folder named on screen is always the whole answer to "why
 //! was this video scanned like that".
+//!
+//! A folder remembers only how scenes are found. How they are written (the
+//! exact cut switch, the file name pattern, where scenes go and what
+//! happens to the original) is one choice for every video. Those decide
+//! what a split leaves on disk, and a split that behaved differently from
+//! one folder to the next would be a surprise at the worst moment.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
