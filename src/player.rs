@@ -86,6 +86,8 @@ const SPLIT_EXACTLY_LABEL: &str = "Split here (S)";
 const SPLIT_EXACTLY_HINT: &str = "Cuts the scene playing now in two, on this picture.";
 /// Room for the two one-picture buttons side by side.
 const PICTURE_STEP_BUTTONS_WIDTH: f32 = 185.0;
+/// Room for the dividing line and the three speeds after it.
+const SPEED_CHOICES_WIDTH: f32 = 150.0;
 const ONE_PICTURE_BACK_LABEL: &str = "-1 picture";
 const ONE_PICTURE_FORWARD_LABEL: &str = "+1 picture";
 const PLAYER_HINT: &str =
@@ -1121,7 +1123,13 @@ impl Player {
                 self.step_frames(1, ui.ctx());
             }
 
-            ui.separator();
+            // A line drawn at the end of a row divides nothing, so the
+            // speeds start the next row without one.
+            if ui.available_size_before_wrap().x < SPEED_CHOICES_WIDTH {
+                ui.end_row();
+            } else {
+                ui.separator();
+            }
             for speed in PlaybackSpeed::ALL {
                 if ui
                     .selectable_label(self.speed == speed, speed.label())
