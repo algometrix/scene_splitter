@@ -4,6 +4,13 @@
 //! video to split it straight from the command line, or with `--scan-only`
 //! to scan videos ahead of time and review them in the window later.
 
+// Windows opens a console window for every console program it starts, so a
+// double click in Explorer would show an empty black window behind the app.
+// Built as a window program, it gets none, and `main` connects it to the
+// terminal it was started from so that the command line still prints. The
+// tests stay a console program, or their results would not show.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod app;
 mod batch;
 mod black;
@@ -171,6 +178,8 @@ struct Arguments {
 }
 
 fn main() -> Result<()> {
+    // First, so that the help text and a refused argument are printed too.
+    print_to_the_starting_terminal();
     let arguments = Arguments::parse();
     let loaded = Settings::load();
     if let Some(problem) = &loaded.problem {
@@ -219,6 +228,33 @@ fn main() -> Result<()> {
     }
     split_from_command_line(path, &arguments, &settings)
 }
+
+/// Connects the program to the terminal that started it. A window program
+/// on Windows starts with no console, so without this nothing it prints
+/// would be seen. Output sent to a file or a pipe needs no console and is
+/// not affected.
+#[cfg(windows)]
+fn print_to_the_starting_terminal() {
+    /// Stands for "the process that started this one" in `AttachConsole`.
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+
+    // SAFETY: the call takes one number and no pointers.
+    // It fails when there is no terminal to connect to, which is the normal
+    // case for a start from Explorer. There is then nobody to print to, so
+    // the result is not looked at.
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+/// Elsewhere a program started from a terminal already prints to it.
+#[cfg(not(windows))]
+fn print_to_the_starting_terminal() {}
 
 /// Downloads ffmpeg and ffprobe on a machine that has neither, printing
 /// progress as it goes.

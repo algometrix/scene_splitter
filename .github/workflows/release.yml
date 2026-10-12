@@ -1,0 +1,180 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds the program for every system and
+# attaches the packages, with their checksums, to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+# Only the last job publishes, and it asks for more itself.
+permissions:
+  contents: read
+
+# Two runs for one tag would both try to create the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  check-version:
+    name: Check that the tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # A release named v0.2.0 whose program says 0.1.0 would mislead
+      # everyone who downloads it, so stop before anything is built.
+      - name: Compare the tag with the version in Cargo.toml
+        run: |
+          crate_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ -z "$crate_version" ] || [ "$crate_version" = "null" ]; then
+            echo "::error::Could not read the version from Cargo.toml."
+            exit 1
+          fi
+          if [ "$TAG" != "v$crate_version" ]; then
+            echo "::error::The tag is $TAG, but Cargo.toml says version $crate_version, which needs the tag v$crate_version. Change the version in Cargo.toml (and Cargo.lock) or push the right tag."
+            exit 1
+          fi
+          echo "The tag $TAG matches version $crate_version in Cargo.toml."
+
+  build:
+    name: Build for ${{ matrix.platform }}
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    # A clean build with link-time optimisation takes a while, but a hung
+    # one must not hold a runner for the six hours GitHub would allow.
+    timeout-minutes: 45
+    strategy:
+      # Show every system that fails, not only the first. Nothing is
+      # published unless all of them build.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: scene_splitter.exe
+            archive: zip
+            runs_on_this_runner: true
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: scene_splitter
+            archive: tar.gz
+            runs_on_this_runner: true
+          # Built on the Apple silicon runner, which can also build for
+          # Intel. This does not depend on GitHub keeping Intel runners.
+          - platform: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary: scene_splitter
+            archive: tar.gz
+            runs_on_this_runner: false
+          # An older Ubuntu on purpose: a program built there also starts
+          # on systems with an older C library.
+          - platform: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: scene_splitter
+            archive: tar.gz
+            runs_on_this_runner: true
+    defaults:
+      run:
+        # The same shell on every system, Git Bash on Windows.
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      BINARY: ${{ matrix.binary }}
+      ARCHIVE: ${{ matrix.archive }}
+      PACKAGE: scene_splitter-${{ github.ref_name }}-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sound output, the window and the file picker need these headers to
+      # build on Linux, as in the CI workflow.
+      - name: Install Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # No build cache: a release is built from nothing but the tagged
+      # source and Cargo.lock.
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Check that the program starts and reports the tagged version
+        if: matrix.runs_on_this_runner
+        run: |
+          reported="$("target/$TARGET/release/$BINARY" --version)"
+          expected="scene_splitter ${TAG#v}"
+          if [ "$reported" != "$expected" ]; then
+            echo "::error::The built program reports '$reported', expected '$expected'."
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p "dist/$PACKAGE"
+          cp "target/$TARGET/release/$BINARY" README.md "dist/$PACKAGE/"
+          # No licence has been chosen yet. Once the file exists it ships.
+          if [ -f LICENSE ]; then
+            cp LICENSE "dist/$PACKAGE/"
+          fi
+          cd dist
+          if [ "$ARCHIVE" = "zip" ]; then
+            7z a -tzip "$PACKAGE.zip" "$PACKAGE"
+          else
+            # tar keeps the mark that makes the program runnable.
+            tar -czf "$PACKAGE.tar.gz" "$PACKAGE"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/${{ env.PACKAGE }}.${{ matrix.archive }}
+          if-no-files-found: error
+          # Only needed until the last job has attached it to the release.
+          retention-days: 3
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Creating a release and attaching files to it.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA-256 checksums
+        working-directory: dist
+        run: |
+          sha256sum scene_splitter-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # A run started again for the same tag replaces the files of the
+      # release it made the first time.
+      - name: Create the release and attach the packages
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" scene_splitter-* SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" scene_splitter-* SHA256SUMS.txt --verify-tag --title "Scene Splitter $TAG" --generate-notes
+          fi

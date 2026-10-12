@@ -1,6 +1,7 @@
 # Scene Splitter
 
 [![CI](https://github.com/algometrix/scene_splitter/actions/workflows/ci.yml/badge.svg)](https://github.com/algometrix/scene_splitter/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/algometrix/scene_splitter?color=4F46C8)](https://github.com/algometrix/scene_splitter/releases/latest)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-4F46C8)
 ![Rust](https://img.shields.io/badge/rust-1.88%2B-FF7A50?logo=rust&logoColor=white)
 ![ffmpeg](https://img.shields.io/badge/ffmpeg-downloaded%20on%20first%20run-1FA97C)
@@ -12,9 +13,30 @@ It is a desktop app and a command line tool in one program, written in Rust with
 
 ![The review screen: a timeline and one colour-coded card per scene](docs/review.png)
 
+## Download
+
+Ready-built programs are on the [Releases page](https://github.com/algometrix/scene_splitter/releases), for Windows (x64), macOS (Apple Silicon and Intel) and Linux (x64). Download the package for your system, unpack it, and start `scene_splitter`. There is nothing to install. If the page lists no release yet, build the program yourself as shown under [Quick start](#quick-start).
+
+You do not need ffmpeg. If it is missing, the app downloads it the first time it runs. See [ffmpeg](#ffmpeg).
+
+Each release has a `SHA256SUMS.txt` file. To check that a download arrived unchanged, put that file next to the package and run:
+
+```
+sha256sum --ignore-missing -c SHA256SUMS.txt        # Linux
+shasum -a 256 --ignore-missing -c SHA256SUMS.txt    # macOS
+```
+
+On Windows, run this in PowerShell and compare the result with the line for your package in `SHA256SUMS.txt`:
+
+```
+Get-FileHash .\scene_splitter-v0.1.0-windows-x86_64.zip -Algorithm SHA256
+```
+
+The programs are not signed. Windows may show a "Windows protected your PC" notice, and macOS may refuse to open the program the first time. On macOS, running `xattr -d com.apple.quarantine scene_splitter` once in the unpacked folder allows it.
+
 ## Quick start
 
-You need a Rust toolchain (1.88 or newer). On Linux, install the [build packages](#requirements) first.
+To build from source you need a Rust toolchain (1.88 or newer). On Linux, install the [build packages](#requirements) first.
 
 ```
 git clone https://github.com/algometrix/scene_splitter
@@ -30,6 +52,7 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 
 ## Contents
 
+- [Download](#download)
 - [What it does](#what-it-does)
 - [Requirements](#requirements)
 - [Build and run](#build-and-run)
@@ -67,7 +90,7 @@ By default the original video moves to the Recycle Bin or Trash once the scene f
 
 ## Requirements
 
-- A Rust toolchain, version 1.88 or newer, with Cargo.
+- A Rust toolchain, version 1.88 or newer, with Cargo. A [downloaded program](#download) needs none.
 - Windows, macOS or Linux. See [Platforms](#platforms) for what has been tested.
 - On Linux, a few packages to build it (Debian and Ubuntu names):
 
@@ -244,6 +267,18 @@ Options you leave out take their value from the saved [settings](#settings). Out
 A video with chapters is listed and split at its chapter marks too, and the list of scenes shows the chapter titles. `--no-chapters` leaves the marks out.
 
 A command line split exits with an error code when the scenes could not be verified or the original could not be moved, so a script can tell.
+
+On Windows the program is built as a window program, so that starting it from Explorer opens no console window. From a terminal it still prints there, but an interactive Command Prompt or PowerShell does not wait for a window program: the prompt comes back at once and the output appears after it. To wait for it, and to get its exit code, start it like this in Command Prompt:
+
+```
+start /wait "" scene_splitter video.mp4 --list-only
+```
+
+And like this in PowerShell:
+
+```
+scene_splitter video.mp4 --list-only | Out-Host
+```
 
 Which options work together:
 
