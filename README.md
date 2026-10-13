@@ -13,6 +13,10 @@ It is a desktop app and a command line tool in one program, written in Rust with
 
 ![The review screen: a timeline and one colour-coded card per scene](docs/review.png)
 
+A review from start to finish, in 40 seconds:
+
+![A review: stepping through the scenes, playing one, adding a split in the player, merging, dropping, undoing, and marking the video to split later](docs/demo.gif)
+
 ## Download
 
 Ready-built programs are on the [Releases page](https://github.com/algometrix/scene_splitter/releases), for Windows (x64), macOS (Apple Silicon and Intel) and Linux (x64). Download the package for your system, unpack it, and start `scene_splitter`. There is nothing to install. If the page lists no release yet, build the program yourself as shown under [Quick start](#quick-start).
