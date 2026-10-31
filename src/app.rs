@@ -11,9 +11,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -25,34 +26,35 @@ use crate::exact_cut::CutPrecision;
 use crate::exact_fallback::ExactCutLook;
 use crate::exact_split;
 use crate::export::{
-    self, ExistingListFile, ExportReport, OriginalAlwaysKept, OriginalPolicy, SplitMethod,
-    SplitOrder, TRASH_NAME,
+    self, ExistingListFile, ExportReport, OriginalAlwaysKept, OriginalPolicy, SplitOrder,
+    SplitProgress, SplitStage, TRASH_NAME,
 };
+use crate::icons::{self, Icon};
 use crate::keyboard::{self, KeyboardOwner};
 use crate::library;
 use crate::player::{Player, PlayerEvent, SplitHere};
 use crate::queue::{ExportOrder, Failure, Job, JobId, JobStatus, Queue, Refused, ScanOrder};
-use crate::review::{file_name, ReviewScreen};
+use crate::review::{file_name, EditorOutput, ReviewScreen};
 use crate::review_session::{
     counted, EarlierSceneFiles, ExportObstacle, FollowUp, ReviewRequest, ReviewSession,
     SceneListNote,
 };
+use crate::scene_length::SceneLengthLimits;
 use crate::scene_list::{FrameRate, SceneList, SceneListFormat};
 use crate::scene_name::{SceneNamePattern, SceneNames};
-use crate::settings::{LoadedSettings, RecyclingQuestion, Settings, SettingsChange};
-use crate::settings_controls::{self, SceneNameDraft};
+use crate::screenshot::ScreenshotHook;
+use crate::settings::{LoadedSettings, RecyclingQuestion, ReviewRoom, Settings, SettingsChange};
+use crate::settings_controls::SceneNameDraft;
+use crate::settings_dialog::{self, SettingsDialogRequest, SettingsInDialog, SettingsTab};
 use crate::split::{self, SceneLocation};
-use crate::theme;
+use crate::theme::{self, ReviewLayout};
 use crate::tools::{self, Availability, DownloadProgress};
 
-const WINDOW_TITLE: &str = "Scene Splitter";
+const WINDOW_TITLE: &str = "Cutaway";
 const WINDOW_SIZE: [f32; 2] = [1320.0, 900.0];
 /// Below this the review screen cannot show its buttons and a scene card.
 const MIN_WINDOW_SIZE: [f32; 2] = [900.0, 600.0];
 const QUEUE_PANEL_WIDTH: f32 = 270.0;
-/// A heading that folds does not wrap, so this one has to fit the queue
-/// panel at its narrowest.
-const BLACK_SCREEN_SETTINGS_HEADING: &str = "Advanced: black screens";
 const QUEUE_PANEL_NARROWEST: f32 = 230.0;
 const QUEUE_PANEL_WIDEST: f32 = 380.0;
 /// The most of the window the queue panel may take. Open settings ask for
@@ -65,8 +67,20 @@ const CARD_SIDE_ROOM: f32 = 48.0;
 const DETAILS_MAX_HEIGHT: f32 = 140.0;
 /// The width of the numbered pill and its gap on the welcome card.
 const STEP_NUMBER_ROOM: f32 = 48.0;
-const JOB_CARD_ROUNDING: f32 = 10.0;
+const JOB_CARD_ROUNDING: f32 = 12.0;
+/// The rounded square with the file type, at the start of a video's card.
+const FILE_TYPE_TILE_SIZE: f32 = 34.0;
+/// The app's mark at the top of the welcome card.
+const WELCOME_MARK_SIZE: f32 = 64.0;
+const FILE_TYPE_TILE_ROUNDING: f32 = 9.0;
+const FILE_TYPE_SIZE: f32 = 10.5;
+/// Longer file types are cut, so the tile never grows.
+const FILE_TYPE_MOST_LETTERS: usize = 4;
 const STATUS_DOT_SIZE: f32 = 8.0;
+const ADD_DIALOG_TITLE: &str = "Add videos";
+const CHOICE_TILE_HEIGHT: f32 = 96.0;
+const CHOOSE_VIDEOS_DETAIL: &str = "One video or several";
+const CHOOSE_FOLDER_DETAIL: &str = "The videos in it, not in its subfolders";
 const ADD_DIALOG_WIDTH: f32 = 440.0;
 const RECYCLING_DIALOG_WIDTH: f32 = 480.0;
 /// The bar under the status of the video being scanned, in the sidebar.
@@ -74,14 +88,16 @@ const SIDEBAR_SCAN_BAR_HEIGHT: f32 = 6.0;
 /// The bar on the page of the video being scanned.
 const SCAN_BAR_HEIGHT: f32 = 10.0;
 /// Room left beside the path box for its Add button.
-const ADD_BUTTON_SPACE: f32 = 70.0;
+const ADD_BUTTON_SPACE: f32 = 86.0;
 const PATH_HINT: &str = if cfg!(windows) {
     r"C:\Videos or C:\Videos\film.mp4"
 } else {
     "/videos or /videos/film.mp4"
 };
 const DRAG_PROMPT: &str = "or drag videos or a folder into this window";
-const DRAG_PROMPT_IN_SIDEBAR: &str = "Or drag videos or a folder into the window.";
+const VIDEOS_SECTION_LABEL: &str = "Videos";
+const SETTINGS_LABEL: &str = "Settings";
+const SETTINGS_HINT: &str = "How videos are scanned and split, and how the window looks.";
 const DRAG_PROMPT_IN_ADD_DIALOG: &str = "You can also drag videos or a folder into the window.";
 /// The steps of using the app, shown on the first screen.
 const WELCOME_STEPS: [(&str, &str); 3] = [
@@ -95,7 +111,7 @@ const WELCOME_STEPS: [(&str, &str); 3] = [
     ),
     (
         "Split",
-        "One file per scene is written next to the video and checked against the original. \
+        "One file per scene is written next to the video and checked. \
          Then the original is moved to the Recycle Bin or Trash. You can turn that off.",
     ),
 ];
@@ -120,26 +136,11 @@ const EDIT_AGAIN_LABEL: &str = "Edit the scenes again";
 const EDIT_AGAIN_EXPLANATION: &str =
     "Takes this video back into review. It is then no longer ready, \
      until you press \"Split later\" again.";
-const WINDOW_SETTINGS_HEADING: &str = "How the window looks";
-const FOLDERS_HEADING: &str = "Folders with their own scan settings";
-const FOLDERS_EXPLANATION: &str =
-    "Videos in these folders are not scanned with the general settings. \
-     Change a folder's settings on the review screen of one of its videos.";
-const SETTINGS_SAVED_NOTE: &str =
-    "Changes are saved straight away. Scan settings apply the next time a video is scanned.";
-const RESTORE_DEFAULTS_LABEL: &str = "Restore default settings";
-const RESTORE_DEFAULTS_EXPLANATION: &str = "Puts every setting here back to how it was at first.";
-/// Under the button and not in a hover: it cannot be taken back, so it is
-/// said where it is read without pointing.
-const RESTORE_DEFAULTS_NOTE: &str = "Also forgets the settings remembered for folders. \
-     What happens to originals stays as it is.";
-const FORGET_FOLDER_EXPLANATION: &str =
-    "Videos in this folder are scanned with the general settings again.";
 /// Problems are few and each is a line of text. Should something go wrong
 /// over and over, only the newest are kept, so the sidebar stays usable.
 const MOST_PROBLEMS_KEPT: usize = 5;
 const WELCOME_EXPLANATION: &str =
-    "Scene Splitter finds the black screens between scenes and cuts the video there. \
+    "Cutaway finds the black screens between scenes and cuts the video there. \
      The scenes are copied as they are, so nothing is encoded again.";
 
 /// Opens the window and blocks until it is closed. With `first_path` that
@@ -154,7 +155,8 @@ pub fn run(
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE)
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(icons::window_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -166,7 +168,7 @@ pub fn run(
             app.get_tools_if_missing(&creation.egui_ctx);
             if let Some(path) = first_path {
                 if let Err(problem) = app.add_path(path) {
-                    app.add_feedback = problem;
+                    app.add_feedback = Some(problem);
                 }
                 app.queue.scan_waiting_videos_as(first_scan);
             }
@@ -180,6 +182,9 @@ pub fn run(
 enum AppRequest {
     OpenAddDialog,
     CloseAddDialog,
+    OpenSettings,
+    /// What the person did in the Settings dialog.
+    InSettings(SettingsDialogRequest),
     /// Add what was chosen or pasted in the add dialog.
     AddFromDialog(Vec<PathBuf>),
     /// Add what was dropped on the window.
@@ -280,16 +285,71 @@ enum JobEvent {
     /// The scan is still running and has come this far.
     ScanProgressed(ScanProgress),
     Scanned(Result<SourcedDetection>),
+    /// The split is still running and has come this far.
+    SplitProgressed(SplitProgress),
     Exported(Result<ExportReport>),
     /// A look at the video's file said this about cutting it on exact
     /// pictures.
     ExactCutLookedAt(ExactCutLook),
+    /// The video's file is no longer in its folder.
+    VideoIsGone,
     /// The background work stopped without a result.
     Crashed,
 }
 
+/// How often the list is looked through for videos whose files are gone.
+/// Soon enough that a video deleted in the file manager is off the list by
+/// the time the person is back in the window.
+const LOOK_FOR_GONE_VIDEOS_EVERY: Duration = Duration::from_secs(3);
+
+/// The look through the list for videos whose files are gone. It runs in
+/// the background, since a drive that has gone to sleep can take seconds to
+/// answer.
+#[derive(Default)]
+struct LookForGoneVideos {
+    last_started: Option<Instant>,
+    under_way: Arc<AtomicBool>,
+}
+
+impl LookForGoneVideos {
+    fn is_due(&self) -> bool {
+        let long_enough_ago = self
+            .last_started
+            .is_none_or(|started| started.elapsed() >= LOOK_FOR_GONE_VIDEOS_EVERY);
+        long_enough_ago && !self.under_way.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether the video was deleted, moved or renamed. A video whose folder
+/// cannot be seen either is not counted as gone: its drive is unplugged or
+/// its share is offline, and it may well be back.
+fn video_is_gone(video: &Path) -> bool {
+    let folder_is_there = video
+        .parent()
+        .is_some_and(|folder| folder.try_exists().unwrap_or(false));
+    folder_is_there && matches!(video.try_exists(), Ok(false))
+}
+
+/// "holiday.mp4 is no longer in its folder", or the same of several videos.
+fn gone_videos_in_words(gone: &[String]) -> Option<String> {
+    match gone {
+        [] => None,
+        [only] => Some(format!(
+            "{only} is no longer in its folder and was taken off the list."
+        )),
+        several => Some(format!(
+            "{} videos are no longer in their folders and were taken off the list.",
+            several.len()
+        )),
+    }
+}
+
 struct SceneSplitterApp {
     settings: Settings,
+    /// Saves pictures of the window when asked, if it was started to.
+    screenshot: Option<ScreenshotHook>,
+    /// The tab the Settings dialog shows, while it is open.
+    settings_tab: Option<SettingsTab>,
     /// The settings as last written to disk, to notice when they change.
     saved_settings: Settings,
     /// Why the settings could not be saved, when that happened.
@@ -305,7 +365,8 @@ struct SceneSplitterApp {
     updates_sender: Sender<JobUpdate>,
     updates: Receiver<JobUpdate>,
     add_dialog: AddDialog,
-    add_feedback: String,
+    /// What the last add has to say beyond the videos it put in the list.
+    add_feedback: Option<String>,
     player: Option<ActivePlayer>,
     /// The split that waits for the person to say, this once, what happens
     /// to originals.
@@ -318,6 +379,7 @@ struct SceneSplitterApp {
     problems: Vec<String>,
     /// Whether a text box had the keyboard when the last frame ended.
     text_box_had_the_keyboard: bool,
+    look_for_gone_videos: LookForGoneVideos,
 }
 
 /// Whether the programs that do the video work are in place.
@@ -344,6 +406,18 @@ struct AddDialog {
     focus_path_box: bool,
     /// Why the last thing chosen could not be added.
     problem: String,
+}
+
+/// What to say about the videos of an add that were in the list already,
+/// when some were.
+fn already_listed_note(found: usize, added: usize) -> Option<String> {
+    let already_listed = found.saturating_sub(added);
+    match (already_listed, added) {
+        (0, _) => None,
+        (_, 0) => Some(counted_already_listed(found)),
+        (1, _) => Some("1 of these videos was already in the list.".to_owned()),
+        (count, _) => Some(format!("{count} of these videos were already in the list.")),
+    }
 }
 
 fn counted_already_listed(video_count: usize) -> String {
@@ -384,6 +458,13 @@ fn percent_done(fraction: f32) -> u32 {
     (fraction.clamp(0.0, 1.0) * PERCENT as f32) as u32
 }
 
+fn split_stage_in_words(stage: SplitStage) -> &'static str {
+    match stage {
+        SplitStage::WritingScenes => "Writing the scene files.",
+        SplitStage::CheckingScenes => "Checking that every scene file plays.",
+    }
+}
+
 fn scan_stage_in_words(stage: ScanStage) -> &'static str {
     match stage {
         ScanStage::BlackScreens => "Looking for black screens.",
@@ -412,6 +493,13 @@ struct ActivePlayer {
 impl eframe::App for SceneSplitterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.run_frame(ctx);
+    }
+
+    /// The page colour behind everything. Where two panels meet between
+    /// pixels, as at 125 percent scaling, the default near-black would show
+    /// through as a dark seam.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 
@@ -452,12 +540,15 @@ impl SceneSplitterApp {
             updates_sender,
             updates,
             add_dialog: AddDialog::default(),
-            add_feedback: String::new(),
+            add_feedback: None,
             player: None,
             recycling_question_for: None,
             batch: None,
             problems: Vec::new(),
             text_box_had_the_keyboard: false,
+            look_for_gone_videos: LookForGoneVideos::default(),
+            screenshot: ScreenshotHook::from_environment(),
+            settings_tab: None,
         }
     }
 
@@ -466,15 +557,18 @@ impl SceneSplitterApp {
     fn run_frame(&mut self, ctx: &egui::Context) {
         // Before anything is drawn, so a choice made in the settings during
         // the last frame shows in this one.
+        theme::dress_in(ctx, self.settings.style);
         theme::show_in(ctx, self.settings.theme);
         self.follow_setup();
         self.apply_job_updates();
+        self.look_for_gone_videos(ctx);
         self.advance_batch(ctx);
         self.tell_the_review_where_new_splits_land();
         self.look_whether_the_video_on_show_can_be_cut_exactly(ctx);
         self.apply(ctx, requests_from_keys_and_drops(ctx));
         self.start_next_scan(ctx);
         self.close_player_unless_its_video_is_in_review();
+        self.open_the_player_of_the_editor(ctx);
         self.forget_review_screens_no_longer_shown();
         self.drop_the_recycling_question_unless_its_split_can_still_start();
 
@@ -487,33 +581,61 @@ impl SceneSplitterApp {
         }
 
         let mut requests = Vec::new();
-        egui::SidePanel::left("queue")
-            .frame(theme::panel(theme::palette(ctx).sidebar))
-            .default_width(QUEUE_PANEL_WIDTH)
-            .width_range(queue_panel_widths(ctx.screen_rect().width()))
-            .show(ctx, |ui| {
-                // One scroll area for the whole panel, so opening the
-                // settings can never push the video list out of reach.
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        requests.extend(show_queue(
-                            ui,
-                            &self.queue,
-                            self.batch.as_ref(),
-                            &self.add_feedback,
-                            &self.problems,
-                            SettingsSection {
-                                settings: &self.settings,
-                                problem: &self.settings_problem,
-                                scene_name_draft: &mut self.scene_name_draft,
-                            },
-                        ));
-                    });
-            });
+        if keyboard.lets_screens_use_keys(ctx)
+            && !ctx.wants_keyboard_input()
+            && keyboard::take_plain_key(ctx, keyboard::ROOM_SHORTCUT.logical_key)
+        {
+            let change = SettingsChange::SwitchReviewRoom;
+            requests.push(AppRequest::ChangeSettingsTo(Box::new(
+                self.settings.changed_by(change),
+            )));
+        }
+        let reviewing = self
+            .queue
+            .current_job()
+            .is_some_and(|job| matches!(job.status(), JobStatus::Reviewing(_)));
+        let footage_only = reviewing && self.settings.room == ReviewRoom::FootageOnly;
+        if !footage_only {
+            let asked_in_the_bar = egui::TopBottomPanel::top("app_bar")
+                .frame(theme::app_bar_panel(ctx))
+                .show_separator_line(false)
+                .show(ctx, show_app_bar)
+                .inner;
+            requests.extend(asked_in_the_bar);
+            egui::SidePanel::left("queue")
+                .frame(theme::panel(theme::palette(ctx).sidebar))
+                // The sidebar is a shade apart from the page, so it needs no line.
+                .show_separator_line(false)
+                .default_width(QUEUE_PANEL_WIDTH)
+                .width_range(queue_panel_widths(ctx.screen_rect().width()))
+                .show(ctx, |ui| {
+                    // One scroll area for the whole panel, so opening the
+                    // settings can never push the video list out of reach.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            requests.extend(show_queue(
+                                ui,
+                                &self.queue,
+                                self.batch.as_ref(),
+                                self.add_feedback.as_deref(),
+                                &self.problems,
+                            ));
+                        });
+                });
+        }
         requests.extend(self.show_current_job(ctx, keyboard));
         if self.add_dialog.open {
             requests.extend(show_add_dialog(ctx, &mut self.add_dialog));
+        }
+        if let Some(tab) = self.settings_tab {
+            let shown = SettingsInDialog {
+                in_use: &self.settings,
+                problem: &self.settings_problem,
+                scene_name_draft: &mut self.scene_name_draft,
+            };
+            let asked = settings_dialog::show(ctx, tab, shown);
+            requests.extend(asked.into_iter().map(AppRequest::InSettings));
         }
         requests.extend(self.show_player(ctx));
         requests.extend(self.show_recycling_question(ctx));
@@ -521,6 +643,13 @@ impl SceneSplitterApp {
 
         self.text_box_had_the_keyboard = ctx.wants_keyboard_input();
         self.save_settings_once_changed(ctx);
+        let screenshot_problem = self
+            .screenshot
+            .as_ref()
+            .and_then(|hook| hook.run_frame(ctx).err());
+        if let Some(problem) = screenshot_problem {
+            self.note_problem(problem);
+        }
     }
 
     /// A split the person adds lands on the nearest keyframe or on the very
@@ -577,7 +706,10 @@ impl SceneSplitterApp {
 
     /// A dialog in front of everything has the keyboard to itself.
     fn keyboard_owner(&self) -> KeyboardOwner {
-        if self.add_dialog.open || self.recycling_question_for.is_some() {
+        if self.add_dialog.open
+            || self.settings_tab.is_some()
+            || self.recycling_question_for.is_some()
+        {
             KeyboardOwner::Dialog
         } else {
             KeyboardOwner::Screens
@@ -666,11 +798,19 @@ impl SceneSplitterApp {
                 self.add_dialog.focus_path_box = true;
             }
             AppRequest::CloseAddDialog => self.add_dialog = AddDialog::default(),
+            AppRequest::OpenSettings => self.settings_tab = Some(SettingsTab::default()),
+            AppRequest::InSettings(SettingsDialogRequest::ShowTab(tab)) => {
+                self.settings_tab = Some(tab);
+            }
+            AppRequest::InSettings(SettingsDialogRequest::Close) => self.settings_tab = None,
+            AppRequest::InSettings(SettingsDialogRequest::ChangeTo(settings)) => {
+                self.apply_request(ctx, AppRequest::ChangeSettingsTo(settings));
+            }
             AppRequest::AddFromDialog(paths) => self.add_from_dialog(paths),
             AppRequest::AddDropped(paths) => {
                 for path in paths {
                     if let Err(problem) = self.add_path(path) {
-                        self.add_feedback = problem;
+                        self.add_feedback = Some(problem);
                     }
                 }
             }
@@ -1076,14 +1216,8 @@ impl SceneSplitterApp {
         }
 
         let added = self.queue.add_all(&videos);
-        self.add_feedback = if added.added == 0 {
-            counted_already_listed(videos.len())
-        } else {
-            format!(
-                "Added {}. Scanning starts by itself.",
-                counted(added.added, "video")
-            )
-        };
+        // A video that was added shows up in the list, which says so.
+        self.add_feedback = already_listed_note(videos.len(), added.added);
         Ok(())
     }
 
@@ -1170,11 +1304,46 @@ impl SceneSplitterApp {
             precision: self.settings.export.cut_precision,
             would_land_at: split_would_land_at,
         };
-        match active.player.show(ctx, &scenes, split_here) {
+        // In the editor the review screen draws the player as part of it.
+        let in_the_editor = self.settings.style.review_layout() != ReviewLayout::List
+            && self.queue.current() == Some(job);
+        if in_the_editor {
+            return None;
+        }
+        let event = active.player.show(ctx, &scenes, split_here);
+        match event {
             PlayerEvent::StillOpen => None,
             PlayerEvent::Closed => Some(AppRequest::ClosePlayer),
             PlayerEvent::SplitRequested(time) => Some(AppRequest::SplitAtPlayhead { job, time }),
         }
+    }
+
+    /// The editor layout always shows the player, paused at the start of
+    /// the video in review until the person plays something. Another video
+    /// shown in review gets a player of its own.
+    fn open_the_player_of_the_editor(&mut self, ctx: &egui::Context) {
+        if self.settings.style.review_layout() == ReviewLayout::List {
+            return;
+        }
+        let Some(job) = self.queue.current() else {
+            return;
+        };
+        let Some(review) = self.queue.review(job) else {
+            return;
+        };
+        if self.player.as_ref().is_some_and(|active| active.job == job) {
+            return;
+        }
+        self.player = Some(ActivePlayer {
+            job,
+            player: Player::showing_still_at(
+                Arc::clone(review.video()),
+                review.video_end(),
+                review.frame_seconds(),
+                0.0,
+                ctx,
+            ),
+        });
     }
 
     fn start_export(&mut self, ctx: &egui::Context, job: JobId) {
@@ -1214,12 +1383,30 @@ impl SceneSplitterApp {
         // Saved with every other change once the frame is over, so the
         // scenes of this split are still known after the name is changed.
         self.settings.remember_scene_name_in_use();
-        self.run_in_background(ctx, order.job, move || {
-            JobEvent::Exported(export::export_scenes(
+        let job = order.job;
+        let updates_sender = self.updates_sender.clone();
+        let window = ctx.clone();
+        self.run_in_background(ctx, job, move || {
+            let steps = WholePercentSteps::default();
+            let report_progress = |progress: SplitProgress| {
+                if !steps.admits(progress.fraction) {
+                    return;
+                }
+                let update = JobUpdate {
+                    job,
+                    event: JobEvent::SplitProgressed(progress),
+                };
+                // The send only fails once the window is gone.
+                if updates_sender.send(update).is_ok() {
+                    window.request_repaint();
+                }
+            };
+            JobEvent::Exported(export::export_scenes_reporting(
                 &order.video,
                 &split_order,
                 &out_dir,
                 scene_names,
+                &report_progress,
             ))
         });
     }
@@ -1245,10 +1432,73 @@ impl SceneSplitterApp {
         });
     }
 
+    /// How short and how long a scene of this video may be: what its
+    /// folder remembers, else the general setting. A video that left the
+    /// queue while it was scanned has nothing in force, and the queue
+    /// refuses its scan anyway.
+    fn scene_lengths_in_force_for(&self, job: JobId) -> SceneLengthLimits {
+        self.queue.job(job).map_or(SceneLengthLimits::NONE, |job| {
+            self.settings
+                .detection_for(job.video())
+                .detection
+                .scene_length
+        })
+    }
+
+    /// Looks, every few seconds and in the background, whether the files of
+    /// the listed videos are still there. Each one that is gone is reported
+    /// like any other news about a video.
+    fn look_for_gone_videos(&mut self, ctx: &egui::Context) {
+        // So that the next look comes round while nobody touches the window.
+        ctx.request_repaint_after(LOOK_FOR_GONE_VIDEOS_EVERY);
+        if !self.look_for_gone_videos.is_due() {
+            return;
+        }
+        let videos = self.queue.videos_to_look_for();
+        if videos.is_empty() {
+            return;
+        }
+        self.look_for_gone_videos.last_started = Some(Instant::now());
+        let under_way = Arc::clone(&self.look_for_gone_videos.under_way);
+        under_way.store(true, Ordering::Relaxed);
+        let updates_sender = self.updates_sender.clone();
+        let window = ctx.clone();
+        std::thread::spawn(move || {
+            for (job, video) in videos {
+                if !video_is_gone(&video) {
+                    continue;
+                }
+                let update = JobUpdate {
+                    job,
+                    event: JobEvent::VideoIsGone,
+                };
+                // The send only fails once the window is gone.
+                if updates_sender.send(update).is_ok() {
+                    window.request_repaint();
+                }
+            }
+            under_way.store(false, Ordering::Relaxed);
+        });
+    }
+
+    /// Takes a video whose file is gone off the list, and returns its name
+    /// when that was done. It stays while a run over the ready videos is
+    /// under way, which counts on its videos, and when it has started to be
+    /// scanned or split since the look. Both say for themselves what
+    /// becomes of it.
+    fn forget_gone_video(&mut self, job: JobId) -> Option<String> {
+        if self.batch_is_running() {
+            return None;
+        }
+        let name = file_name(self.queue.job(job)?.video());
+        self.queue.forget(job).ok().map(|()| name)
+    }
+
     /// Tells the queue how far the background work has come, and how the
     /// work that has ended went.
     fn apply_job_updates(&mut self) {
         let updates: Vec<JobUpdate> = self.updates.try_iter().collect();
+        let mut gone_videos = Vec::new();
         for JobUpdate { job, event } in updates {
             // A run over the ready videos waits for this to give the next
             // video its turn. It ignores a video whose turn it is not.
@@ -1257,10 +1507,14 @@ impl SceneSplitterApp {
             }
             let told = match event {
                 JobEvent::ScanProgressed(progress) => self.queue.scan_progressed(job, progress),
-                JobEvent::Scanned(Ok(sourced)) => self.queue.scan_finished(job, sourced),
+                JobEvent::Scanned(Ok(sourced)) => {
+                    let scene_lengths = self.scene_lengths_in_force_for(job);
+                    self.queue.scan_finished(job, sourced, scene_lengths)
+                }
                 JobEvent::Scanned(Err(error)) => {
                     self.queue.failed(job, Failure::from_scan_error(&error))
                 }
+                JobEvent::SplitProgressed(progress) => self.queue.split_progressed(job, progress),
                 JobEvent::Exported(Ok(report)) => self.queue.finished(job, report),
                 JobEvent::Exported(Err(error)) => {
                     self.queue.failed(job, Failure::from_split_error(&error))
@@ -1269,9 +1523,16 @@ impl SceneSplitterApp {
                     self.queue.note_exact_cut_look(job, look);
                     Ok(())
                 }
+                JobEvent::VideoIsGone => {
+                    gone_videos.extend(self.forget_gone_video(job));
+                    Ok(())
+                }
                 JobEvent::Crashed => self.queue.crashed(job),
             };
             self.note_refusal(told);
+        }
+        if let Some(gone) = gone_videos_in_words(&gone_videos) {
+            self.note_problem(gone);
         }
     }
 
@@ -1311,6 +1572,8 @@ impl SceneSplitterApp {
         };
         let id = job.id();
         let name = file_name(job.video());
+        // What the player in the editor asked for, when it is drawn there.
+        let mut player_event = None;
 
         let request = match job.status() {
             JobStatus::Reviewing(session) => {
@@ -1318,7 +1581,7 @@ impl SceneSplitterApp {
                     .player
                     .as_ref()
                     .filter(|active| active.job == id)
-                    .map(|active| active.player.position());
+                    .map(|active| active.player.playhead());
                 // The question about sound is asked in front of the player,
                 // which is in front of the review. Only the player hears
                 // Escape as its answer. To the review it is a dialog.
@@ -1332,7 +1595,51 @@ impl SceneSplitterApp {
                     keyboard
                 };
                 let screen = self.review_screens.entry(id).or_default();
-                let requests = screen.show(ctx, session, &self.settings, playhead, review_keyboard);
+                let split_here = SplitHere {
+                    precision: self.settings.export.cut_precision,
+                    would_land_at: playhead.and_then(|time| session.split_time_near(time)),
+                };
+                let scenes = session.scenes();
+                let mut player = self.player.as_mut().filter(|active| active.job == id);
+                let mut draw_player = |ui: &mut egui::Ui| {
+                    if let Some(active) = player.as_mut() {
+                        player_event = Some(active.player.show_embedded(ui, &scenes, split_here));
+                    }
+                };
+                let asked = match self.settings.style.review_layout() {
+                    ReviewLayout::List => EditorOutput {
+                        requests: screen.show(
+                            ctx,
+                            session,
+                            &self.settings,
+                            playhead,
+                            review_keyboard,
+                        ),
+                        player: Vec::new(),
+                    },
+                    ReviewLayout::Editor => screen.show_editor(
+                        ctx,
+                        session,
+                        &self.settings,
+                        playhead,
+                        review_keyboard,
+                        &mut draw_player,
+                    ),
+                    ReviewLayout::Stage => screen.show_stage(
+                        ctx,
+                        session,
+                        &self.settings,
+                        playhead,
+                        review_keyboard,
+                        &mut draw_player,
+                    ),
+                };
+                if let Some(active) = self.player.as_mut().filter(|active| active.job == id) {
+                    for ask in asked.player {
+                        active.player.act_on(ask, ctx);
+                    }
+                }
+                let requests = asked.requests;
                 // While the question about recycling is open, the review
                 // behind it is not to be changed, not even with its keys.
                 let may_change_the_review = self.recycling_question_for.is_none();
@@ -1370,8 +1677,13 @@ impl SceneSplitterApp {
                 let split = ReadySplit::of(review, cut_precision);
                 show_ready(ctx, id, &name, split, way_to_split)
             }
-            JobStatus::Exporting(_) => {
-                show_busy(ctx, &format!("Writing and checking the scenes of {name}"));
+            JobStatus::Exporting { progress, .. } => {
+                let what = format!("Writing and checking the scenes of {name}");
+                match progress {
+                    Some(progress) => show_split_progress(ctx, &what, *progress),
+                    // A split on exact pictures does not say how far it is.
+                    None => show_busy(ctx, &what),
+                }
                 None
             }
             JobStatus::Finished(report) => show_finished(ctx, &name, report),
@@ -1380,7 +1692,14 @@ impl SceneSplitterApp {
                 show_failed(ctx, id, &name, failure, review.as_deref())
             }
         };
-        request.into_iter().collect()
+        let asked_in_the_player = match player_event {
+            Some(PlayerEvent::SplitRequested(time)) => {
+                Some(AppRequest::SplitAtPlayhead { job: id, time })
+            }
+            Some(PlayerEvent::Closed) => Some(AppRequest::ClosePlayer),
+            Some(PlayerEvent::StillOpen) | None => None,
+        };
+        request.into_iter().chain(asked_in_the_player).collect()
     }
 }
 
@@ -1413,7 +1732,11 @@ fn split_outcome_of(event: &JobEvent) -> Option<SplitOutcome> {
         // A crash is counted for the video whose turn it is, which is being
         // split. A scan that crashed is some other video's.
         JobEvent::Exported(Err(_)) | JobEvent::Crashed => Some(SplitOutcome::Failed),
-        JobEvent::ScanProgressed(_) | JobEvent::Scanned(_) | JobEvent::ExactCutLookedAt(_) => None,
+        JobEvent::ScanProgressed(_)
+        | JobEvent::Scanned(_)
+        | JobEvent::SplitProgressed(_)
+        | JobEvent::ExactCutLookedAt(_)
+        | JobEvent::VideoIsGone => None,
     }
 }
 
@@ -1453,7 +1776,16 @@ fn status_label(status: &JobStatus) -> String {
                 counted(review.scene_count(), "scene")
             ),
         },
-        JobStatus::Exporting(_) => "Writing and checking".to_owned(),
+        JobStatus::Exporting { progress: None, .. } => "Writing and checking".to_owned(),
+        JobStatus::Exporting {
+            progress: Some(progress),
+            ..
+        } => match progress.stage {
+            SplitStage::WritingScenes => format!("Writing, {}%", percent_done(progress.fraction)),
+            SplitStage::CheckingScenes => {
+                format!("Checking, {}%", percent_done(progress.fraction))
+            }
+        },
         JobStatus::Finished(report) if report.is_clean() => "Done, checked".to_owned(),
         JobStatus::Finished(_) => "Done, check the result".to_owned(),
         JobStatus::Skipped(_) => "Skipped".to_owned(),
@@ -1464,20 +1796,12 @@ fn status_label(status: &JobStatus) -> String {
 fn status_color(palette: &theme::Palette, status: &JobStatus) -> egui::Color32 {
     match status {
         JobStatus::Waiting | JobStatus::Skipped(_) => palette.muted_text,
-        JobStatus::Scanning(_) | JobStatus::Exporting(_) => palette.accent,
+        JobStatus::Scanning(_) | JobStatus::Exporting { .. } => palette.accent,
         // Both wait for the person, which is what this colour says.
         JobStatus::Reviewing(_) | JobStatus::ReadyToSplit(_) => palette.primary,
         JobStatus::Finished(report) if report.is_clean() => palette.success,
         JobStatus::Finished(_) | JobStatus::Failed { .. } => palette.danger,
     }
-}
-
-/// What the Settings section of the sidebar shows.
-struct SettingsSection<'app> {
-    settings: &'app Settings,
-    /// Why the saved settings could not be read or written, or empty.
-    problem: &'app str,
-    scene_name_draft: &'app mut SceneNameDraft,
 }
 
 /// The sidebar: the way to add videos, the videos with their progress, and
@@ -1486,26 +1810,25 @@ fn show_queue(
     ui: &mut egui::Ui,
     queue: &Queue,
     batch: Option<&SplitBatch>,
-    add_feedback: &str,
+    add_feedback: Option<&str>,
     problems: &[String],
-    settings_section: SettingsSection,
 ) -> Vec<AppRequest> {
-    let palette = theme::palette(ui.ctx());
     let mut requests = Vec::new();
-    ui.label(theme::semibold("Scene Splitter", 20.0).color(palette.primary));
     let add_button = ui
-        .add(theme::primary_button(ui, "Add videos"))
+        .add(
+            // As wide as the column, like the cards of the videos under it.
+            theme::IconButton::new(Icon::Plus, "Add videos", theme::ButtonKind::Primary)
+                .least_width(ui.available_width()),
+        )
         .on_hover_text("Choose videos or a folder, or paste a path (Ctrl+O).");
     if add_button.clicked() {
         requests.push(AppRequest::OpenAddDialog);
     }
-    ui.label(theme::caption(ui, DRAG_PROMPT_IN_SIDEBAR));
-    if !add_feedback.is_empty() {
-        ui.label(theme::caption(ui, add_feedback));
+    if let Some(feedback) = add_feedback {
+        ui.label(theme::caption(ui, feedback));
     }
 
-    ui.add_space(4.0);
-    ui.label(theme::semibold("Videos", 14.0));
+    theme::section_label(ui, VIDEOS_SECTION_LABEL);
     if queue.is_empty() {
         ui.label(theme::caption(
             ui,
@@ -1519,17 +1842,24 @@ fn show_queue(
         requests.extend(show_job_card(ui, job, is_current));
     }
     requests.extend(show_problems(ui, problems));
-
-    ui.add_space(8.0);
-    egui::CollapsingHeader::new(theme::semibold("Settings", 14.0)).show(ui, |ui| {
-        let SettingsSection {
-            settings,
-            problem,
-            scene_name_draft,
-        } = settings_section;
-        requests.extend(show_settings(ui, settings, problem, scene_name_draft));
-    });
     requests
+}
+
+/// The bar across the top of the window: the app's mark and name on the
+/// left, Settings on the right, where windows keep them.
+fn show_app_bar(ui: &mut egui::Ui) -> Option<AppRequest> {
+    let mut request = None;
+    ui.horizontal(|ui| {
+        theme::brand_mark_and_name(ui, WINDOW_TITLE);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let settings =
+                theme::IconButton::new(Icon::Gear, SETTINGS_LABEL, theme::ButtonKind::Quiet);
+            if ui.add(settings).on_hover_text(SETTINGS_HINT).clicked() {
+                request = Some(AppRequest::OpenSettings);
+            }
+        });
+    });
+    request
 }
 
 /// "Split 1 ready video", "Split 3 ready videos": the button that starts the
@@ -1608,146 +1938,24 @@ fn path_from_pasted_text(text: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-/// The settings section. Whatever changes here is saved and used from then
-/// on, by the window and by the command line.
-///
-/// The controls work on a copy of the settings in use. When they leave it
-/// different, the copy is returned for the app to take over, which is where
-/// a change of settings can be checked against what is going on.
-fn show_settings(
-    ui: &mut egui::Ui,
-    in_use: &Settings,
-    problem: &str,
-    scene_name_draft: &mut SceneNameDraft,
-) -> Option<AppRequest> {
-    let mut settings = in_use.clone();
-    let palette = theme::palette(ui.ctx());
-    if !problem.is_empty() {
-        ui.add(theme::selectable(
-            egui::RichText::new(problem).color(palette.danger),
-        ));
-        theme::copy_details_button(ui, problem);
-    }
-
-    ui.label(theme::semibold("When a video is split", 13.0));
-    settings_controls::show_cut_precision_checkbox(ui, &mut settings.export.cut_precision);
-    // An exact split keeps the original whatever this box says, so the box
-    // is not offered as if it had a say.
-    let recycling_has_a_say = matches!(
-        settings.export.split_method(),
-        SplitMethod::CopyAtKeyframes { .. }
-    );
-    ui.add_enabled_ui(recycling_has_a_say, |ui| {
-        settings_controls::show_original_policy_checkbox(
-            ui,
-            &mut settings.export.original_policy,
-            format!("Move the original to the {TRASH_NAME} after the check"),
-        )
-        .on_hover_text(
-            "The new files are compared with the original first. If anything is missing or different, the original stays.",
-        )
-        .on_disabled_hover_text(OriginalAlwaysKept::CutIsExact.in_plain_words());
-    });
-    settings_controls::show_scene_location_checkbox(ui, &mut settings.export.scene_location);
-    settings_controls::show_scene_name_box(ui, scene_name_draft, &mut settings.export.scene_name);
-    ui.checkbox(&mut settings.show_tips, "Show tips on the review screen");
-
-    ui.add_space(4.0);
-    ui.label(theme::semibold(WINDOW_SETTINGS_HEADING, 13.0));
-    ui.horizontal_wrapped(|ui| {
-        settings_controls::show_theme_choice(ui, &mut settings.theme);
-    });
-
-    ui.add_space(4.0);
-    ui.label(theme::semibold("Looking for missed scenes", 13.0));
-    ui.horizontal_wrapped(|ui| {
-        settings_controls::show_hard_cut_controls(
-            ui,
-            &mut settings.detection.hard_cuts,
-            "settings_hard_cut_sensitivity",
-        );
-    });
-
-    // What counts as a black screen needs some knowledge of video to set,
-    // and the defaults suit most films, so it stays folded away.
-    ui.add_space(4.0);
-    egui::CollapsingHeader::new(BLACK_SCREEN_SETTINGS_HEADING).show(ui, |ui| {
-        settings_controls::show_black_screen_controls(ui, &mut settings.detection.scan);
-    });
-    show_folders_with_their_own_settings(ui, &mut settings);
-
-    ui.add_space(4.0);
-    ui.label(theme::caption(ui, SETTINGS_SAVED_NOTE));
-    let restore = ui
-        .button(RESTORE_DEFAULTS_LABEL)
-        .on_hover_text(RESTORE_DEFAULTS_EXPLANATION);
-    ui.add(egui::Label::new(theme::caption(ui, RESTORE_DEFAULTS_NOTE)).wrap());
-    if restore.clicked() {
-        settings = in_use.restored_to_defaults();
-    }
-    (settings != *in_use).then(|| AppRequest::ChangeSettingsTo(Box::new(settings)))
-}
-
-/// The folders whose videos are not scanned with the general settings shown
-/// above, each with the way to make it an ordinary folder again. Draws
-/// nothing while no folder has settings of its own.
-///
-/// `settings` is the copy the Settings section works on.
-fn show_folders_with_their_own_settings(ui: &mut egui::Ui, settings: &mut Settings) {
-    if settings.folders.is_empty() {
-        return;
-    }
-    ui.add_space(4.0);
-    ui.label(theme::semibold(FOLDERS_HEADING, 13.0));
-    ui.label(theme::caption(ui, FOLDERS_EXPLANATION));
-    let mut folder_to_forget = None;
-    for (folder, _) in settings.folders.iter() {
-        let shown = folder.display().to_string();
-        ui.horizontal(|ui| {
-            let forget = ui.link("Forget").on_hover_text(FORGET_FOLDER_EXPLANATION);
-            if forget.clicked() {
-                folder_to_forget = Some(folder.to_path_buf());
-            }
-            ui.add(egui::Label::new(theme::caption(ui, &shown)).truncate())
-                .on_hover_text(&shown);
-        });
-    }
-    if let Some(folder) = folder_to_forget {
-        settings.folders.forget(&folder);
-    }
-}
-
 /// One video in the sidebar. Clicking it asks for it to be shown.
 fn show_job_card(ui: &mut egui::Ui, job: &Job, is_current: bool) -> Option<AppRequest> {
     let palette = theme::palette(ui.ctx());
-    let (fill, border) = if is_current {
-        (palette.primary_tint, palette.primary)
+    let fill = if is_current {
+        palette.primary_tint
     } else {
-        (palette.card, palette.card_border)
+        palette.card
     };
     let card = egui::Frame::none()
         .fill(fill)
         .rounding(JOB_CARD_ROUNDING)
-        .stroke(egui::Stroke::new(1.0_f32, border))
-        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(theme::semibold(file_name(job.video()), 14.0)).truncate());
             ui.horizontal(|ui| {
-                let (dot, _) = ui.allocate_exact_size(
-                    egui::vec2(STATUS_DOT_SIZE, STATUS_DOT_SIZE),
-                    egui::Sense::hover(),
-                );
-                ui.painter().circle_filled(
-                    dot.center(),
-                    STATUS_DOT_SIZE / 2.0,
-                    status_color(palette, job.status()),
-                );
-                ui.label(theme::caption(ui, status_label(job.status())));
+                show_file_type_tile(ui, job.video(), is_current);
+                ui.vertical(|ui| show_job_card_text(ui, job));
             });
-            if let JobStatus::Scanning(Some(progress)) = job.status() {
-                theme::progress_bar(ui, progress.fraction, SIDEBAR_SCAN_BAR_HEIGHT);
-            }
         })
         .response;
     let clicked = ui
@@ -1759,6 +1967,74 @@ fn show_job_card(ui: &mut egui::Ui, job: &Job, is_current: bool) -> Option<AppRe
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked();
     clicked.then_some(AppRequest::ShowJob(job.id()))
+}
+
+/// The video's file type in capitals ("MP4") in a small rounded square, as
+/// a file manager shows it. A file without a type gets a film icon instead.
+fn show_file_type_tile(ui: &mut egui::Ui, video: &Path, is_current: bool) {
+    let palette = theme::palette(ui.ctx());
+    let size = egui::vec2(FILE_TYPE_TILE_SIZE, FILE_TYPE_TILE_SIZE);
+    let (tile, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let tint = if is_current {
+        palette.card
+    } else {
+        palette.lavender_tile
+    };
+    ui.painter()
+        .rect_filled(tile, FILE_TYPE_TILE_ROUNDING, tint);
+    match file_type_badge(video) {
+        Some(badge) => {
+            ui.painter().text(
+                tile.center(),
+                egui::Align2::CENTER_CENTER,
+                badge,
+                theme::semibold_font(FILE_TYPE_SIZE),
+                palette.primary,
+            );
+        }
+        None => Icon::Film.paint(ui.painter(), tile.shrink(9.0), palette.primary),
+    }
+}
+
+/// "MP4" for `trip.mp4`, or `None` for a file without a type.
+fn file_type_badge(video: &Path) -> Option<String> {
+    let extension = video.extension()?.to_str()?;
+    let badge: String = extension
+        .chars()
+        .take(FILE_TYPE_MOST_LETTERS)
+        .collect::<String>()
+        .to_uppercase();
+    (!badge.is_empty()).then_some(badge)
+}
+
+/// The name of a video in the sidebar, how far it has come, and its progress.
+fn show_job_card_text(ui: &mut egui::Ui, job: &Job) {
+    let palette = theme::palette(ui.ctx());
+    ui.spacing_mut().item_spacing.y = 2.0;
+    ui.add(egui::Label::new(theme::semibold(file_name(job.video()), 14.0)).truncate());
+    ui.horizontal(|ui| {
+        let (dot, _) = ui.allocate_exact_size(
+            egui::vec2(STATUS_DOT_SIZE, STATUS_DOT_SIZE),
+            egui::Sense::hover(),
+        );
+        ui.painter().circle_filled(
+            dot.center(),
+            STATUS_DOT_SIZE / 2.0,
+            status_color(palette, job.status()),
+        );
+        ui.label(theme::caption(ui, status_label(job.status())));
+    });
+    let fraction_done = match job.status() {
+        JobStatus::Scanning(Some(progress)) => Some(progress.fraction),
+        JobStatus::Exporting {
+            progress: Some(progress),
+            ..
+        } => Some(progress.fraction),
+        _ => None,
+    };
+    if let Some(fraction_done) = fraction_done {
+        theme::progress_bar(ui, fraction_done, SIDEBAR_SCAN_BAR_HEIGHT);
+    }
 }
 
 /// How narrow and how wide the queue panel may be in a window this wide.
@@ -1780,10 +2056,10 @@ fn show_setup(ctx: &egui::Context, setup: &Setup) -> Option<AppRequest> {
             ui.label(theme::muted(
                 ui,
                 format!(
-                "Scene Splitter is downloading the video tools it needs (ffmpeg, about {} MB). \
+                    "Cutaway is downloading the video tools it needs (ffmpeg, about {} MB). \
                  You can add videos now. Scanning starts when the download is done.",
-                megabytes(progress.total_bytes.max(progress.received_bytes))
-            ),
+                    megabytes(progress.total_bytes.max(progress.received_bytes))
+                ),
             ));
             ui.add(egui::ProgressBar::new(progress.fraction()).show_percentage());
         }
@@ -1794,7 +2070,7 @@ fn show_setup(ctx: &egui::Context, setup: &Setup) -> Option<AppRequest> {
             );
             ui.label("Check your internet connection and press Try again.");
             show_details(ui, reason);
-            retry = ui.add(theme::primary_button(ui, "Try again")).clicked();
+            retry = ui.add(theme::primary_button("Try again")).clicked();
         }
     });
     retry.then_some(AppRequest::GetToolsAgain)
@@ -1842,36 +2118,58 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
     let clicked_outside = theme::show_backdrop(ctx, "add_dialog_backdrop", egui::Order::Middle);
     let mut paths_to_add: Option<Vec<PathBuf>> = None;
     let mut open = true;
-    egui::Window::new("Add videos")
-        .open(&mut open)
+    let width = ADD_DIALOG_WIDTH.min(ctx.screen_rect().width() - CARD_SIDE_ROOM);
+    egui::Window::new(ADD_DIALOG_TITLE)
+        .title_bar(false)
         .order(egui::Order::Foreground)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
-            ui.set_width(ADD_DIALOG_WIDTH.min(ctx.screen_rect().width() - CARD_SIDE_ROOM));
-            ui.horizontal_wrapped(|ui| {
-                if ui.add(theme::primary_button(ui, "Choose videos")).clicked() {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(theme::semibold(ADD_DIALOG_TITLE, 20.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let close =
+                        theme::IconButton::new(Icon::Close, "Close", theme::ButtonKind::Quiet);
+                    if ui.add(close).on_hover_text("Esc").clicked() {
+                        open = false;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            // Two choices of one size, side by side.
+            let gap = ui.spacing().item_spacing.x;
+            let tile = egui::vec2((width - gap) / 2.0, CHOICE_TILE_HEIGHT);
+            ui.horizontal(|ui| {
+                let videos =
+                    theme::choice_tile(ui, tile, Icon::Film, "Choose videos", CHOOSE_VIDEOS_DETAIL);
+                if videos.clicked() {
                     // The system's picker blocks until it is closed, which
                     // is what a person expects of it.
                     paths_to_add = rfd::FileDialog::new()
                         .add_filter("Videos", &library::VIDEO_EXTENSIONS)
                         .pick_files();
                 }
-                let choose_folder = egui::Button::new("Choose a folder")
-                    .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
-                if ui.add(choose_folder).clicked() {
+                let folder = theme::choice_tile(
+                    ui,
+                    tile,
+                    Icon::Folder,
+                    "Choose a folder",
+                    CHOOSE_FOLDER_DETAIL,
+                );
+                if folder.clicked() {
                     let picked = rfd::FileDialog::new().pick_folder();
                     paths_to_add = picked.map(|folder| vec![folder]);
                 }
             });
-            ui.label(theme::caption(
-                ui,
-                "A folder adds the videos in it, but not those in its subfolders.",
-            ));
 
-            ui.add_space(6.0);
-            ui.label("Or paste the location of a video or folder");
+            ui.add_space(12.0);
+            ui.label(theme::muted(
+                ui,
+                "Or paste the location of a video or folder",
+            ));
             ui.horizontal(|ui| {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut dialog.pasted_path)
@@ -1884,9 +2182,8 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
                 let pasted = path_from_pasted_text(&dialog.pasted_path);
                 let pressed_enter =
                     field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                let add_clicked = ui
-                    .add_enabled(pasted.is_some(), egui::Button::new("Add"))
-                    .clicked();
+                let add = theme::IconButton::new(Icon::Plus, "Add", theme::ButtonKind::Plain);
+                let add_clicked = ui.add_enabled(pasted.is_some(), add).clicked();
                 if add_clicked || pressed_enter {
                     paths_to_add = pasted.map(|path| vec![path]);
                 }
@@ -1894,7 +2191,8 @@ fn show_add_dialog(ctx: &egui::Context, dialog: &mut AddDialog) -> Option<AppReq
             if !dialog.problem.is_empty() {
                 ui.colored_label(palette.danger, &dialog.problem);
             }
-            ui.label(theme::caption(ui, DRAG_PROMPT_IN_ADD_DIALOG));
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| ui.label(theme::caption(ui, DRAG_PROMPT_IN_ADD_DIALOG)));
         });
 
     // The dialog is in front of everything, so Escape is its to take.
@@ -2058,9 +2356,9 @@ fn show_recycling_question(
             }
             ui.add(
                 egui::Label::new(
-                    "That only happens if the new files pass the check: together they must \
-                     contain the whole original, with nothing missing or changed. If the \
-                     check does not pass, the original stays where it is.",
+                    "That only happens if the new files pass the check: every one of them must \
+                     read to its end and play. If the check does not pass, the original stays \
+                     where it is.",
                 )
                 .wrap(),
             );
@@ -2077,18 +2375,18 @@ fn show_recycling_question(
             );
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
-                let move_it = theme::primary_button(ui, subject.move_label());
+                let move_it = theme::primary_button(subject.move_label());
                 if ui.add(move_it).clicked() {
                     answer = Some(RecyclingAnswer::MoveOriginal);
                 }
                 let keep_it = egui::Button::new(subject.keep_label())
-                    .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
+                    .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT));
                 let keep_it = ui.add(keep_it).on_hover_text(subject.what_keeping_does());
                 if keep_it.clicked() {
                     answer = Some(RecyclingAnswer::KeepOriginal);
                 }
-                let cancel = egui::Button::new("Cancel")
-                    .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
+                let cancel =
+                    egui::Button::new("Cancel").min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT));
                 if ui
                     .add(cancel)
                     .on_hover_text("Does not split yet.")
@@ -2112,11 +2410,18 @@ fn show_welcome(ctx: &egui::Context) -> Option<AppRequest> {
     let palette = theme::palette(ctx);
     let mut add_videos = false;
     show_centered_card(ctx, |ui| {
+        let mark = icons::mark_texture(ui.ctx());
+        let mark_size = egui::vec2(WELCOME_MARK_SIZE, WELCOME_MARK_SIZE);
+        ui.add(egui::Image::new(&mark).fit_to_exact_size(mark_size));
         ui.label(theme::semibold("Cut a long video into its scenes", 20.0));
         ui.label(theme::muted(ui, WELCOME_EXPLANATION));
         ui.add_space(4.0);
         add_videos = ui
-            .add(theme::primary_button(ui, "Add videos"))
+            .add(theme::IconButton::new(
+                Icon::Plus,
+                "Add videos",
+                theme::ButtonKind::Primary,
+            ))
             .on_hover_text("Ctrl+O")
             .clicked();
         ui.label(theme::caption(ui, DRAG_PROMPT));
@@ -2284,11 +2589,11 @@ fn show_failed(
         }
         ui.horizontal_wrapped(|ui| {
             let try_again = egui::Button::new("Try again")
-                .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
+                .min_size(egui::vec2(0.0, theme::CONTROL_HEIGHT));
             match review {
                 Some(review) => {
                     let back = ui
-                        .add(theme::primary_button(ui, "Back to review"))
+                        .add(theme::primary_button("Back to review"))
                         .on_hover_text(format!(
                             "Shows the {} again as you left them, so you can split once more.",
                             counted(review.scene_count(), "scene")
@@ -2334,11 +2639,13 @@ fn show_finished(ctx: &egui::Context, name: &str, report: &ExportReport) -> Opti
             show_details(ui, &details);
         }
         ui.horizontal_wrapped(|ui| {
-            if ui.add(theme::primary_button(ui, "Open folder")).clicked() {
+            let open_folder =
+                theme::IconButton::new(Icon::Folder, "Open folder", theme::ButtonKind::Primary);
+            if ui.add(open_folder).clicked() {
                 request = Some(AppRequest::OpenFolder(report.out_dir.clone()));
             }
-            let add_more = egui::Button::new("Add more videos")
-                .min_size(egui::vec2(0.0, theme::PRIMARY_BUTTON_HEIGHT));
+            let add_more =
+                theme::IconButton::new(Icon::Plus, "Add more videos", theme::ButtonKind::Plain);
             if ui.add(add_more).clicked() {
                 request = Some(AppRequest::OpenAddDialog);
             }
@@ -2393,10 +2700,57 @@ fn show_scan_progress(ctx: &egui::Context, text: &str, progress: ScanProgress) {
     });
 }
 
+/// A split under way: what is being split, how far it has come as a bar and
+/// a number, and what it is doing now.
+fn show_split_progress(ctx: &egui::Context, text: &str, progress: SplitProgress) {
+    show_centered_card(ctx, |ui| {
+        ui.label(theme::semibold(text, 16.0));
+        theme::progress_bar(ui, progress.fraction, SCAN_BAR_HEIGHT);
+        ui.label(theme::muted(
+            ui,
+            format!(
+                "{}% done. {}",
+                percent_done(progress.fraction),
+                split_stage_in_words(progress.stage)
+            ),
+        ));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scene_name::EarlierNaming;
+
+    #[test]
+    fn a_video_is_gone_only_when_its_folder_is_still_there() {
+        let folder =
+            std::env::temp_dir().join(format!("scene_splitter_gone_video_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let video = folder.join("film.mp4");
+        std::fs::write(&video, b"not a real video").unwrap();
+        assert!(!video_is_gone(&video));
+
+        std::fs::remove_file(&video).unwrap();
+        assert!(video_is_gone(&video));
+
+        // A whole folder that cannot be seen is a drive that is away.
+        std::fs::remove_dir(&folder).unwrap();
+        assert!(!video_is_gone(&video));
+    }
+
+    #[test]
+    fn gone_videos_are_named_alone_and_counted_together() {
+        assert_eq!(gone_videos_in_words(&[]), None);
+        assert_eq!(
+            gone_videos_in_words(&["film.mp4".to_owned()]).unwrap(),
+            "film.mp4 is no longer in its folder and was taken off the list."
+        );
+        assert_eq!(
+            gone_videos_in_words(&["one.mp4".to_owned(), "two.mp4".to_owned()]).unwrap(),
+            "2 videos are no longer in their folders and were taken off the list."
+        );
+    }
 
     #[test]
     fn a_pasted_path_loses_its_surrounding_quotes() {
@@ -2418,6 +2772,23 @@ mod tests {
     fn an_empty_box_is_not_a_path() {
         assert_eq!(path_from_pasted_text("  "), None);
         assert_eq!(path_from_pasted_text("\"\""), None);
+    }
+
+    #[test]
+    fn an_add_says_only_how_many_videos_were_listed_already() {
+        assert_eq!(already_listed_note(3, 3), None);
+        assert_eq!(
+            already_listed_note(1, 0).as_deref(),
+            Some("That video is already in the list.")
+        );
+        assert_eq!(
+            already_listed_note(5, 4).as_deref(),
+            Some("1 of these videos was already in the list.")
+        );
+        assert_eq!(
+            already_listed_note(5, 3).as_deref(),
+            Some("2 of these videos were already in the list.")
+        );
     }
 
     #[test]
@@ -2665,7 +3036,9 @@ mod tests {
             source: cache::DetectionSource::FreshScan,
             undecoded: Vec::new(),
         };
-        app.queue.scan_finished(job, scan).unwrap();
+        app.queue
+            .scan_finished(job, scan, SceneLengthLimits::NONE)
+            .unwrap();
         app.queue.mark_ready(job).unwrap();
         (app, job)
     }
@@ -3128,6 +3501,83 @@ mod tests {
         assert_eq!(split.original_always_kept, None);
     }
 
+    /// A scan of a 100 second video with a short black screen 20 seconds in
+    /// and a long one in the middle.
+    fn scan_with_an_early_black_screen() -> SourcedDetection {
+        let black = |start: f64, end: f64| crate::timecode::TimeSpan { start, end };
+        let mut detection =
+            crate::review_session::test_sessions::scenes_of_twenty_seconds_detected(5);
+        detection.black_screens = vec![black(19.5, 20.5), black(58.0, 62.0)];
+        detection.cuts = vec![20.0, 60.0];
+        SourcedDetection {
+            detection,
+            source: cache::DetectionSource::FreshScan,
+            undecoded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_scanned_video_starts_its_review_within_the_scene_lengths_of_its_folder() {
+        use crate::review_session::test_sessions::scene_lengths;
+
+        let mut app = SceneSplitterApp::new(LoadedSettings {
+            settings: Settings::default(),
+            problem: None,
+        });
+        let video = std::env::temp_dir().join("tapes").join("no_such_tape.mp4");
+        let crate::queue::Added::New(job) = app.queue.add(&video) else {
+            panic!("the queue was empty");
+        };
+        // The general setting allows any length. The folder's does not.
+        app.settings.remember_detection_for_folder_of(&video);
+        let mut for_this_folder = app.settings.detection_for(&video).detection;
+        for_this_folder.scene_length = scene_lengths(Some(30.0), None);
+        app.settings.change_detection_for(&video, for_this_folder);
+        assert_eq!(
+            app.settings.general_detection().scene_length,
+            SceneLengthLimits::NONE
+        );
+
+        app.queue.start_scan(job).unwrap();
+        app.updates_sender
+            .send(JobUpdate {
+                job,
+                event: JobEvent::Scanned(Ok(scan_with_an_early_black_screen())),
+            })
+            .unwrap();
+        app.apply_job_updates();
+
+        let review = app.queue.review(job).unwrap();
+        assert_eq!(review.accepted_cuts().as_slice(), [60.0]);
+        assert_eq!(review.scene_lengths(), scene_lengths(Some(30.0), None));
+    }
+
+    #[test]
+    fn scene_lengths_changed_on_a_review_are_saved_and_change_no_scene_unasked() {
+        use crate::review_session::test_sessions::scene_lengths;
+
+        let ctx = egui::Context::default();
+        let (mut app, job) = app_with_a_video_in_review();
+        let mut wanted = app.settings.general_detection();
+        wanted.scene_length = scene_lengths(Some(30.0), None);
+
+        app.apply_to_review(&ctx, job, vec![ReviewRequest::ChangeDetection(wanted)]);
+        assert_eq!(app.settings.general_detection(), wanted);
+        // The review keeps its scenes until the person asks for the lengths.
+        assert_eq!(app.queue.review(job).unwrap().scene_count(), 5);
+
+        app.apply_to_review(
+            &ctx,
+            job,
+            vec![ReviewRequest::UseSceneLengths(wanted.scene_length)],
+        );
+        // The splits at 20 and 80 are too close to the ends of the video,
+        // and the one at 60 too close to the one at 40. No scan was queued.
+        let review = app.queue.review(job).unwrap();
+        assert_eq!(review.accepted_cuts().as_slice(), [40.0]);
+        assert_eq!(review.scene_lengths(), wanted.scene_length);
+    }
+
     #[test]
     fn detection_settings_changed_on_a_review_go_to_the_settings_its_video_uses() {
         use crate::folder_settings::{DetectionSettings, SettingsScope};
@@ -3523,20 +3973,55 @@ mod tests {
         );
     }
 
+    /// Where a widget the screen reader was told of is drawn, in points.
+    fn place_of_node(node: &egui::accesskit::Node) -> egui::Rect {
+        let bounds = node.bounds().expect("a drawn widget has a place");
+        egui::Rect::from_min_max(
+            egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+            egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+        )
+    }
+
     /// An app as a person sees it, driven one frame at a time with keys.
     /// Nothing here changes a setting, so nothing is written to disk.
     struct Window {
         ctx: egui::Context,
         app: SceneSplitterApp,
         job: JobId,
+        /// The size of the window, in points.
+        size: egui::Vec2,
+        /// What the last frame told screen readers: every widget's name,
+        /// place and state.
+        widgets: Vec<egui::accesskit::Node>,
     }
 
     impl Window {
         fn with_a_video_in_review() -> Self {
+            Self::with_a_video_in(theme::Style::Editor)
+        }
+
+        /// The review laid out as a list, with the player in a window of its own.
+        fn with_a_video_in_review_as_a_list() -> Self {
+            Self::with_a_video_in(theme::Style::Soft)
+        }
+
+        fn with_a_video_in(style: theme::Style) -> Self {
+            Self::sized(style, WINDOW)
+        }
+
+        fn sized(style: theme::Style, size: egui::Vec2) -> Self {
             let ctx = egui::Context::default();
             theme::apply(&ctx);
-            let (app, job) = app_with_a_video_in_review();
-            let mut window = Self { ctx, app, job };
+            ctx.enable_accesskit();
+            let (mut app, job) = app_with_a_video_in_review();
+            app.settings.style = style;
+            let mut window = Self {
+                ctx,
+                app,
+                job,
+                size,
+                widgets: Vec::new(),
+            };
             // Windows and cards take their place in the first frames.
             window.frame(Vec::new());
             window.frame(Vec::new());
@@ -3549,12 +4034,63 @@ mod tests {
 
         fn frame_with(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
             let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW)),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
                 modifiers,
                 events,
                 ..Default::default()
             };
-            let _ = self.ctx.run(input, |ctx| self.app.run_frame(ctx));
+            // The screen reader is told of every widget, every frame.
+            self.ctx.enable_accesskit();
+            let output = self.ctx.run(input, |ctx| self.app.run_frame(ctx));
+            if let Some(update) = output.platform_output.accesskit_update {
+                self.widgets = update.nodes.into_iter().map(|(_, node)| node).collect();
+            }
+        }
+
+        /// The widget the last frame drew with this name.
+        fn widget(&self, name: &str) -> &egui::accesskit::Node {
+            self.widgets
+                .iter()
+                .find(|node| node.name() == Some(name))
+                .unwrap_or_else(|| panic!("no widget is named {name:?}"))
+        }
+
+        /// Whether the button with this name is shown as chosen.
+        fn is_chosen(&self, name: &str) -> bool {
+            self.widget(name).toggled() == Some(egui::accesskit::Toggled::True)
+        }
+
+        fn place_of(&self, name: &str) -> egui::Rect {
+            place_of_node(self.widget(name))
+        }
+
+        /// The first list to choose from that the last frame drew. egui
+        /// gives such lists no name of their own.
+        fn place_of_first_list(&self) -> egui::Rect {
+            let list = self
+                .widgets
+                .iter()
+                .find(|node| node.role() == egui::accesskit::Role::ComboBox)
+                .expect("a list to choose from was drawn");
+            place_of_node(list)
+        }
+
+        fn click(&mut self, name: &str, modifiers: egui::Modifiers) {
+            // A panel takes its size from the frame before, so after a change
+            // the layout settles over two frames before the button holds still.
+            self.frame(Vec::new());
+            self.frame(Vec::new());
+            let pos = self.place_of(name).center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers,
+            };
+            self.frame_with(vec![egui::Event::PointerMoved(pos)], modifiers);
+            self.frame_with(vec![button(true)], modifiers);
+            self.frame_with(vec![button(false)], modifiers);
+            self.frame(Vec::new());
         }
 
         fn press(&mut self, key: egui::Key) {
@@ -3626,8 +4162,72 @@ mod tests {
     }
 
     #[test]
-    fn escape_closes_the_player_and_only_the_next_one_clears_the_selection() {
+    fn the_editor_keeps_its_player_open_and_escape_clears_the_selection() {
         let mut window = Window::with_a_video_in_review();
+        assert!(window.app.player.is_some());
+        window.select_the_first_two_scenes();
+
+        window.press(egui::Key::Escape);
+        assert!(window.app.player.is_some());
+        assert_eq!(window.selected_scene_count(), 0);
+    }
+
+    #[test]
+    fn a_scene_button_on_the_stage_chooses_its_scene_and_plays_from_its_start() {
+        let mut window = Window::with_a_video_in(theme::Style::Studio);
+        assert!(!window.is_chosen("02  0:20"));
+
+        window.click("02  0:20", egui::Modifiers::NONE);
+        assert_eq!(window.selected_scene_count(), 1);
+        assert_eq!(window.player_position(), 20.0);
+        assert!(window.is_chosen("02  0:20"));
+
+        // Shift chooses every scene from the last one chosen to this one.
+        window.click("04  0:20", egui::Modifiers::SHIFT);
+        assert_eq!(window.player_position(), 60.0);
+        assert_eq!(window.selected_scene_count(), 3);
+    }
+
+    #[test]
+    fn the_stage_tools_act_on_the_chosen_scenes_only_once_there_are_some() {
+        let merge = "Merge the chosen scenes";
+        let drop = "Drop or keep the chosen scenes";
+        let mut window = Window::with_a_video_in(theme::Style::Studio);
+        assert!(window.widget(merge).is_disabled());
+        assert!(window.widget(drop).is_disabled());
+
+        window.select_the_first_two_scenes();
+        window.frame(Vec::new());
+        assert!(!window.widget(merge).is_disabled());
+        window.click(merge, egui::Modifiers::NONE);
+        assert_eq!(window.scene_count(), 4);
+    }
+
+    #[test]
+    fn the_stage_drops_the_chosen_scenes_with_its_tool() {
+        let mut window = Window::with_a_video_in(theme::Style::Studio);
+        window.select_the_first_two_scenes();
+        window.frame(Vec::new());
+        window.click("Drop or keep the chosen scenes", egui::Modifiers::NONE);
+        let review = window.app.queue.review(window.job).unwrap();
+        assert_eq!(review.dropped_count(), 2);
+    }
+
+    #[test]
+    fn in_the_smallest_window_the_stage_keeps_its_export_choices_beside_the_split() {
+        let window = Window::sized(theme::Style::Studio, SMALLEST_WINDOW);
+        let split = window.place_of("Split into 5 files");
+        // The first list is what happens to the original.
+        let choice = window.place_of_first_list();
+        assert!(
+            (split.center().y - choice.center().y).abs() < 1.0,
+            "the split is at {split:?}, the choice at {choice:?}"
+        );
+    }
+
+    #[test]
+    fn escape_closes_the_player_and_only_the_next_one_clears_the_selection() {
+        let mut window = Window::with_a_video_in_review_as_a_list();
         window.select_the_first_two_scenes();
         window.open_the_player();
 
@@ -3715,7 +4315,7 @@ mod tests {
 
     #[test]
     fn escape_pressed_while_typing_only_leaves_the_text_box() {
-        let mut window = Window::with_a_video_in_review();
+        let mut window = Window::with_a_video_in_review_as_a_list();
         window.select_the_first_two_scenes();
         window.open_the_player();
         // As the frame before ended, the person was typing a time into the
@@ -3817,8 +4417,8 @@ mod tests {
     fn a_theme_chosen_in_the_settings_shows_in_the_very_next_frame() {
         let mut window = Window::with_a_video_in_review();
         window.open_the_player();
-        let light = theme::Palette::of(egui::Theme::Light);
-        let dark = theme::Palette::of(egui::Theme::Dark);
+        let light = theme::Style::default().palette(egui::Theme::Light);
+        let dark = theme::Style::default().palette(egui::Theme::Dark);
 
         window.choose_theme(theme::ThemeChoice::Dark);
         let painted = window.colours_of_a_frame();
@@ -3854,7 +4454,7 @@ mod tests {
             &|ctx| drop(show_failed(ctx, job, "a video.mp4", &failure, None)),
             &|ctx| show_busy(ctx, "Reading the video"),
         ];
-        let light = theme::Palette::of(egui::Theme::Light);
+        let light = theme::Style::Soft.palette(egui::Theme::Light);
 
         for screen in screens {
             let ctx = egui::Context::default();

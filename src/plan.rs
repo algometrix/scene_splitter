@@ -37,6 +37,11 @@ impl SceneIndex {
     pub fn next(self) -> Self {
         Self(self.0 + 1)
     }
+
+    /// `None` for the first scene, which has no scene above it.
+    pub fn previous(self) -> Option<Self> {
+        self.0.checked_sub(1).map(Self)
+    }
 }
 
 /// Where a segment sits among all the plan's segments. Merging and splitting
@@ -66,8 +71,9 @@ pub struct CutIndex(usize);
 /// Where a proposed cut came from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CutSource {
-    /// Suggested by the scan, whether for a black screen or for a sudden
-    /// change of picture. The plan is not told which.
+    /// Suggested when the review began: by the scan, for a black screen or
+    /// for a sudden change of picture, or to keep a scene within the longest
+    /// length the person allows. The plan is not told which.
     Detected,
     /// Suggested by the scan at `detected_at`, and moved by the person
     /// since. The time is kept so that a reset can put the cut back.
@@ -177,7 +183,7 @@ impl fmt::Display for AddCutError {
             Self::AlreadyProposed { at } => write!(
                 formatter,
                 "There is already a split at {}.",
-                crate::timecode::format_timestamp(*at)
+                crate::timecode::format_clock_precise(*at)
             ),
         }
     }
@@ -224,7 +230,7 @@ pub enum NudgeCutError {
 
 impl fmt::Display for NudgeCutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use crate::timecode::format_timestamp;
+        use crate::timecode::format_clock_precise;
         match self {
             Self::NoSplitBeforeScene => write!(
                 formatter,
@@ -241,7 +247,7 @@ impl fmt::Display for NudgeCutError {
             Self::SplitInTheWay { at } => write!(
                 formatter,
                 "The split cannot move further. The split at {} is in the way.",
-                format_timestamp(*at)
+                format_clock_precise(*at)
             ),
             Self::MergedPartsInTheWay { .. } => write!(
                 formatter,
@@ -322,7 +328,19 @@ impl SplitPlan {
     /// split. Meant for a plan nobody has edited yet. A time outside the
     /// video, or one that is proposed already, is left out.
     pub fn propose_chapter_cuts(&mut self, chapter_cut_times: &[f64]) {
-        for &time in chapter_cut_times {
+        self.propose_from(CutSource::Chapter, chapter_cut_times);
+    }
+
+    /// Adds the cuts that divide scenes longer than the person allows, each
+    /// set to split. Meant for a plan nobody has edited yet. A reset keeps
+    /// them, as it keeps what the scan found. A time outside the video, or
+    /// one that is proposed already, is left out.
+    pub fn propose_cuts_for_long_scenes(&mut self, cut_times: &[f64]) {
+        self.propose_from(CutSource::Detected, cut_times);
+    }
+
+    fn propose_from(&mut self, source: CutSource, cut_times: &[f64]) {
+        for &time in cut_times {
             if !self.whole_video.has_strictly_inside(time) {
                 continue;
             }
@@ -334,7 +352,7 @@ impl SplitPlan {
                 position,
                 ProposedCut {
                     time,
-                    source: CutSource::Chapter,
+                    source,
                     choice: CutChoice::Split,
                 },
             );
@@ -1314,7 +1332,7 @@ mod tests {
     fn a_repeated_cut_is_explained_with_the_time_it_is_already_at() {
         assert_eq!(
             AddCutError::AlreadyProposed { at: 4.0 }.to_string(),
-            "There is already a split at 00:00:04.000."
+            "There is already a split at 0:04.00."
         );
     }
 
@@ -1419,6 +1437,21 @@ mod tests {
         plan.nudge_cut_before(second_scene(), LATER, TO_CUT_POINT)
             .unwrap();
         assert_eq!(plan.time_the_review_began_with(6.0), 4.0);
+    }
+
+    #[test]
+    fn cuts_for_long_scenes_are_suggestions_that_a_reset_keeps() {
+        let mut plan = plan_with_cuts(&[4.0]);
+        plan.propose_cuts_for_long_scenes(&[2.0, 4.0, 6.0, 50.0]);
+        // 4 is proposed already, and 50 is outside the video.
+        assert_eq!(plan.accepted_cuts().as_slice(), [2.0, 4.0, 6.0]);
+        assert!(plan.is_as_detected());
+        assert_eq!(plan.chapter_split_count(), 0);
+
+        plan.merge_scenes(scenes(0, 3));
+        assert!(plan.accepted_cuts().is_empty());
+        plan.reset_to_detected();
+        assert_eq!(plan.accepted_cuts().as_slice(), [2.0, 4.0, 6.0]);
     }
 
     #[test]
@@ -1631,7 +1664,7 @@ mod tests {
         );
         assert_eq!(
             NudgeCutError::SplitInTheWay { at: 6.0 }.to_string(),
-            "The split cannot move further. The split at 00:00:06.000 is in the way."
+            "The split cannot move further. The split at 0:06.00 is in the way."
         );
         assert_eq!(
             NudgeCutError::MergedPartsInTheWay { at: 6.0 }.to_string(),

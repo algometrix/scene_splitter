@@ -196,6 +196,85 @@ impl TurnOption {
     }
 }
 
+/// The bitstream filter that sets the times of pictures as they are copied.
+/// ffmpeg has it from version 4.4 on.
+pub const TIME_FILTER: &str = "setts";
+
+/// Whether ffmpeg's list of bitstream filters names `filter`. The list has
+/// a heading and then one name to a line.
+pub fn lists_bitstream_filter(listing: &str, filter: &str) -> bool {
+    listing.lines().any(|line| line.trim() == filter)
+}
+
+/// How a copy gives a show time to the pictures whose file states none.
+///
+/// An AVI file says of each picture when it is decoded. Once its pictures
+/// are stored out of order, as MPEG-4 video from DivX and Xvid mostly is,
+/// ffmpeg reads a show time for some pictures only, and for no keyframe.
+/// It starts a new scene file only at a keyframe with a show time. Left
+/// alone, it so copies such a video into one file whatever cuts were asked
+/// for, and ends as if all went well.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShowTimeOption {
+    /// A picture without a show time gets its decode time as one. That is
+    /// the very time the scan lists the picture under (`probe`), so every
+    /// cut falls on the keyframe it was planned on. Needs the time filter.
+    FromDecodeTime,
+    /// ffmpeg works the show times out from the order of the pictures,
+    /// which every version can. A keyframe then gets a time a few pictures
+    /// after the one the scan read, and how many differs from keyframe to
+    /// keyframe. A cut can so fall on the keyframe before the planned one
+    /// where two keyframes follow each other within a few pictures. Only
+    /// for an ffmpeg without the time filter.
+    WorkedOutByFfmpeg,
+}
+
+/// What ffmpeg writes inside itself for "this packet has no time", as a
+/// number: the lowest a time can be. The time filter of ffmpeg 4.4 has no
+/// name for it, so the number is spelled out.
+const NO_TIME: i64 = i64::MIN;
+
+impl ShowTimeOption {
+    /// Chosen from what `ffmpeg -bsfs` prints.
+    pub fn for_bitstream_filters(listing: &str) -> Self {
+        if lists_bitstream_filter(listing, TIME_FILTER) {
+            Self::FromDecodeTime
+        } else {
+            Self::WorkedOutByFfmpeg
+        }
+    }
+
+    /// The options that go before the video that is read.
+    pub fn input_arguments(self) -> &'static [&'static str] {
+        match self {
+            Self::FromDecodeTime => &[],
+            Self::WorkedOutByFfmpeg => &["-fflags", "+genpts"],
+        }
+    }
+
+    /// The options that go after the video that is read, with those that
+    /// say what is copied.
+    pub fn output_arguments(self) -> Vec<String> {
+        match self {
+            Self::FromDecodeTime => vec!["-bsf:v".to_owned(), show_time_filter()],
+            Self::WorkedOutByFfmpeg => Vec::new(),
+        }
+    }
+}
+
+/// The time filter set up to give a picture its decode time as its show
+/// time when it has none, and to leave every other time as it is.
+///
+/// Written as a sum of two products, of which one is always zero, because
+/// ffmpeg 4.4 cuts a filter's settings apart at every comma, and every
+/// "if" of its expressions needs one. `not` gives one for zero and zero
+/// for anything else, so `not(PTS+<no time, without its minus>)` is one
+/// exactly for a picture without a show time.
+fn show_time_filter() -> String {
+    let is_missing = format!("not(PTS+{})", NO_TIME.unsigned_abs());
+    format!("{TIME_FILTER}=pts={is_missing}*DTS+not({is_missing})*PTS")
+}
+
 fn major_version(banner: &str) -> Option<u32> {
     let version = banner.strip_prefix(VERSION_BANNER_START)?;
     // Some builds write the version as a git tag, "n7.1".
@@ -1128,6 +1207,48 @@ mod tests {
         );
         assert!(named.arguments(None).is_empty());
         assert!(left.arguments(Some(&quarter)).is_empty());
+    }
+
+    #[test]
+    fn a_bitstream_filter_is_found_by_its_whole_name() {
+        let listing = "Bitstream filters:\naac_adtstoasc\nsetts\ntrace_headers\n";
+        assert!(lists_bitstream_filter(listing, "setts"));
+        assert!(!lists_bitstream_filter(
+            "Bitstream filters:\nsetts_of_another_kind\n",
+            "setts"
+        ));
+    }
+
+    #[test]
+    fn show_times_come_from_decode_times_where_ffmpeg_has_the_time_filter() {
+        let with_the_filter = "Bitstream filters:\nnull\nsetts\n";
+        let without_it = "Bitstream filters:\nnull\nnoise\n";
+        let from_decode_time = ShowTimeOption::for_bitstream_filters(with_the_filter);
+        let worked_out = ShowTimeOption::for_bitstream_filters(without_it);
+
+        assert_eq!(from_decode_time, ShowTimeOption::FromDecodeTime);
+        assert!(from_decode_time.input_arguments().is_empty());
+        assert_eq!(
+            from_decode_time.output_arguments(),
+            [
+                "-bsf:v",
+                "setts=pts=not(PTS+9223372036854775808)*DTS\
+                 +not(not(PTS+9223372036854775808))*PTS"
+            ]
+        );
+
+        assert_eq!(worked_out, ShowTimeOption::WorkedOutByFfmpeg);
+        assert_eq!(worked_out.input_arguments(), ["-fflags", "+genpts"]);
+        assert!(worked_out.output_arguments().is_empty());
+        // A listing that could not be read names no filter.
+        assert_eq!(ShowTimeOption::for_bitstream_filters(""), worked_out);
+    }
+
+    #[test]
+    fn the_time_filter_is_set_up_without_a_comma() {
+        // ffmpeg 4.4 reads a comma as the end of the filter.
+        let filter = show_time_filter();
+        assert!(!filter.contains(','), "{filter}");
     }
 
     #[test]

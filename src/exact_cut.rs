@@ -604,11 +604,7 @@ pub fn exact_cut_times(detection: &Detection, scan_kind: ScanKind) -> Vec<f64> {
     // cut on the nearest point they are told a cut can go. Told that it can
     // go exactly where each change is, they choose the same changes and
     // leave them where they are.
-    let black_screen_middles: Vec<f64> = detection
-        .black_screens
-        .iter()
-        .map(|screen| (screen.start + screen.end) / 2.0)
-        .collect();
+    let black_screen_middles = black_screen_middles(detection);
     let black_screen_cuts = scenes::cut_points(
         &detection.black_screens,
         &black_screen_middles,
@@ -628,6 +624,15 @@ pub fn exact_cut_times(detection: &Detection, scan_kind: ScanKind) -> Vec<f64> {
         detection.video,
         &settings,
     )
+}
+
+/// Where an exact cut for each black screen of the scan goes: its middle.
+pub fn black_screen_middles(detection: &Detection) -> Vec<f64> {
+    detection
+        .black_screens
+        .iter()
+        .map(|screen| (screen.start + screen.end) / 2.0)
+        .collect()
 }
 
 #[cfg(test)]

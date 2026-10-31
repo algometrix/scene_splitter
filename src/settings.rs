@@ -1,6 +1,7 @@
 //! The choices a person makes once and expects the app to remember: how
-//! black screens are detected, how hard cuts are thinned, where scenes go,
-//! what their files are called, and whether the window is light or dark.
+//! black screens are detected, how hard cuts are thinned, how short and how
+//! long a scene may be, where scenes go, what their files are called, and
+//! whether the window is light or dark.
 //! The window and the command line read the same file.
 
 use std::io::ErrorKind;
@@ -15,7 +16,7 @@ use crate::folder_settings::{
 };
 use crate::folders;
 use crate::scene_name::{PatternsUsed, SceneNamePattern, SceneNames};
-use crate::theme::ThemeChoice;
+use crate::theme::{Style, ThemeChoice};
 
 const APP_FOLDER: &str = "scene_splitter";
 const SETTINGS_FILE: &str = "settings.json";
@@ -42,8 +43,8 @@ enum WrittenBy {
 pub struct Settings {
     /// One value, the same kind a folder remembers, so that a setting added
     /// to it is general and per folder at once. In the file its parts stand
-    /// beside the other settings, as `scan` and `hard_cuts`, where they
-    /// always stood.
+    /// beside the other settings, as `scan`, `hard_cuts` and `scene_length`,
+    /// where the first two always stood.
     #[serde(flatten)]
     pub detection: DetectionSettings,
     pub export: ExportOptions,
@@ -58,11 +59,37 @@ pub struct Settings {
     /// Whether the window is light, dark, or as the system is. A file from
     /// before there was a choice follows the system.
     pub theme: ThemeChoice,
+    /// How the window looks. A file from before there were styles gets the
+    /// editor style.
+    pub style: Style,
+    /// Whether the review has the whole window to itself.
+    pub room: ReviewRoom,
     /// The names splits were written with, the newest first. Not a choice
     /// the person makes: it is how the scene files of an earlier split are
     /// still found after the name for scene files was changed. Empty in a
     /// file from before names were remembered.
     pub scene_names_used: PatternsUsed,
+}
+
+/// How much of the window a review shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReviewRoom {
+    /// The list of videos, the ways to scan again and every choice about
+    /// the split, around the footage.
+    #[default]
+    Everything,
+    /// Only what works on the footage: the picture, the scenes, the
+    /// timeline and the split. The key F switches between the two.
+    FootageOnly,
+}
+
+impl ReviewRoom {
+    pub fn switched(self) -> Self {
+        match self {
+            Self::Everything => Self::FootageOnly,
+            Self::FootageOnly => Self::Everything,
+        }
+    }
 }
 
 /// The first split that would move an original to the Recycle Bin or Trash
@@ -85,6 +112,8 @@ impl Default for Settings {
             show_tips: true,
             recycling_question: RecyclingQuestion::NotAskedYet,
             theme: ThemeChoice::FollowSystem,
+            style: Style::default(),
+            room: ReviewRoom::default(),
             scene_names_used: PatternsUsed::default(),
         }
     }
@@ -98,6 +127,8 @@ pub enum SettingsChange {
     ExportOptions(ExportOptions),
     ShowTips,
     HideTips,
+    /// Footage only if it was everything, everything if it was footage only.
+    SwitchReviewRoom,
 }
 
 /// What loading the settings gave.
@@ -203,6 +234,7 @@ impl Settings {
             SettingsChange::ExportOptions(export) => changed.export = export,
             SettingsChange::ShowTips => changed.show_tips = true,
             SettingsChange::HideTips => changed.show_tips = false,
+            SettingsChange::SwitchReviewRoom => changed.room = changed.room.switched(),
         }
         changed
     }
@@ -372,6 +404,7 @@ mod tests {
     use crate::detect::{ScanMode, ScanSettings};
     use crate::exact_cut::CutPrecision;
     use crate::hardcut::{HardCutSettings, Sensitivity};
+    use crate::scene_length::{SceneLength, SceneLengthLimits};
     use crate::split::SceneLocation;
 
     /// A settings file of its own for one test, removed when the test ends.
@@ -396,6 +429,11 @@ mod tests {
         }
     }
 
+    fn between_one_and_twenty_minutes() -> SceneLengthLimits {
+        let length = |seconds: f64| SceneLength::from_seconds(seconds).unwrap();
+        SceneLengthLimits::new(Some(length(60.0)), Some(length(1200.0))).unwrap()
+    }
+
     fn changed_settings() -> Settings {
         let mut settings = Settings::default();
         settings.detection.scan.mode = ScanMode::EveryFrame;
@@ -405,6 +443,7 @@ mod tests {
         settings.export.scene_name = SceneNamePattern::new("{name} part {number}").unwrap();
         settings.detection.hard_cuts.sensitivity = Sensitivity::High;
         settings.detection.hard_cuts.min_scene_seconds = 300.0;
+        settings.detection.scene_length = between_one_and_twenty_minutes();
         settings.show_tips = false;
         settings.recycling_question = RecyclingQuestion::Answered;
         settings.theme = ThemeChoice::Dark;
@@ -570,6 +609,7 @@ mod tests {
         assert_eq!(loaded.export.scene_location, SceneLocation::NewFolder);
         assert_eq!(loaded.detection.scan, ScanSettings::default());
         assert_eq!(loaded.detection.hard_cuts, HardCutSettings::default());
+        assert_eq!(loaded.detection.scene_length, SceneLengthLimits::NONE);
         assert!(loaded.show_tips);
     }
 
@@ -595,6 +635,36 @@ mod tests {
             settings.save_to(&file.0).unwrap();
             assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
         }
+    }
+
+    #[test]
+    fn every_style_is_saved_and_comes_back_and_an_old_file_gets_the_editor_style() {
+        let file = SettingsFile::for_test("style_choice");
+        for style in Style::ALL {
+            let settings = Settings {
+                style,
+                ..Settings::default()
+            };
+            settings.save_to(&file.0).unwrap();
+            assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
+        }
+        std::fs::write(&file.0, r#"{ "theme": "Dark" }"#).unwrap();
+        let loaded = Settings::load_from(&file.0).unwrap().unwrap();
+        assert_eq!(loaded.style, Style::Editor);
+    }
+
+    #[test]
+    fn the_footage_only_room_is_switched_on_and_off_and_kept() {
+        let settings = Settings::default();
+        assert_eq!(settings.room, ReviewRoom::Everything);
+        let focused = settings.changed_by(SettingsChange::SwitchReviewRoom);
+        assert_eq!(focused.room, ReviewRoom::FootageOnly);
+        let back = focused.changed_by(SettingsChange::SwitchReviewRoom);
+        assert_eq!(back.room, ReviewRoom::Everything);
+
+        let file = SettingsFile::for_test("review_room");
+        focused.save_to(&file.0).unwrap();
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(focused));
     }
 
     #[test]
@@ -823,6 +893,40 @@ mod tests {
         assert!(settings.validate().is_err());
     }
 
+    #[test]
+    fn scene_lengths_stand_beside_the_other_detection_settings_in_the_file() {
+        let file = SettingsFile::for_test("scene_lengths");
+        let mut settings = Settings::default();
+        settings.detection.scene_length = between_one_and_twenty_minutes();
+        settings.save_to(&file.0).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file.0).unwrap()).unwrap();
+        assert_eq!(saved["scene_length"]["shortest_seconds"], 60.0);
+        assert_eq!(saved["scene_length"]["longest_seconds"], 1200.0);
+        assert_eq!(Settings::load_from(&file.0).unwrap(), Some(settings));
+    }
+
+    #[test]
+    fn a_file_whose_longest_scene_is_below_its_shortest_is_refused_with_the_reason() {
+        let file = SettingsFile::for_test("scene_lengths_upside_down");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file.0,
+            r#"{ "scene_length": { "shortest_seconds": 600.0, "longest_seconds": 60.0 } }"#,
+        )
+        .unwrap();
+
+        let problem = format!("{:#}", Settings::load_from(&file.0).unwrap_err());
+        assert!(
+            problem.contains(
+                "the longest scene (1 min 00 s) must not be shorter than the shortest scene \
+                 (10 min 00 s)"
+            ),
+            "{problem}"
+        );
+    }
+
     /// A video in a folder of films, and one in a folder of old tapes.
     fn a_film() -> PathBuf {
         std::env::temp_dir().join("films").join("film.mp4")
@@ -990,7 +1094,9 @@ mod tests {
         assert!(!loaded.show_tips);
         assert_eq!(loaded.recycling_question, RecyclingQuestion::Answered);
         // What it could not say yet is as the app does it by default: the
-        // default names, cuts on keyframes, and no folder of its own.
+        // default names, cuts on keyframes, scenes of any length, and no
+        // folder of its own.
+        assert_eq!(loaded.detection.scene_length, SceneLengthLimits::NONE);
         assert_eq!(loaded.export.scene_name, SceneNamePattern::default());
         assert_eq!(loaded.export.cut_precision, CutPrecision::NearestKeyframe);
         assert!(loaded.folders.is_empty());

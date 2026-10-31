@@ -4,29 +4,31 @@
 //! They are ignored by default because they need `ffmpeg` and `ffprobe` on
 //! the PATH. Run them with `cargo test --release -- --include-ignored`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::black::BlackCriteria;
 use crate::detect::{self, Detection, ScanDepth, ScanMode, ScanProgress, ScanSettings, ScanStage};
 use crate::export::{
-    self, OriginalAlwaysKept, OriginalOutcome, OriginalPolicy, SplitMethod, SplitOrder,
+    self, OriginalAlwaysKept, OriginalOutcome, OriginalPolicy, SplitMethod, SplitOrder, SplitStage,
     Verification,
 };
 use crate::fates::{SceneFate, ScenesToWrite};
-use crate::ffmpeg::FfmpegError;
+use crate::ffmpeg::{FfmpegError, Program, ShowTimeOption, STEADY_OUTPUT_LIMIT};
 use crate::hardcut::{HardCutSettings, Sensitivity};
 use crate::probe;
 use crate::scene_name::{EarlierNaming, SceneNamePattern};
 use crate::scenes::CutTimes;
-use crate::split::{self, SceneOutcome};
+use crate::split::{self, ScenesNotCut};
 use crate::test_videos::{
     ChapterContainer, TestChapter, TestVideo, BLACK_SECONDS, FRAME_RATE, FRAME_SECONDS,
     SCENE_SECONDS,
 };
 use crate::thumbnails::{self, THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH};
 use crate::timecode::TimeSpan;
-use crate::verify::{self, SceneToVerify};
+use crate::tools;
+use crate::verify;
+use crate::windows::FullDecodeBudget;
 
 const BYTES_PER_RGB_PIXEL: usize = 3;
 /// Where the black screen of the test video begins and ends.
@@ -116,9 +118,19 @@ fn decoding_every_frame_finds_the_black_screen() {
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
-fn the_fast_scan_finds_the_same_black_screen_while_decoding_far_less() {
+fn a_video_too_large_to_decode_in_full_is_scanned_by_its_packet_sizes_alone() {
+    // The test video is short, so only a budget of nothing makes it too large.
+    const NO_FULL_DECODE: FullDecodeBudget = FullDecodeBudget { pixels: 0 };
     let video = TestVideo::two_scenes_with_a_black_screen("fast_scan");
-    let detection = scan(&video, ScanMode::Suspicious, ScanDepth::BlackScreens);
+    let detection = detect::scan_within_budget(
+        &video.path,
+        &scan_settings(ScanMode::Suspicious),
+        ScanDepth::BlackScreens,
+        NO_FULL_DECODE,
+        &detect::no_scan_progress,
+    )
+    .unwrap()
+    .detection;
 
     assert_one_black_screen_between_the_scenes(&detection.black_screens);
     assert!(
@@ -127,6 +139,16 @@ fn the_fast_scan_finds_the_same_black_screen_while_decoding_far_less() {
         detection.decoded_frames,
         detection.frame_count
     );
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_short_video_is_decoded_in_full_without_being_asked() {
+    let video = TestVideo::two_scenes_with_a_black_screen("cheap_full_decode");
+    let detection = scan(&video, ScanMode::Suspicious, ScanDepth::BlackScreens);
+
+    assert_one_black_screen_between_the_scenes(&detection.black_screens);
+    assert_eq!(detection.decoded_frames, detection.frame_count);
 }
 
 #[test]
@@ -460,22 +482,54 @@ fn each_scene_file_holds_its_own_part_of_the_video() {
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
-fn verification_fails_when_a_scene_is_missing() {
-    let video = TestVideo::two_scenes_with_a_black_screen("missing_scene");
+fn the_check_says_how_far_it_is_and_ends_near_the_whole() {
+    let video = TestVideo::two_scenes_with_a_black_screen("check_progress");
     let scene_files = split_at_the_black_screen(&video);
 
-    let error = verify::verify_scenes(&video.path, &scene_files[..1]).unwrap_err();
-    assert!(format!("{error:#}").contains("packets"), "{error:#}");
+    let shares = std::sync::Mutex::new(Vec::new());
+    verify::verify_scenes(&video.path, &scene_files, &|share| {
+        shares.lock().unwrap().push(share)
+    })
+    .unwrap();
+
+    let shares = shares.into_inner().unwrap();
+    let furthest = shares.iter().copied().fold(0.0, f32::max);
+    assert!(shares.iter().all(|share| (0.0..=1.0).contains(share)));
+    // The packets are nearly all of a scene file.
+    assert!(furthest > 0.8, "the check only got to {furthest}");
 }
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
-fn verification_fails_when_the_scenes_are_out_of_order() {
-    let video = TestVideo::two_scenes_with_a_black_screen("wrong_order");
-    let mut scene_files = split_at_the_black_screen(&video);
-    scene_files.reverse();
+fn a_split_says_how_far_it_is_through_writing_and_checking() {
+    let video = TestVideo::two_scenes_with_a_black_screen("split_progress");
+    let detection = scan(&video, ScanMode::EveryFrame, ScanDepth::BlackScreens);
+    let order = SplitOrder::new(
+        ScenesToWrite::every_scene(detected_cuts(&detection)),
+        copying(OriginalPolicy::Keep),
+    );
 
-    assert!(verify::verify_scenes(&video.path, &scene_files).is_err());
+    let reports = std::sync::Mutex::new(Vec::new());
+    export::export_scenes_reporting(
+        &video.path,
+        &order,
+        video.folder(),
+        SceneNamePattern::default(),
+        &|progress| reports.lock().unwrap().push(progress),
+    )
+    .unwrap();
+
+    let reports = reports.into_inner().unwrap();
+    let stages: Vec<SplitStage> = reports.iter().map(|progress| progress.stage).collect();
+    assert!(stages.contains(&SplitStage::WritingScenes), "{stages:?}");
+    assert!(stages.contains(&SplitStage::CheckingScenes), "{stages:?}");
+    let first_check = stages
+        .iter()
+        .position(|stage| *stage == SplitStage::CheckingScenes)
+        .unwrap();
+    assert!(stages[first_check..]
+        .iter()
+        .all(|stage| *stage == SplitStage::CheckingScenes));
 }
 
 #[test]
@@ -488,7 +542,7 @@ fn verification_fails_when_a_scene_is_cut_short() {
     let bytes = std::fs::read(last_scene).unwrap();
     std::fs::write(last_scene, &bytes[..bytes.len() / 2]).unwrap();
 
-    assert!(verify::verify_scenes(&video.path, &scene_files).is_err());
+    assert!(verify::verify_scenes(&video.path, &scene_files, &verify::no_share_checked).is_err());
 }
 
 #[test]
@@ -510,7 +564,7 @@ fn splitting_again_into_fewer_scenes_leaves_no_old_files_behind() {
     )
     .unwrap();
     assert_eq!(found, scene_files);
-    assert!(verify::verify_scenes(&video.path, &scene_files).is_ok());
+    assert!(verify::verify_scenes(&video.path, &scene_files, &verify::no_share_checked).is_ok());
 }
 
 #[test]
@@ -535,7 +589,9 @@ fn a_video_with_a_percent_sign_in_its_name_is_split() {
             video.folder().join("100% fun_scene_2_of_2.mp4"),
         ]
     );
-    assert!(verify::verify_scenes(&named_with_percent, &scene_files).is_ok());
+    assert!(
+        verify::verify_scenes(&named_with_percent, &scene_files, &verify::no_share_checked).is_ok()
+    );
     assert_no_folder_is_left_in(video.folder());
 }
 
@@ -573,6 +629,179 @@ fn a_split_that_fails_leaves_the_scenes_of_an_earlier_split_as_they_were() {
     assert_no_folder_is_left_in(video.folder());
 }
 
+/// Cuts at keyframes of a video, and what a split at them has to give.
+struct KeyframeCuts {
+    cuts: CutTimes,
+    /// How many pictures each scene holds, in scene order.
+    pictures_per_scene: Vec<usize>,
+}
+
+/// Cuts at the keyframes of `video` with the given numbers, counted from
+/// zero, at the times the scan reads for them.
+fn cuts_at_keyframes(video: &TestVideo, keyframe_numbers: &[usize]) -> KeyframeCuts {
+    let index = probe::read_packet_index(&video.path).unwrap();
+    let keyframe_positions: Vec<usize> = index
+        .packets
+        .iter()
+        .enumerate()
+        .filter(|(_position, packet)| packet.is_keyframe)
+        .map(|(position, _packet)| position)
+        .collect();
+    let cut_positions: Vec<usize> = keyframe_numbers
+        .iter()
+        .map(|&number| keyframe_positions[number])
+        .collect();
+
+    let cut_times = cut_positions
+        .iter()
+        .map(|&position| index.packets[position].time)
+        .collect();
+    let scene_starts = std::iter::once(0).chain(cut_positions.iter().copied());
+    let scene_ends = cut_positions
+        .iter()
+        .copied()
+        .chain(std::iter::once(index.packets.len()));
+    KeyframeCuts {
+        cuts: CutTimes::inside(index.video, cut_times).unwrap(),
+        pictures_per_scene: scene_starts
+            .zip(scene_ends)
+            .map(|(start, end)| end - start)
+            .collect(),
+    }
+}
+
+fn pictures_in_each(scene_files: &[PathBuf]) -> Vec<usize> {
+    scene_files
+        .iter()
+        .map(|scene| probe::read_packet_index(scene).unwrap().packets.len())
+        .collect()
+}
+
+/// Makes sure the AVI test video is of the kind that came out as one file:
+/// ffprobe lists its keyframes with "N/A" where the show time goes. An
+/// ffmpeg that one day fills those times in would let the tests below pass
+/// without testing anything.
+fn assert_keyframes_state_no_show_time(video: &TestVideo) {
+    let packets = tools::command(Program::Ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0"])
+        .args(["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"])
+        .arg(&video.path)
+        .run_for_text(STEADY_OUTPUT_LIMIT)
+        .unwrap();
+    let keyframes: Vec<&str> = packets
+        .lines()
+        .filter(|line| {
+            line.split(',')
+                .nth(1)
+                .is_some_and(|flags| flags.starts_with('K'))
+        })
+        .collect();
+    assert!(keyframes.len() > 6, "{keyframes:?}");
+    assert!(
+        keyframes.iter().all(|line| line.starts_with("N/A,")),
+        "{keyframes:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn an_avi_that_states_no_show_time_for_its_keyframes_is_split_at_every_cut() {
+    let video = TestVideo::avi_without_show_times("avi");
+    assert_keyframes_state_no_show_time(&video);
+    let planned = cuts_at_keyframes(&video, &[3, 6]);
+
+    let order = SplitOrder::new(
+        ScenesToWrite::every_scene(planned.cuts),
+        copying(OriginalPolicy::Keep),
+    );
+    let report = export::export_scenes(
+        &video.path,
+        &order,
+        video.folder(),
+        SceneNamePattern::default(),
+    )
+    .unwrap();
+
+    // Every scene starts on the keyframe its cut was planned on.
+    assert_eq!(
+        pictures_in_each(&report.scene_files),
+        planned.pictures_per_scene
+    );
+    assert!(
+        matches!(report.verification, Verification::Passed),
+        "{:?}",
+        report.verification
+    );
+    assert!(video.path.is_file());
+    assert!(report.is_clean());
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn an_avi_is_split_at_every_cut_by_an_ffmpeg_without_the_time_filter_too() {
+    let video = TestVideo::avi_without_show_times("avi_old_ffmpeg");
+    let planned = cuts_at_keyframes(&video, &[3, 6]);
+
+    let scene_files = split::split_at_keyframes_timing_pictures(
+        &video.path,
+        &planned.cuts,
+        video.folder(),
+        ShowTimeOption::WorkedOutByFfmpeg,
+    )
+    .unwrap();
+
+    assert_eq!(pictures_in_each(&scene_files), planned.pictures_per_scene);
+    verify::verify_scenes(&video.path, &scene_files, &verify::no_share_checked).unwrap();
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_scene_cut_out_of_an_avi_is_split_at_every_cut_again() {
+    let video = TestVideo::avi_without_show_times("avi_scene");
+    let first_split = cuts_at_keyframes(&video, &[3]);
+    let scene_files =
+        split::split_at_keyframes(&video.path, &first_split.cuts, video.folder()).unwrap();
+
+    // The second scene opens with a keyframe and the pictures stored after
+    // it that are shown before it, which the whole video does not.
+    let scene = TestVideo::copy_of(&scene_files[1], "avi_scene_again");
+    let planned = cuts_at_keyframes(&scene, &[1, 4]);
+    let scenes_of_the_scene =
+        split::split_at_keyframes(&scene.path, &planned.cuts, scene.folder()).unwrap();
+
+    assert_eq!(
+        pictures_in_each(&scenes_of_the_scene),
+        planned.pictures_per_scene
+    );
+    verify::verify_scenes(&scene.path, &scenes_of_the_scene, &verify::no_share_checked).unwrap();
+}
+
+#[test]
+#[ignore = "needs ffmpeg on the PATH"]
+fn a_cut_ffmpeg_passes_over_stops_the_split_and_says_how_many_scenes_were_written() {
+    let video = TestVideo::two_scenes_with_a_black_screen("cut_passed_over");
+    // The last keyframe is a second before the end, so no keyframe is left
+    // for a cut half a second before it.
+    let after_the_last_keyframe = 2.0 * SCENE_SECONDS + BLACK_SECONDS - 0.5;
+
+    let error = split::split_at_keyframes(
+        &video.path,
+        &cuts_at(&[BLACK_START, after_the_last_keyframe]),
+        video.folder(),
+    )
+    .unwrap_err();
+
+    assert!(error.downcast_ref::<ScenesNotCut>().is_some(), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("ffmpeg wrote 2 of 3 scenes"),
+        "{error:#}"
+    );
+    // The two scenes that were written are gone with their folder.
+    assert_no_folder_is_left_in(video.folder());
+    let files_left = std::fs::read_dir(video.folder()).unwrap().count();
+    assert_eq!(files_left, 1);
+}
+
 /// The test video cut into its first scene, its black screen and its second
 /// scene, with the black screen dropped.
 fn without_the_black_screen() -> ScenesToWrite {
@@ -580,23 +809,20 @@ fn without_the_black_screen() -> ScenesToWrite {
     ScenesToWrite::new(cuts_at(&[BLACK_START, BLACK_END]), fates).unwrap()
 }
 
-/// Splits the video without its black screen, and returns every scene the
-/// way the check takes it.
-fn split_without_the_black_screen(video: &TestVideo) -> Vec<SceneToVerify> {
-    split::split_scenes(
+/// Splits the video without its black screen, and returns the scene files
+/// that were kept.
+fn split_without_the_black_screen(video: &TestVideo) -> Vec<PathBuf> {
+    let nothing_to_note = |_dropped_scene: &Path| Ok(());
+    let outcomes = split::split_scenes(
         &video.path,
         &without_the_black_screen(),
         video.folder(),
         SceneNamePattern::default(),
-        verify::record_dropped_scene,
+        nothing_to_note,
+        &split::no_share_written,
     )
-    .unwrap()
-    .into_iter()
-    .map(|outcome| match outcome {
-        SceneOutcome::Written(scene_file) => SceneToVerify::InFile(scene_file),
-        SceneOutcome::Dropped(packets) => SceneToVerify::Dropped(packets),
-    })
-    .collect()
+    .unwrap();
+    split::written_files(&outcomes)
 }
 
 #[test]
@@ -651,46 +877,25 @@ fn a_split_with_a_dropped_scene_writes_the_others_and_always_keeps_the_original(
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
-fn kept_scenes_pass_the_check_only_as_the_right_parts_in_the_right_order() {
+fn the_kept_scenes_of_a_split_with_a_dropped_scene_pass_the_check() {
     let video = TestVideo::two_scenes_with_a_black_screen("dropped_verify");
-    let mut scenes = split_without_the_black_screen(&video);
-    verify::verify_scenes_with_dropped(&video.path, &scenes).unwrap();
+    let kept_files = split_without_the_black_screen(&video);
 
-    // The two scene files change places around the dropped scene.
-    scenes.swap(0, 2);
-    assert!(verify::verify_scenes_with_dropped(&video.path, &scenes).is_err());
+    assert_eq!(kept_files.len(), 2);
+    verify::verify_scenes(&video.path, &kept_files, &verify::no_share_checked).unwrap();
 }
 
 #[test]
 #[ignore = "needs ffmpeg on the PATH"]
 fn the_check_fails_when_a_kept_scene_of_a_split_with_dropped_scenes_is_cut_short() {
     let video = TestVideo::two_scenes_with_a_black_screen("dropped_cut_short");
-    let scenes = split_without_the_black_screen(&video);
+    let kept_files = split_without_the_black_screen(&video);
 
-    let SceneToVerify::InFile(last_scene) = &scenes[2] else {
-        panic!("the last scene was kept, so it is in a file");
-    };
+    let last_scene = &kept_files[1];
     let bytes = std::fs::read(last_scene).unwrap();
     std::fs::write(last_scene, &bytes[..bytes.len() / 2]).unwrap();
 
-    assert!(verify::verify_scenes_with_dropped(&video.path, &scenes).is_err());
-}
-
-#[test]
-#[ignore = "needs ffmpeg on the PATH"]
-fn the_kept_scenes_alone_do_not_pass_for_the_whole_video() {
-    let video = TestVideo::two_scenes_with_a_black_screen("dropped_not_whole");
-    let kept_files: Vec<PathBuf> = split_without_the_black_screen(&video)
-        .into_iter()
-        .filter_map(|scene| match scene {
-            SceneToVerify::InFile(scene_file) => Some(scene_file),
-            SceneToVerify::Dropped(_) => None,
-        })
-        .collect();
-
-    // The check that guards an original before it is recycled.
-    let error = verify::verify_scenes(&video.path, &kept_files).unwrap_err();
-    assert!(format!("{error:#}").contains("packets"), "{error:#}");
+    assert!(verify::verify_scenes(&video.path, &kept_files, &verify::no_share_checked).is_err());
 }
 
 #[test]

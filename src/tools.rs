@@ -178,6 +178,24 @@ pub fn turn_option() -> ffmpeg::TurnOption {
     ffmpeg::TurnOption::for_version(version_banner())
 }
 
+/// How the ffmpeg in use gives a show time to pictures whose file states
+/// none. Asked of the program until it answers, and not again after that,
+/// since the answer cannot change while the app runs.
+///
+/// A failure is handed on and not remembered. Taken for "no time filter",
+/// it would quietly cut every video the less exact way until the app is
+/// started again.
+pub fn show_time_option() -> Result<ffmpeg::ShowTimeOption, ffmpeg::FfmpegError> {
+    static OPTION: OnceLock<ffmpeg::ShowTimeOption> = OnceLock::new();
+    if let Some(option) = OPTION.get() {
+        return Ok(*option);
+    }
+    let bitstream_filters = command(Program::Ffmpeg)
+        .args(["-nostdin", "-v", "error", "-bsfs"])
+        .run_for_text(ffmpeg::QUICK_ANSWER_LIMIT)?;
+    Ok(*OPTION.get_or_init(|| ffmpeg::ShowTimeOption::for_bitstream_filters(&bitstream_filters)))
+}
+
 /// A bare command that runs ffmpeg, for the player. Its decoders run for as
 /// long as a video plays, so it starts and stops them itself.
 pub fn ffmpeg_command() -> Command {

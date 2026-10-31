@@ -23,15 +23,17 @@ use crate::plan::{
     PlanSnapshot, SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
 };
 use crate::scan::UndecodedFrames;
+use crate::scene_length::SceneLengthLimits;
 use crate::scene_list::SceneListFormat;
 use crate::scene_name::EarlierSplit;
-use crate::scenes::CutTimes;
 use crate::selection::{ClickKind, SceneSelection};
 use crate::settings::SettingsChange;
+use crate::starting_cuts::{LimitsEffect, StartingCuts, SuggestedCuts};
 use crate::thumbnails;
-use crate::timecode::{format_timestamp, parse_timestamp, TimeSpan};
+use crate::timecode::{format_clock_precise, parse_timestamp, TimeSpan};
 
 const CHAPTERS_NOT_READ: &str = "The chapter marks of this file could not be read.";
+const SCAN_FROM_LAST_TIME: &str = "Using the scan from last time.";
 
 /// What looking for the scene files of an earlier split found.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +95,40 @@ pub enum ExportObstacle {
     SplitsStuckOffCutPoints(Vec<f64>),
 }
 
+/// Whether an answer says something was done or refused, which the screen
+/// tells apart by colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnswerTone {
+    Done,
+    Refused,
+}
+
+/// What the review last said back to something the person did. There is
+/// one, so the screen always says the newest: a new answer replaces the
+/// old, and any change to the plan clears it.
+#[derive(Debug, PartialEq)]
+pub enum ReviewAnswer {
+    /// Scenes could not be dropped, because nothing would be left to write.
+    DropRefused(NothingToWrite),
+    Split(SplitFeedback),
+}
+
+impl ReviewAnswer {
+    pub fn tone(&self) -> AnswerTone {
+        match self {
+            Self::DropRefused(_) => AnswerTone::Refused,
+            Self::Split(feedback) => feedback.tone(),
+        }
+    }
+
+    pub fn in_words(&self) -> String {
+        match self {
+            Self::DropRefused(refusal) => refusal.to_string(),
+            Self::Split(feedback) => feedback.in_words(),
+        }
+    }
+}
+
 /// How asking for a new split, or for a split to be moved, went, for the
 /// screens to say.
 #[derive(Debug, PartialEq)]
@@ -121,22 +157,30 @@ impl SplitFeedback {
         }
     }
 
+    pub fn tone(&self) -> AnswerTone {
+        if self.is_refusal() {
+            AnswerTone::Refused
+        } else {
+            AnswerTone::Done
+        }
+    }
+
     pub fn in_words(&self) -> String {
         match self {
             Self::Added(cut_time) => format!(
                 "Added a split at {}, the nearest point where the video can be cut.",
-                format_timestamp(*cut_time)
+                format_clock_precise(*cut_time)
             ),
             Self::AddedExactly(cut_time) => format!(
                 "Added a split at exactly {}. A few seconds around it are encoded again when you split.",
-                format_timestamp(*cut_time)
+                format_clock_precise(*cut_time)
             ),
             Self::Refused(why) => why.to_string(),
             Self::NotATime => "Type a time like 1:03:12.".to_owned(),
             Self::Moved(moved) => format!(
                 "Moved the split from {} to {}.",
-                format_timestamp(moved.from),
-                format_timestamp(moved.to)
+                format_clock_precise(moved.from),
+                format_clock_precise(moved.to)
             ),
             Self::MoveRefused(why) => why.to_string(),
         }
@@ -190,7 +234,8 @@ pub enum ReviewRequest {
     /// Play the focused scene, from the picture chosen in it or from its
     /// start.
     PlayFocused,
-    JoinFocusedWithNext,
+    /// Merge the focused scene with the one above it.
+    JoinFocusedWithPrevious,
     /// Do not write this scene to a file.
     DropScene(SceneIndex),
     /// Write this scene after all.
@@ -226,9 +271,13 @@ pub enum ReviewRequest {
     Skip,
     /// Scan the video again, as this kind of scan.
     Rescan(ScanKind),
-    /// Scan again although that throws away the edits.
-    RescanAnyway,
-    /// Do not scan again after all.
+    /// Make the scenes again from what the scan found, with these limits on
+    /// how long a scene may be. The video is not scanned again.
+    UseSceneLengths(SceneLengthLimits),
+    /// Scan again, or make the scenes again, although that throws away the
+    /// edits.
+    StartOverAnyway,
+    /// Do not start over after all.
     KeepEdits,
     /// Play the video from this time.
     PlayFrom(f64),
@@ -265,6 +314,33 @@ pub enum FollowUp {
     ChangeDetection(DetectionSettings),
     RememberForFolder,
     UseGeneralSettings,
+}
+
+/// A way to begin the review of a video afresh. Each one replaces the
+/// scenes, and with them every merge and split the person made by hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StartOver {
+    /// Scan the video again, as this kind of scan.
+    Rescan(ScanKind),
+    /// Make the scenes again from the scan there is, with these limits on
+    /// how long a scene may be.
+    WithSceneLengths(SceneLengthLimits),
+}
+
+/// What a review tells about its scan, apart from the cuts: the parts of the
+/// summary that stay the same when the scenes are made again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScanFacts {
+    black_screen_count: usize,
+    source: DetectionSource,
+    chapters_were_read: ChaptersRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChaptersRead {
+    Yes,
+    /// Scenes the file marks may be missing from the list.
+    CouldNotBe,
 }
 
 /// When the person wants the video they have reviewed to be split.
@@ -310,12 +386,8 @@ pub struct ReviewSession {
     frame_seconds: f64,
     /// What stands in the box for the time of a new split.
     new_split_time: String,
-    /// How the last split added or moved on the review screen went, once
-    /// one was tried.
-    new_split_feedback: Option<SplitFeedback>,
-    /// Why the last try to drop scenes changed nothing, until the plan
-    /// changes again.
-    drop_refusal: Option<NothingToWrite>,
+    /// What the review last said back, until the plan changes.
+    last_answer: Option<ReviewAnswer>,
     /// How the last saving of the scene list went, once one was tried.
     scene_list_note: Option<SceneListNote>,
     export_obstacle: Option<ExportObstacle>,
@@ -328,9 +400,15 @@ pub struct ReviewSession {
     /// be split with the others needs this later, when its turn comes and
     /// nobody is there to ask.
     replacing_agreed_for: Option<EarlierSceneFiles>,
-    /// A scan the person asked for that would throw away their edits, until
-    /// they confirm or cancel it.
-    rescan_awaiting_consent: Option<ScanKind>,
+    /// A fresh start the person asked for that would throw away their
+    /// edits, until they confirm or cancel it.
+    start_over_awaiting_consent: Option<StartOver>,
+    /// Every split the scan and the chapter marks suggest, kept so that the
+    /// scenes can be made again with other limits without a scan.
+    suggested: SuggestedCuts,
+    /// The limits on scene length the scenes were made with.
+    scene_lengths: SceneLengthLimits,
+    scan_facts: ScanFacts,
     /// The titles the file's chapter marks give to scenes.
     chapter_splits: ChapterSplits,
     /// Where a split the person adds lands. It follows the setting, which
@@ -342,53 +420,45 @@ pub struct ReviewSession {
 }
 
 impl ReviewSession {
-    /// `cuts` are the cuts to start from, which the caller picks from the
-    /// scan: its black-screen cuts, or those plus its hard cuts.
-    pub fn new(video: Arc<Path>, scan: SourcedDetection, cuts: CutTimes) -> Self {
+    /// `suggested` are the splits the scan the person chose and the file's
+    /// chapter marks suggest. The review starts from those that
+    /// `scene_lengths` leaves in, and the cuts it adds to long scenes.
+    pub fn new(
+        video: Arc<Path>,
+        scan: SourcedDetection,
+        suggested: SuggestedCuts,
+        scene_lengths: SceneLengthLimits,
+    ) -> Self {
         let SourcedDetection {
             detection,
             source,
             undecoded,
         } = scan;
         let frame_seconds = detection.frame_seconds();
-        let black_screens = counted(detection.black_screens.len(), "black screen");
-        let hard_cuts = cuts.len().saturating_sub(detection.cuts.len());
-        let found = if hard_cuts > 0 {
-            format!(
-                "Found {}: {black_screens}, {}.",
-                counted(cuts.len(), "scene change"),
-                counted(hard_cuts, "sudden picture change")
-            )
-        } else {
-            format!("Found {black_screens}.")
-        };
-        let chapter_splits = detection.chapter_splits(cuts.as_slice());
-        let found = match splits_from_chapters_in_words(chapter_splits.cuts.len()) {
-            Some(from_chapters) => format!("{found} {from_chapters}"),
-            None => found,
-        };
-        let scan_summary = match source {
-            DetectionSource::FreshScan => found,
-            DetectionSource::StoredScan => format!("{found} Using the scan from last time."),
-        };
         let decoded = format!(
-            "The scan looked at {} of {} pictures to find them.",
-            detection.decoded_frames, detection.frame_count
+            "The scan looked at {} of {} pictures.",
+            in_digit_groups(detection.decoded_frames),
+            in_digit_groups(detection.frame_count)
         );
         let chapter_mark_count = detection.chapter_marks().len();
         let scan_details = match (detection.chapters.problem(), chapter_mark_count) {
-            (Some(problem), _) => format!("{decoded} {CHAPTERS_NOT_READ} ({problem})"),
+            // The summary says already that the chapter marks could not be
+            // read, and the two are shown together.
+            (Some(problem), _) => format!("{decoded} ({problem})"),
             (None, 0) => decoded,
             (None, marks) => format!("{decoded} The file has {}.", counted(marks, "chapter mark")),
         };
-        // Said where it is read without pointing: scenes the file marks
-        // may be missing from the list.
-        let scan_summary = match detection.chapters.problem() {
-            Some(_) => format!("{scan_summary} {CHAPTERS_NOT_READ}"),
-            None => scan_summary,
+        let scan_facts = ScanFacts {
+            black_screen_count: detection.black_screens.len(),
+            source,
+            chapters_were_read: match detection.chapters.problem() {
+                Some(_) => ChaptersRead::CouldNotBe,
+                None => ChaptersRead::Yes,
+            },
         };
-        let mut plan = SplitPlan::from_detected_cuts(&cuts, detection.keyframe_times);
-        plan.propose_chapter_cuts(&chapter_splits.cuts);
+        let starting = suggested.within(scene_lengths);
+        let scan_summary = scan_summary_in_words(&scan_facts, &suggested, starting.limits_effect);
+        let plan = plan_starting_from(&starting, &suggested);
         Self {
             video,
             plan,
@@ -400,17 +470,25 @@ impl ReviewSession {
             undecoded,
             frame_seconds,
             new_split_time: String::new(),
-            new_split_feedback: None,
-            drop_refusal: None,
+            last_answer: None,
             scene_list_note: None,
             export_obstacle: None,
             split_asked_for: SplitTiming::Now,
             replacing_agreed_for: None,
-            rescan_awaiting_consent: None,
+            start_over_awaiting_consent: None,
+            suggested,
+            scene_lengths,
+            scan_facts,
             new_split_precision: CutPrecision::NearestKeyframe,
             exact_cut_look: ExactCutLook::NotLooked,
-            chapter_splits,
+            chapter_splits: starting.chapter_splits,
         }
+    }
+
+    /// The limits on scene length this review's scenes were made with. The
+    /// settings may say something else by now.
+    pub fn scene_lengths(&self) -> SceneLengthLimits {
+        self.scene_lengths
     }
 
     pub fn exact_cut_look(&self) -> &ExactCutLook {
@@ -542,8 +620,18 @@ impl ReviewSession {
         &self.new_split_time
     }
 
+    pub fn last_answer(&self) -> Option<&ReviewAnswer> {
+        self.last_answer.as_ref()
+    }
+
+    /// How the last split added or moved went, when that is the last
+    /// answer.
+    #[cfg(test)]
     pub fn new_split_feedback(&self) -> Option<&SplitFeedback> {
-        self.new_split_feedback.as_ref()
+        match &self.last_answer {
+            Some(ReviewAnswer::Split(feedback)) => Some(feedback),
+            _ => None,
+        }
     }
 
     pub fn export_obstacle(&self) -> Option<&ExportObstacle> {
@@ -551,8 +639,12 @@ impl ReviewSession {
     }
 
     /// Why the scenes the person last tried to drop are still written.
+    #[cfg(test)]
     pub fn drop_refusal(&self) -> Option<&NothingToWrite> {
-        self.drop_refusal.as_ref()
+        match &self.last_answer {
+            Some(ReviewAnswer::DropRefused(refusal)) => Some(refusal),
+            _ => None,
+        }
     }
 
     pub fn scene_list_note(&self) -> Option<&SceneListNote> {
@@ -589,10 +681,15 @@ impl ReviewSession {
         self.replacing_agreed_for = None;
     }
 
-    /// Whether the person still has to say if a scan may throw away their
-    /// edits.
-    pub fn is_asking_before_rescan(&self) -> bool {
-        self.rescan_awaiting_consent.is_some()
+    /// The fresh start the person still has to say yes or no to, because
+    /// it throws away their edits.
+    pub fn start_over_awaiting_consent(&self) -> Option<StartOver> {
+        self.start_over_awaiting_consent
+    }
+
+    #[cfg(test)]
+    pub fn is_asking_before_starting_over(&self) -> bool {
+        self.start_over_awaiting_consent.is_some()
     }
 
     pub fn scene_count(&self) -> usize {
@@ -621,7 +718,7 @@ impl ReviewSession {
     }
 
     #[cfg(test)]
-    pub fn accepted_cuts(&self) -> CutTimes {
+    pub fn accepted_cuts(&self) -> crate::scenes::CutTimes {
         self.plan.accepted_cuts()
     }
 
@@ -717,7 +814,7 @@ impl ReviewSession {
             ReviewRequest::PlayFocused => {
                 return self.focused_play_time().map(FollowUp::PlayFrom);
             }
-            ReviewRequest::JoinFocusedWithNext => self.join_focused_with_next(),
+            ReviewRequest::JoinFocusedWithPrevious => self.join_focused_with_previous(),
             ReviewRequest::DropScene(scene) => self.set_fate_of(vec![scene], SceneFate::Drop),
             ReviewRequest::KeepScene(scene) => self.set_fate_of(vec![scene], SceneFate::Keep),
             ReviewRequest::DropOrKeepSelected => self.drop_or_keep_selected(),
@@ -741,11 +838,21 @@ impl ReviewSession {
                 return self.replace_earlier_files(&scene_dir, look_for_earlier_scene_files());
             }
             ReviewRequest::Skip => return Some(FollowUp::Skip),
-            ReviewRequest::Rescan(scan_kind) => return self.ask_to_rescan(scan_kind),
-            ReviewRequest::RescanAnyway => {
-                return self.rescan_awaiting_consent.take().map(FollowUp::Rescan);
+            ReviewRequest::Rescan(scan_kind) => {
+                return self.ask_to_start_over(StartOver::Rescan(scan_kind));
             }
-            ReviewRequest::KeepEdits => self.rescan_awaiting_consent = None,
+            ReviewRequest::UseSceneLengths(scene_lengths) => {
+                if scene_lengths != self.scene_lengths {
+                    return self.ask_to_start_over(StartOver::WithSceneLengths(scene_lengths));
+                }
+            }
+            ReviewRequest::StartOverAnyway => {
+                return self
+                    .start_over_awaiting_consent
+                    .take()
+                    .and_then(|start_over| self.start_over(start_over));
+            }
+            ReviewRequest::KeepEdits => self.start_over_awaiting_consent = None,
             ReviewRequest::PlayFrom(time) => return Some(FollowUp::PlayFrom(time)),
             ReviewRequest::ChangeSettings(change) => {
                 return Some(FollowUp::ChangeSettings(change));
@@ -845,13 +952,43 @@ impl ReviewSession {
         }
     }
 
-    /// A scan replaces the scenes, so edits are not thrown away unasked.
-    fn ask_to_rescan(&mut self, scan_kind: ScanKind) -> Option<FollowUp> {
+    /// A fresh start replaces the scenes, so edits are not thrown away
+    /// unasked.
+    fn ask_to_start_over(&mut self, start_over: StartOver) -> Option<FollowUp> {
         if self.is_edited() {
-            self.rescan_awaiting_consent = Some(scan_kind);
+            self.start_over_awaiting_consent = Some(start_over);
             return None;
         }
-        Some(FollowUp::Rescan(scan_kind))
+        self.start_over(start_over)
+    }
+
+    /// A scan is left to the app. Other limits on scene length need none:
+    /// the review still has every split the scan suggested.
+    fn start_over(&mut self, start_over: StartOver) -> Option<FollowUp> {
+        match start_over {
+            StartOver::Rescan(scan_kind) => Some(FollowUp::Rescan(scan_kind)),
+            StartOver::WithSceneLengths(scene_lengths) => {
+                self.make_the_scenes_again_within(scene_lengths);
+                None
+            }
+        }
+    }
+
+    /// Begins the review afresh from what the scan found, with other limits
+    /// on scene length. Nothing of the old scenes is left to undo back to.
+    fn make_the_scenes_again_within(&mut self, scene_lengths: SceneLengthLimits) {
+        let focused_moment = self.focused_moment();
+        let starting = self.suggested.within(scene_lengths);
+        self.plan = plan_starting_from(&starting, &self.suggested);
+        self.scan_summary =
+            scan_summary_in_words(&self.scan_facts, &self.suggested, starting.limits_effect);
+        self.chapter_splits = starting.chapter_splits;
+        self.scene_lengths = scene_lengths;
+        self.undo_history.clear();
+        self.last_answer = None;
+        self.start_over_awaiting_consent = None;
+        self.forget_what_depended_on_the_old_plan();
+        self.focus_the_scene_showing(focused_moment);
     }
 
     /// Every change to the plan goes through here, so each one can be undone
@@ -922,21 +1059,20 @@ impl ReviewSession {
         self.focus = Some(focus.with_picture(picture));
     }
 
-    fn join_focused_with_next(&mut self) {
+    fn join_focused_with_previous(&mut self) {
         let Some(focus) = self.focus else {
             return;
         };
-        let next = focus.scene().next();
-        if next.position() >= self.scene_count() {
+        let Some(previous) = focus.scene().previous() else {
             return;
-        }
-        self.merge_scenes(focus.scene()..=next);
+        };
+        self.merge_scenes(previous..=focus.scene());
     }
 
     fn nudge_split(&mut self, scene: SceneIndex, direction: NudgeDirection) {
         let step = self.nudge_step();
         let nudged = self.edit_plan(|plan| plan.nudge_cut_before(scene, direction, step));
-        self.new_split_feedback = Some(match nudged {
+        self.last_answer = Some(ReviewAnswer::Split(match nudged {
             Ok(moved) => {
                 // The scene keeps its number but not its start, which is
                 // what the focus is found again by.
@@ -944,7 +1080,7 @@ impl ReviewSession {
                 SplitFeedback::Moved(moved)
             }
             Err(why) => SplitFeedback::MoveRefused(why),
-        });
+        }));
     }
 
     /// Scene numbers shift when the plan changes, so a selection made
@@ -954,7 +1090,7 @@ impl ReviewSession {
     fn forget_what_depended_on_the_old_plan(&mut self) {
         self.selection.clear();
         self.forget_export_obstacle();
-        self.drop_refusal = None;
+        self.last_answer = None;
         self.scene_list_note = None;
     }
 
@@ -1003,7 +1139,9 @@ impl ReviewSession {
             Ok(())
         });
         self.selection = selection;
-        self.drop_refusal = outcome.err();
+        if let Err(refusal) = outcome {
+            self.last_answer = Some(ReviewAnswer::DropRefused(refusal));
+        }
     }
 
     fn merge_scenes(&mut self, scenes: RangeInclusive<SceneIndex>) {
@@ -1028,14 +1166,14 @@ impl ReviewSession {
 
     fn add_typed_split(&mut self) {
         let Some(requested_time) = parse_timestamp(&self.new_split_time) else {
-            self.new_split_feedback = Some(SplitFeedback::NotATime);
+            self.last_answer = Some(ReviewAnswer::Split(SplitFeedback::NotATime));
             return;
         };
         let feedback = self.split_near(requested_time);
         if !feedback.is_refusal() {
             self.new_split_time.clear();
         }
-        self.new_split_feedback = Some(feedback);
+        self.last_answer = Some(ReviewAnswer::Split(feedback));
     }
 
     fn add_split_near(&mut self, time: f64) -> Result<f64, AddCutError> {
@@ -1062,6 +1200,78 @@ impl ReviewSession {
     }
 }
 
+/// The plan a review starts from, with nothing edited yet.
+fn plan_starting_from(starting: &StartingCuts, suggested: &SuggestedCuts) -> SplitPlan {
+    let mut plan =
+        SplitPlan::from_detected_cuts(&starting.detected, suggested.keyframe_times().to_vec());
+    plan.propose_cuts_for_long_scenes(&starting.added_for_long_scenes);
+    plan.propose_chapter_cuts(&starting.chapter_splits.cuts);
+    plan
+}
+
+/// What the status line says while no action has an answer to show: what
+/// the scan found, what the limits on scene length made of it, and where
+/// the scan came from.
+fn scan_summary_in_words(
+    facts: &ScanFacts,
+    suggested: &SuggestedCuts,
+    limits_effect: LimitsEffect,
+) -> String {
+    let black_screens = counted(facts.black_screen_count, "black screen");
+    let sudden_changes = suggested.sudden_change_count();
+    let found = if sudden_changes > 0 {
+        format!(
+            "Found {}: {black_screens}, {}.",
+            counted(suggested.scene_change_count(), "scene change"),
+            counted(sudden_changes, "sudden picture change")
+        )
+    } else {
+        format!("Found {black_screens}.")
+    };
+    let from_last_time = match facts.source {
+        DetectionSource::FreshScan => None,
+        DetectionSource::StoredScan => Some(SCAN_FROM_LAST_TIME.to_owned()),
+    };
+    // Said where it is read without pointing: scenes the file marks may be
+    // missing from the list.
+    let chapters_not_read = match facts.chapters_were_read {
+        ChaptersRead::Yes => None,
+        ChaptersRead::CouldNotBe => Some(CHAPTERS_NOT_READ.to_owned()),
+    };
+    let sentences = [
+        Some(found),
+        splits_from_chapters_in_words(suggested.chapter_split_count()),
+        short_scenes_merged_in_words(limits_effect.splits_left_out),
+        long_scenes_split_in_words(limits_effect.splits_added),
+        from_last_time,
+        chapters_not_read,
+    ];
+    sentences
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What the shortest scene did, so nobody wonders where splits went. Every
+/// split it left out merged one scene into its neighbour.
+fn short_scenes_merged_in_words(splits_left_out: usize) -> Option<String> {
+    match splits_left_out {
+        0 => None,
+        1 => Some("1 short scene was merged away.".to_owned()),
+        several => Some(format!("{several} short scenes were merged away.")),
+    }
+}
+
+/// What the longest scene did.
+fn long_scenes_split_in_words(splits_added: usize) -> Option<String> {
+    match splits_added {
+        0 => None,
+        1 => Some("1 split was added to a long scene.".to_owned()),
+        several => Some(format!("{several} splits were added to long scenes.")),
+    }
+}
+
 /// The sentence of the scan summary about chapter marks, or `None` when no
 /// split comes from one.
 fn splits_from_chapters_in_words(chapter_split_count: usize) -> Option<String> {
@@ -1073,6 +1283,19 @@ fn splits_from_chapters_in_words(chapter_split_count: usize) -> Option<String> {
 }
 
 /// "1 scene", "3 scenes".
+/// A count with its digits in groups of three, as "213,456".
+fn in_digit_groups(count: usize) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::new();
+    for (place, digit) in digits.chars().enumerate() {
+        if place > 0 && (digits.len() - place) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 pub fn counted(count: usize, noun: &str) -> String {
     let plural = if count == 1 { "" } else { "s" };
     format!("{count} {noun}{plural}")
@@ -1082,6 +1305,8 @@ pub fn counted(count: usize, noun: &str) -> String {
 pub mod test_sessions {
     use super::*;
     use crate::detect::Detection;
+    use crate::scene_length::SceneLength;
+    use crate::starting_cuts::CutSources;
 
     /// A 100 second video cut into five scenes of 20 seconds each, with a
     /// keyframe every 10 seconds.
@@ -1104,11 +1329,32 @@ pub mod test_sessions {
         })
     }
 
-    /// The review of a scan, starting from its black-screen cuts.
+    /// The review of a scan, starting from its black-screen cuts, with no
+    /// limit on how long a scene may be.
     pub fn review_of(scan: SourcedDetection) -> ReviewSession {
-        let cuts = CutTimes::inside(scan.detection.video, scan.detection.cuts.clone()).unwrap();
+        review_within(scan, ScanKind::BlackScreens, SceneLengthLimits::default())
+    }
+
+    /// The review of a scan of this kind, with these limits on scene length.
+    pub fn review_within(
+        scan: SourcedDetection,
+        scan_kind: ScanKind,
+        scene_lengths: SceneLengthLimits,
+    ) -> ReviewSession {
+        let suggested =
+            SuggestedCuts::of(&scan.detection, &CutSources::for_review(scan_kind)).unwrap();
         let video: Arc<Path> = Arc::from(Path::new("no_such_video.mp4"));
-        ReviewSession::new(video, scan, cuts)
+        ReviewSession::new(video, scan, suggested, scene_lengths)
+    }
+
+    /// No scene shorter than `shortest_seconds`, and none longer than
+    /// `longest_seconds`, where one is given.
+    pub fn scene_lengths(
+        shortest_seconds: Option<f64>,
+        longest_seconds: Option<f64>,
+    ) -> SceneLengthLimits {
+        let length = |seconds: f64| SceneLength::from_seconds(seconds).unwrap();
+        SceneLengthLimits::new(shortest_seconds.map(length), longest_seconds.map(length)).unwrap()
     }
 
     pub fn scenes_of_twenty_seconds_detected(scene_count: usize) -> Detection {
@@ -1277,7 +1523,7 @@ mod tests {
         assert!(session.undecoded().is_empty());
         assert_eq!(
             session.scan_details(),
-            "The scan looked at 0 of 3000 pictures to find them."
+            "The scan looked at 0 of 3,000 pictures."
         );
         assert_eq!(session.frame_seconds(), 100.0 / 3000.0);
     }
@@ -1318,15 +1564,22 @@ mod tests {
 
     #[test]
     fn a_scan_that_also_found_hard_cuts_counts_them_apart() {
+        // The scan suggests cuts at 20 and 40. One more comes from a hard cut.
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(3);
+        detection.hard_cut_candidates = Some(vec![crate::hardcut::HardCutCandidate {
+            time: 30.0,
+            strength: u8::MAX,
+        }]);
         let scan = SourcedDetection {
-            detection: test_sessions::scenes_of_twenty_seconds_detected(3),
+            detection,
             source: DetectionSource::FreshScan,
             undecoded: Vec::new(),
         };
-        // The scan suggests cuts at 20 and 40. One more comes from a hard cut.
-        let cuts = CutTimes::inside(scan.detection.video, vec![20.0, 30.0, 40.0]).unwrap();
-        let video: Arc<Path> = Arc::from(Path::new("no_such_video.mp4"));
-        let session = ReviewSession::new(video, scan, cuts);
+        let every_strong_change = ScanKind::HardCuts(crate::hardcut::HardCutSettings {
+            min_scene_seconds: 10.0,
+            ..Default::default()
+        });
+        let session = test_sessions::review_within(scan, every_strong_change, Default::default());
 
         assert_eq!(
             session.scan_summary(),
@@ -1440,6 +1693,30 @@ mod tests {
     }
 
     #[test]
+    fn a_count_of_pictures_is_written_in_groups_of_three_digits() {
+        assert_eq!(in_digit_groups(0), "0");
+        assert_eq!(in_digit_groups(999), "999");
+        assert_eq!(in_digit_groups(1200), "1,200");
+        assert_eq!(in_digit_groups(213456), "213,456");
+        assert_eq!(in_digit_groups(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn the_newest_answer_replaces_a_refused_drop() {
+        let mut session = Session::five_scenes();
+        session.ask(ReviewRequest::SelectAllScenes);
+        session.ask(ReviewRequest::DropOrKeepSelected);
+        session.ask(ReviewRequest::TypeNewSplitTime("abc".to_owned()));
+        session.ask(ReviewRequest::AddTypedSplit);
+
+        assert_eq!(session.0.drop_refusal(), None);
+        assert_eq!(
+            session.0.last_answer(),
+            Some(&ReviewAnswer::Split(SplitFeedback::NotATime))
+        );
+    }
+
+    #[test]
     fn dropping_the_last_scene_that_is_written_is_refused() {
         let mut session = Session(test_sessions::scenes_of_twenty_seconds(2));
         session.ask(ReviewRequest::DropScene(scene(0)));
@@ -1494,7 +1771,7 @@ mod tests {
             session.ask(ReviewRequest::Rescan(ScanKind::BlackScreens)),
             None
         );
-        assert!(session.0.is_asking_before_rescan());
+        assert!(session.0.is_asking_before_starting_over());
     }
 
     #[test]
@@ -1691,7 +1968,7 @@ mod tests {
         assert!(!feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "Added a split at 00:00:50.000, the nearest point where the video can be cut."
+            "Added a split at 0:50.00, the nearest point where the video can be cut."
         );
         assert_eq!(
             session.scene_ends(),
@@ -1711,7 +1988,7 @@ mod tests {
         assert!(!feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "Added a split at exactly 00:00:47.360. A few seconds around it are encoded again when you split."
+            "Added a split at exactly 0:47.36. A few seconds around it are encoded again when you split."
         );
         assert_eq!(
             session.scene_ends(),
@@ -1988,10 +2265,7 @@ mod tests {
             SplitFeedback::Refused(AddCutError::AlreadyProposed { at: 40.0 })
         );
         assert!(feedback.is_refusal());
-        assert_eq!(
-            feedback.in_words(),
-            "There is already a split at 00:00:40.000."
-        );
+        assert_eq!(feedback.in_words(), "There is already a split at 0:40.00.");
         assert_eq!(session.0.scene_count(), 5);
     }
 
@@ -2108,7 +2382,7 @@ mod tests {
         assert!(!feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "Moved the split from 00:00:40.000 to 00:00:50.000."
+            "Moved the split from 0:40.00 to 0:50.00."
         );
     }
 
@@ -2136,7 +2410,7 @@ mod tests {
         assert!(feedback.is_refusal());
         assert_eq!(
             feedback.in_words(),
-            "The split cannot move further. The split at 00:01:00.000 is in the way."
+            "The split cannot move further. The split at 1:00.00 is in the way."
         );
         // The refused move left nothing more to undo than the first one.
         session.ask(ReviewRequest::Undo);
@@ -2321,10 +2595,10 @@ mod tests {
     }
 
     #[test]
-    fn the_focused_scene_is_joined_with_the_next_and_stays_focused() {
+    fn the_focused_scene_is_joined_with_the_one_above_which_takes_the_focus() {
         let mut session = Session::five_scenes();
-        session.ask(click(1, ClickKind::Single));
-        session.ask(ReviewRequest::JoinFocusedWithNext);
+        session.ask(click(2, ClickKind::Single));
+        session.ask(ReviewRequest::JoinFocusedWithPrevious);
 
         assert_eq!(session.scene_ends(), vec![20.0, 60.0, 80.0, 100.0]);
         assert_eq!(session.focused(), Some(1));
@@ -2332,15 +2606,15 @@ mod tests {
     }
 
     #[test]
-    fn the_last_scene_has_no_next_scene_to_join() {
+    fn the_first_scene_has_no_scene_above_to_join() {
         let mut session = Session::five_scenes();
-        session.ask(click(4, ClickKind::Single));
-        session.ask(ReviewRequest::JoinFocusedWithNext);
+        session.ask(click(0, ClickKind::Single));
+        session.ask(ReviewRequest::JoinFocusedWithPrevious);
         assert_eq!(session.0.scene_count(), 5);
         assert!(!session.0.can_undo());
 
         let mut nothing_focused = Session::five_scenes();
-        nothing_focused.ask(ReviewRequest::JoinFocusedWithNext);
+        nothing_focused.ask(ReviewRequest::JoinFocusedWithPrevious);
         assert_eq!(nothing_focused.0.scene_count(), 5);
     }
 
@@ -2523,6 +2797,155 @@ mod tests {
         );
     }
 
+    /// Title cards a few seconds apart at the start of a 200 second video,
+    /// and one long black screen in the middle of it.
+    fn scan_with_title_cards() -> SourcedDetection {
+        let black = |start: f64, end: f64| TimeSpan { start, end };
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(10);
+        detection.black_screens = vec![
+            black(9.5, 10.5),
+            black(19.5, 20.5),
+            black(29.0, 31.0),
+            black(98.0, 102.0),
+        ];
+        detection.cuts = vec![10.0, 20.0, 30.0, 100.0];
+        SourcedDetection {
+            detection,
+            source: DetectionSource::FreshScan,
+            undecoded: Vec::new(),
+        }
+    }
+
+    fn review_of_title_cards(scene_lengths: SceneLengthLimits) -> Session {
+        Session(test_sessions::review_within(
+            scan_with_title_cards(),
+            ScanKind::BlackScreens,
+            scene_lengths,
+        ))
+    }
+
+    fn no_scene_under_a_minute() -> SceneLengthLimits {
+        test_sessions::scene_lengths(Some(60.0), None)
+    }
+
+    #[test]
+    fn a_review_starts_within_the_scene_lengths_and_says_what_they_did() {
+        let session = review_of_title_cards(no_scene_under_a_minute());
+        assert_eq!(session.scene_ends(), [100.0, 200.0]);
+        assert_eq!(
+            session.0.scan_summary(),
+            "Found 4 black screens. 3 short scenes were merged away."
+        );
+        assert_eq!(session.0.scene_lengths(), no_scene_under_a_minute());
+        // The limits are where the review begins, not an edit of it.
+        assert!(!session.0.is_edited());
+    }
+
+    #[test]
+    fn a_review_says_how_many_splits_the_longest_scene_added() {
+        let session = review_of_title_cards(test_sessions::scene_lengths(None, Some(50.0)));
+        assert_eq!(
+            session.scene_ends(),
+            [10.0, 20.0, 30.0, 60.0, 100.0, 150.0, 200.0]
+        );
+        assert_eq!(
+            session.0.scan_summary(),
+            "Found 4 black screens. 2 splits were added to long scenes."
+        );
+    }
+
+    #[test]
+    fn other_scene_lengths_make_the_scenes_of_an_untouched_review_again_at_once() {
+        let mut session = review_of_title_cards(SceneLengthLimits::default());
+        assert_eq!(session.scene_ends(), [10.0, 20.0, 30.0, 100.0, 200.0]);
+
+        // Nothing is left for the app to do: the video is not scanned again.
+        assert_eq!(
+            session.ask(ReviewRequest::UseSceneLengths(no_scene_under_a_minute())),
+            None
+        );
+        assert_eq!(session.scene_ends(), [100.0, 200.0]);
+        assert_eq!(session.0.scene_lengths(), no_scene_under_a_minute());
+        assert!(!session.0.is_asking_before_starting_over());
+        assert!(!session.0.is_edited());
+
+        // And back again, with what the limits left out.
+        session.ask(ReviewRequest::UseSceneLengths(SceneLengthLimits::default()));
+        assert_eq!(session.scene_ends(), [10.0, 20.0, 30.0, 100.0, 200.0]);
+        assert_eq!(session.0.scan_summary(), "Found 4 black screens.");
+    }
+
+    #[test]
+    fn other_scene_lengths_ask_before_they_throw_edits_away() {
+        let mut session = review_of_title_cards(SceneLengthLimits::default());
+        session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
+        let merged_by_hand = session.scene_ends();
+
+        assert_eq!(
+            session.ask(ReviewRequest::UseSceneLengths(no_scene_under_a_minute())),
+            None
+        );
+        assert_eq!(
+            session.0.start_over_awaiting_consent(),
+            Some(StartOver::WithSceneLengths(no_scene_under_a_minute()))
+        );
+        assert_eq!(session.scene_ends(), merged_by_hand);
+        assert_eq!(session.0.scene_lengths(), SceneLengthLimits::default());
+
+        assert_eq!(session.ask(ReviewRequest::StartOverAnyway), None);
+        assert_eq!(session.scene_ends(), [100.0, 200.0]);
+        assert!(!session.0.is_asking_before_starting_over());
+        assert!(!session.0.can_undo());
+    }
+
+    #[test]
+    fn keeping_the_edits_keeps_the_scene_lengths_the_review_began_with() {
+        let mut session = review_of_title_cards(SceneLengthLimits::default());
+        session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
+        let merged_by_hand = session.scene_ends();
+        session.ask(ReviewRequest::UseSceneLengths(no_scene_under_a_minute()));
+
+        assert_eq!(session.ask(ReviewRequest::KeepEdits), None);
+        assert_eq!(session.scene_ends(), merged_by_hand);
+        assert_eq!(session.0.scene_lengths(), SceneLengthLimits::default());
+        assert!(session.0.can_undo());
+    }
+
+    #[test]
+    fn the_scene_lengths_a_review_already_has_change_nothing_and_ask_nothing() {
+        let mut session = review_of_title_cards(no_scene_under_a_minute());
+        session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
+
+        assert_eq!(
+            session.ask(ReviewRequest::UseSceneLengths(no_scene_under_a_minute())),
+            None
+        );
+        assert!(!session.0.is_asking_before_starting_over());
+        assert_eq!(session.0.scene_count(), 1);
+    }
+
+    #[test]
+    fn the_scene_lengths_never_undo_what_the_person_did_by_hand() {
+        let mut session = review_of_title_cards(no_scene_under_a_minute());
+        // A split ten seconds in, which the shortest scene would not allow.
+        session.add_split_at("0:10");
+        session.ask(ReviewRequest::MergeScenes(scenes(1, 2)));
+        assert_eq!(session.scene_ends(), [10.0, 200.0]);
+    }
+
+    #[test]
+    fn a_reset_goes_back_to_the_scenes_within_the_scene_lengths() {
+        let mut session =
+            review_of_title_cards(test_sessions::scene_lengths(Some(40.0), Some(50.0)));
+        let as_begun = session.scene_ends();
+        assert_eq!(as_begun, [50.0, 100.0, 150.0, 200.0]);
+
+        session.add_split_at("0:10");
+        session.ask(ReviewRequest::MergeScenes(scenes(1, 3)));
+        session.ask(ReviewRequest::ResetScenes);
+        assert_eq!(session.scene_ends(), as_begun);
+    }
+
     #[test]
     fn an_untouched_review_is_scanned_again_without_asking() {
         let mut session = Session::five_scenes();
@@ -2530,7 +2953,7 @@ mod tests {
             session.ask(ReviewRequest::Rescan(ScanKind::BlackScreens)),
             Some(FollowUp::Rescan(ScanKind::BlackScreens))
         );
-        assert!(!session.0.is_asking_before_rescan());
+        assert!(!session.0.is_asking_before_starting_over());
     }
 
     #[test]
@@ -2539,14 +2962,14 @@ mod tests {
         session.ask(ReviewRequest::MergeScenes(scenes(0, 1)));
 
         assert_eq!(session.ask(ReviewRequest::Rescan(hard_cut_scan())), None);
-        assert!(session.0.is_asking_before_rescan());
+        assert!(session.0.is_asking_before_starting_over());
 
         // The scan that was asked for is the one that runs.
         assert_eq!(
-            session.ask(ReviewRequest::RescanAnyway),
+            session.ask(ReviewRequest::StartOverAnyway),
             Some(FollowUp::Rescan(hard_cut_scan()))
         );
-        assert!(!session.0.is_asking_before_rescan());
+        assert!(!session.0.is_asking_before_starting_over());
     }
 
     #[test]
@@ -2558,7 +2981,7 @@ mod tests {
         assert_eq!(session.0.scene_count(), 1);
 
         assert_eq!(session.ask(ReviewRequest::Rescan(hard_cut_scan())), None);
-        assert!(session.0.is_asking_before_rescan());
+        assert!(session.0.is_asking_before_starting_over());
     }
 
     #[test]
@@ -2568,14 +2991,14 @@ mod tests {
         session.ask(ReviewRequest::Rescan(ScanKind::BlackScreens));
 
         assert_eq!(session.ask(ReviewRequest::KeepEdits), None);
-        assert!(!session.0.is_asking_before_rescan());
+        assert!(!session.0.is_asking_before_starting_over());
         assert_eq!(session.0.scene_count(), 4);
     }
 
     #[test]
     fn scanning_anyway_without_having_been_asked_does_nothing() {
         let mut session = Session::five_scenes();
-        assert_eq!(session.ask(ReviewRequest::RescanAnyway), None);
+        assert_eq!(session.ask(ReviewRequest::StartOverAnyway), None);
     }
 
     #[test]
@@ -2679,7 +3102,7 @@ mod tests {
         );
         assert_eq!(
             session.scan_details(),
-            "The scan looked at 0 of 3000 pictures to find them. The file has 4 chapter marks."
+            "The scan looked at 0 of 3,000 pictures. The file has 4 chapter marks."
         );
     }
 

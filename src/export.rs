@@ -15,9 +15,9 @@ use crate::library::VIDEO_EXTENSIONS;
 use crate::probe;
 use crate::scene_list::{SceneList, SceneListFormat};
 use crate::scene_name::{SceneNamePattern, SceneNames};
-use crate::split::{self, SceneLocation, SceneOutcome};
+use crate::split::{self, SceneLocation};
 use crate::timecode::format_timestamp;
-use crate::verify::{self, SceneToVerify};
+use crate::verify;
 
 /// What each system calls the place deleted files go to.
 pub const TRASH_NAME: &str = if cfg!(windows) {
@@ -77,8 +77,8 @@ impl ExportOptions {
 /// How the scenes of one split are written, and with it what may happen to
 /// the original afterwards.
 ///
-/// Only a split that copies every packet can be compared with the original
-/// packet for packet, so only that kind carries a policy for the original.
+/// Only a split that copies every packet holds the original unchanged, so
+/// only that kind carries a policy for the original.
 /// An exact split encodes the pictures around each cut again. It has no
 /// policy to carry, and so no way to ask for the original to be recycled.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -234,9 +234,54 @@ impl SplitOrder {
     }
 }
 
+/// What the result says of scene files that passed the check.
+const SCENES_PLAY: &str = "Checked: every scene file reads to its end and plays.";
+
+/// The two parts of a split, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SplitStage {
+    WritingScenes,
+    CheckingScenes,
+}
+
+/// Writing reads the whole video and writes it once. Checking reads what
+/// was written once more, which goes faster. So writing counts for a
+/// little more than half of a split.
+const WRITING_SHARE_OF_A_SPLIT: f32 = 0.6;
+
+/// How far a split has come.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplitProgress {
+    pub stage: SplitStage,
+    /// The share of the whole split that is done, from 0.0 to 1.0. A split
+    /// passes through both stages on the way to 1.0.
+    pub fraction: f32,
+}
+
+impl SplitProgress {
+    /// The progress of a split that has done `stage_fraction` of `stage`.
+    pub fn within(stage: SplitStage, stage_fraction: f32) -> Self {
+        let stage_fraction = stage_fraction.clamp(0.0, 1.0);
+        let fraction = match stage {
+            SplitStage::WritingScenes => stage_fraction * WRITING_SHARE_OF_A_SPLIT,
+            SplitStage::CheckingScenes => {
+                WRITING_SHARE_OF_A_SPLIT + stage_fraction * (1.0 - WRITING_SHARE_OF_A_SPLIT)
+            }
+        };
+        Self { stage, fraction }
+    }
+}
+
+/// Receives the progress of a split. Called from the threads that check the
+/// scenes, so two reports close together can arrive out of order.
+pub type OnSplitProgress<'a> = &'a (dyn Fn(SplitProgress) + Sync);
+
+/// For callers that do not show progress.
+pub fn no_split_progress(_progress: SplitProgress) {}
+
 #[derive(Debug)]
 pub enum Verification {
-    /// The scenes hold every packet of the original, unchanged.
+    /// Every scene file reads to its end and plays.
     Passed,
     /// The scenes of an exact split passed the checks that can be made of
     /// them. Scenes that do not are never put in place.
@@ -413,14 +458,10 @@ impl ExportReport {
     fn check_in_plain_words(&self) -> String {
         match &self.verification {
             Verification::Passed if self.dropped_scenes > 0 => format!(
-                "Checked: each file contains its own part of the original, with nothing missing \
-                 or changed. {}",
+                "{SCENES_PLAY} {}",
                 dropped_scenes_are_in_no_file(self.dropped_scenes)
             ),
-            Verification::Passed => {
-                "Checked: together they contain the whole original, with nothing missing or changed."
-                    .to_owned()
-            }
+            Verification::Passed => SCENES_PLAY.to_owned(),
             // The check ran on every scene, before the dropped ones were
             // left out, so the count of pictures is the whole original's.
             Verification::PassedForExactCut(proof) if self.dropped_scenes > 0 => format!(
@@ -560,11 +601,31 @@ pub fn export_scenes(
     out_dir: &Path,
     scene_names: impl Into<SceneNames>,
 ) -> Result<ExportReport> {
-    export_scenes_encoding_with(video, order, out_dir, scene_names, Encoder::LIBX264)
+    export_scenes_reporting(video, order, out_dir, scene_names, &no_split_progress)
+}
+
+/// `export_scenes`, saying how far it has come as it goes. A split on exact
+/// pictures does not say.
+pub fn export_scenes_reporting(
+    video: &Path,
+    order: &SplitOrder,
+    out_dir: &Path,
+    scene_names: impl Into<SceneNames>,
+    on_progress: OnSplitProgress,
+) -> Result<ExportReport> {
+    export_with(
+        video,
+        order,
+        out_dir,
+        scene_names.into(),
+        Encoder::LIBX264,
+        on_progress,
+    )
 }
 
 /// `export_scenes`, with the encoder an exact split looks for in ffmpeg
 /// named by the caller. The tests name one that no ffmpeg has.
+#[cfg(test)]
 pub fn export_scenes_encoding_with(
     video: &Path,
     order: &SplitOrder,
@@ -572,7 +633,24 @@ pub fn export_scenes_encoding_with(
     scene_names: impl Into<SceneNames>,
     encoder: Encoder,
 ) -> Result<ExportReport> {
-    let scene_names = scene_names.into();
+    export_with(
+        video,
+        order,
+        out_dir,
+        scene_names.into(),
+        encoder,
+        &no_split_progress,
+    )
+}
+
+fn export_with(
+    video: &Path,
+    order: &SplitOrder,
+    out_dir: &Path,
+    scene_names: SceneNames,
+    encoder: Encoder,
+    on_progress: OnSplitProgress,
+) -> Result<ExportReport> {
     match order.cut_precision {
         CutPrecision::NearestKeyframe => export_copied_scenes(
             video,
@@ -581,9 +659,10 @@ pub fn export_scenes_encoding_with(
             out_dir,
             scene_names,
             CutOutcome::AsAskedFor,
+            on_progress,
         ),
         CutPrecision::ExactFrame => {
-            export_exact_scenes(video, order, out_dir, scene_names, encoder)
+            export_exact_scenes(video, order, out_dir, scene_names, encoder, on_progress)
         }
     }
 }
@@ -601,13 +680,14 @@ pub fn export_scenes_encoding_with(
 /// exact cut are checked before they leave the unfinished folder, so by
 /// then nothing of the try is left, and the scene files of an earlier split
 /// are still as they were. What is written instead goes through the same
-/// packet for packet check as any normal split.
+/// check as any normal split.
 fn export_exact_scenes(
     video: &Path,
     order: &SplitOrder,
     out_dir: &Path,
     scene_names: SceneNames,
     encoder: Encoder,
+    on_progress: OnSplitProgress,
 ) -> Result<ExportReport> {
     let exact_split =
         exact_split::split_on_exact_frames(video, order.scenes(), out_dir, scene_names, encoder);
@@ -626,6 +706,7 @@ fn export_exact_scenes(
                 out_dir,
                 scene_names,
                 why_not_exact,
+                on_progress,
             );
         }
     };
@@ -650,7 +731,7 @@ fn export_exact_scenes(
 
 /// Cuts a video that was to be cut on exact pictures at the points nearest
 /// to its splits where it can be cut, by copying, and checks the scenes
-/// packet for packet as after any normal split.
+/// as after any normal split.
 ///
 /// Fails, with nothing written, when the splits cannot all go to such
 /// points and still leave every scene in place.
@@ -660,6 +741,7 @@ fn export_at_the_nearest_cut_points(
     out_dir: &Path,
     scene_names: SceneNames,
     why_not_exact: WhyNotExact,
+    on_progress: OnSplitProgress,
 ) -> Result<ExportReport> {
     let after_no_exact_cut = format!(
         "the video was not cut on the exact pictures ({}), and cutting it at the nearest \
@@ -697,6 +779,7 @@ fn export_at_the_nearest_cut_points(
         out_dir,
         scene_names,
         CutOutcome::AtTheNearestPointsInstead(fallback),
+        on_progress,
     )
     .with_context(|| after_no_exact_cut)
 }
@@ -704,8 +787,8 @@ fn export_at_the_nearest_cut_points(
 /// What may happen to the original of a split that asked for exact pictures
 /// and was cut at the nearest points instead: it stays.
 ///
-/// The scenes of such a split are copies and pass the packet for packet
-/// check, which is all that a normal split needs to let its original go. It
+/// The scenes of such a split are copies and pass the check, which is all
+/// that a normal split needs to let its original go. It
 /// stays all the same, because the person asked for a split that always
 /// keeps it, and may have counted on that when they started it.
 fn original_rule_after_no_exact_cut(rule_of_the_order: OriginalRule) -> OriginalRule {
@@ -727,30 +810,29 @@ fn export_copied_scenes(
     out_dir: &Path,
     scene_names: SceneNames,
     cut: CutOutcome,
+    on_progress: OnSplitProgress,
 ) -> Result<ExportReport> {
+    let report_share_of = |stage: SplitStage| {
+        move |stage_fraction: f32| on_progress(SplitProgress::within(stage, stage_fraction))
+    };
+    // The check looks at the scene files alone, so nothing is noted about a
+    // dropped scene before it goes.
+    let nothing_to_note = |_dropped_scene: &Path| Ok(());
     let outcomes = split::split_scenes(
         video,
         scenes,
         out_dir,
         scene_names,
-        verify::record_dropped_scene,
+        nothing_to_note,
+        &report_share_of(SplitStage::WritingScenes),
     )?;
     let scene_files = split::written_files(&outcomes);
-    let scenes_to_verify: Vec<SceneToVerify> = outcomes
-        .into_iter()
-        .map(|outcome| match outcome {
-            SceneOutcome::Written(scene_file) => SceneToVerify::InFile(scene_file),
-            SceneOutcome::Dropped(packets) => SceneToVerify::Dropped(packets),
-        })
-        .collect();
 
-    // A split of every scene goes through the check it always went through.
-    // Only a split that dropped scenes needs what was noted about them.
-    let verified = if scenes.has_dropped_scenes() {
-        verify::verify_scenes_with_dropped(video, &scenes_to_verify)
-    } else {
-        verify::verify_scenes(video, &scene_files)
-    };
+    let verified = verify::verify_scenes(
+        video,
+        &scene_files,
+        &report_share_of(SplitStage::CheckingScenes),
+    );
     let verification = match verified {
         Ok(()) => Verification::Passed,
         Err(error) => Verification::Failed(format!("{error:#}")),
@@ -834,7 +916,7 @@ enum OriginalDecision {
 
 /// The one rule that guards the original: it is only recycled when nothing
 /// about the split says it must stay, the person asked for that, and the
-/// scenes were proven to hold every packet of it. The check of an exact cut
+/// scenes, which are copies, read to their ends and play. The check of an exact cut
 /// proves less than that, so it never counts.
 fn decide_about_original(rule: OriginalRule, verification: &Verification) -> OriginalDecision {
     match (rule, verification) {
@@ -860,6 +942,19 @@ mod tests {
     use crate::fates::SceneFate;
     use crate::scenes::CutTimes;
     use crate::timecode::TimeSpan;
+
+    #[test]
+    fn a_split_goes_from_nothing_to_all_through_writing_then_checking() {
+        let writing = |share| SplitProgress::within(SplitStage::WritingScenes, share).fraction;
+        let checking = |share| SplitProgress::within(SplitStage::CheckingScenes, share).fraction;
+        assert_eq!(writing(0.0), 0.0);
+        assert_eq!(writing(1.0), checking(0.0));
+        assert!(writing(0.5) < writing(1.0));
+        assert!(checking(0.5) < checking(1.0));
+        assert_eq!(checking(1.0), 1.0);
+        // A share out of range does not leave the stage.
+        assert_eq!(checking(7.0), 1.0);
+    }
 
     fn failed() -> Verification {
         Verification::Failed("packet 3 of stream 0 differs".to_owned())
@@ -1147,8 +1242,7 @@ mod tests {
         assert_eq!(
             with_drops.plain_summary(),
             "1 scene file is in\nscenes\n\n\
-             Checked: each file contains its own part of the original, with nothing missing or \
-             changed. 2 scenes were dropped and are in no file.\n\n\
+             Checked: every scene file reads to its end and plays. 2 scenes were dropped and are in no file.\n\n\
              The original is still in its place. It is always kept when scenes are dropped, \
              because the new files do not hold all of it."
         );
@@ -1294,8 +1388,7 @@ mod tests {
              as mpeg4, and exact cuts only work for pictures stored as H.264. It was cut at the \
              nearest points where it can be cut instead. The split moved from 00:00:02.920 to \
              00:00:02.000, 0.920 seconds earlier.\n\n\
-             Checked: together they contain the whole original, with nothing missing or \
-             changed.\n\n\
+             Checked: every scene file reads to its end and plays.\n\n\
              The original is still in its place. It is always kept when a cut on the exact \
              picture was asked for, whichever way the video was cut in the end."
         );

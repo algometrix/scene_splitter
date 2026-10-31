@@ -23,21 +23,23 @@ use crate::fates::SceneFate;
 use crate::focus::{self, PicturePosition, PictureStep, SceneStep};
 use crate::folder_settings::{self, DetectionInUse, DetectionSettings, SettingsScope};
 use crate::hardcut::{HardCutSettings, Sensitivity};
+use crate::icons::Icon;
 use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::{
     CutIndex, NudgeDirection, NudgeStep, SceneIndex, SceneLayout, SegmentIndex, SplitPlan,
 };
 use crate::review_session::{
     counted, EarlierSceneFiles, ExportObstacle, ReviewRequest, ReviewSession, SceneListNote,
+    StartOver,
 };
 use crate::scan::UndecodedFrames;
 use crate::scene_list::SceneListFormat;
 use crate::scene_name::EarlierNaming;
 use crate::selection::ClickKind;
-use crate::settings::{Settings, SettingsChange};
+use crate::settings::{ReviewRoom, Settings, SettingsChange};
 use crate::settings_controls;
 use crate::split;
-use crate::theme::{self, CardTint};
+use crate::theme::{self, ButtonKind, CardTint, IconButton, StatTile};
 use crate::thumbnails::{self, PictureSize, Thumbnail};
 use crate::timecode::{format_clock, format_length, format_timestamp, TimeSpan};
 
@@ -103,13 +105,13 @@ const TIPS: [(&str, &str); 3] = [
 /// dark one.
 const KEYS: [(&str, &str); 16] = [
     (
-        "Up, Down",
+        "Up, Down or W, S",
         "Go to the scene above or below. Home and End go to the first and the last.",
     ),
     ("Shift+Up or Down", "Select more scenes, or fewer."),
     ("Enter, Space", "Play the scene."),
     ("Left, Right", "Choose a picture of the scene to play from."),
-    ("J", "Merge the scene with the one below it."),
+    ("J", "Merge the scene with the one above it."),
     ("M", "Merge the selected scenes."),
     ("U", "Take a merged scene apart."),
     (
@@ -196,6 +198,30 @@ const LOOK_HARDER_EXPLANATION: &str =
     "Looks at every picture of the video for places where it changes abruptly, even subtly. \
      This is much slower than the first scan.";
 const RESCAN_WARNING: &str = "Scanning again removes the merges and splits you made on this video.";
+const RESCAN_ANYWAY_LABEL: &str = "Scan again anyway";
+const SCENE_LENGTHS_WARNING: &str =
+    "Using other scene lengths removes the merges and splits you made on this video.";
+const USE_SCENE_LENGTHS_ANYWAY_LABEL: &str = "Use them anyway";
+const KEEP_EDITS_LABEL: &str = "Cancel";
+const SCENE_LENGTHS_LABEL: &str = "Scene lengths";
+const HIDE_SCENE_LENGTHS_LABEL: &str = "Hide the scene lengths";
+const SCENE_LENGTHS_EXPLANATION: &str =
+    "How short and how long a scene may be. For videos with many black screens close \
+     together, or with very long scenes.";
+const USE_SCENE_LENGTHS_LABEL: &str = "Use on this video";
+const USE_SCENE_LENGTHS_EXPLANATION: &str =
+    "Makes the scenes of this video again from what the scan found, with these lengths. \
+     The video is not scanned again.";
+const SCENE_LENGTHS_IN_USE: &str = "The scenes of this video already follow these lengths.";
+const SCENE_LENGTHS_APPLY_NOTE: &str =
+    "Changes are saved straight away, for the videos scanned from now on. \
+     Press \"Use on this video\" for this one.";
+const SKIP_LABEL: &str = "Skip this video";
+const UNDO_HINT: &str = "Takes back the last change";
+const NOTHING_TO_UNDO_HINT: &str = "Nothing to take back yet.";
+/// Narrower than this, the title row's Focus button shows only its icon.
+const TITLE_ROW_WITH_WORDS: f32 = 1000.0;
+const NOTHING_TO_SPLIT_HINT: &str = "There is only one scene, so there is nothing to split.";
 const SPLIT_LATER_LABEL: &str = "Split later";
 const SPLIT_LATER_EXPLANATION: &str =
     "Keeps these scenes and shows the next video (Ctrl+Shift+Enter). Nothing is written yet. \
@@ -521,8 +547,8 @@ impl SceneListInput {
     }
 }
 
-/// The card with the black screen settings, which sits above the scenes and
-/// scrolls with them.
+/// A card with settings, which sits above the scenes and scrolls with them:
+/// the one for black screens, or the one for scene lengths.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SettingsCard {
     Hidden,
@@ -531,6 +557,40 @@ enum SettingsCard {
     /// link would seem to do nothing.
     JustOpened,
     Open,
+}
+
+impl SettingsCard {
+    /// What a click on the card's link makes of it.
+    fn toggled(self) -> Self {
+        match self {
+            Self::Hidden => Self::JustOpened,
+            Self::JustOpened | Self::Open => Self::Hidden,
+        }
+    }
+
+    /// How the card is drawn in this frame. A card that was just opened is
+    /// brought into view in this one frame only.
+    fn for_this_frame(&mut self) -> Self {
+        let as_drawn = *self;
+        if as_drawn == Self::JustOpened {
+            *self = Self::Open;
+        }
+        as_drawn
+    }
+
+    fn link_label(self, show: &'static str, hide: &'static str) -> &'static str {
+        match self {
+            Self::Hidden => show,
+            Self::JustOpened | Self::Open => hide,
+        }
+    }
+}
+
+/// The settings cards as one frame draws them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SettingsCards {
+    black_screens: SettingsCard,
+    scene_lengths: SettingsCard,
 }
 
 /// The screen of one review: the previews it has loaded, where it drew the
@@ -554,6 +614,7 @@ pub struct ReviewScreen {
     missed_scenes_open: bool,
     /// Whether the card with the black screen settings is shown.
     black_screen_settings: SettingsCard,
+    scene_length_settings: SettingsCard,
     /// The size previews are decoded at, which suits the sharpness of the
     /// screen the window is on.
     preview_pixels: PictureSize,
@@ -590,6 +651,7 @@ impl Default for ReviewScreen {
             scene_to_scroll_to: None,
             missed_scenes_open: false,
             black_screen_settings: SettingsCard::Hidden,
+            scene_length_settings: SettingsCard::Hidden,
             preview_pixels: thumbnails::SMALLEST_THUMBNAIL,
             expanded_scenes: HashSet::new(),
             card_heights: HashMap::new(),
@@ -640,10 +702,10 @@ impl ReviewScreen {
             .show(ctx, |ui| self.show_header(ui, session, settings, playhead))
             .inner;
         requests.extend(asked_in_header);
-        let settings_card = self.black_screen_settings;
-        if settings_card == SettingsCard::JustOpened {
-            self.black_screen_settings = SettingsCard::Open;
-        }
+        let settings_cards = SettingsCards {
+            black_screens: self.black_screen_settings.for_this_frame(),
+            scene_lengths: self.scene_length_settings.for_this_frame(),
+        };
 
         let (asked_in_overview, input) = egui::CentralPanel::default()
             .frame(theme::panel(palette.page))
@@ -654,9 +716,20 @@ impl ReviewScreen {
                     // Dragging moves scenes, the wheel and scroll bar scroll.
                     .drag_to_scroll(false)
                     .show(ui, |ui| {
-                        let asked_in_overview =
-                            self.show_overview(ui, session, settings, &detection, settings_card);
-                        (asked_in_overview, self.show_scenes(ui, session))
+                        let asked_in_overview = match settings.room {
+                            ReviewRoom::Everything => self.show_overview(
+                                ui,
+                                session,
+                                settings,
+                                &detection,
+                                settings_cards,
+                            ),
+                            ReviewRoom::FootageOnly => Vec::new(),
+                        };
+                        (
+                            asked_in_overview,
+                            self.show_scenes(ui, session, settings.room),
+                        )
                     })
                     .inner
             })
@@ -691,10 +764,13 @@ impl ReviewScreen {
         session: &ReviewSession,
         settings: &Settings,
         detection: &DetectionInUse,
-        settings_card: SettingsCard,
+        settings_cards: SettingsCards,
     ) -> Vec<ReviewRequest> {
         let mut requests = self.show_options(ui, session, settings, detection);
-        requests.extend(show_notes(ui, session, detection, settings_card));
+        // Tiles of one row share their top edge, whatever their captions.
+        let tile_rows = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
+        ui.with_layout(tile_rows, |ui| show_key_numbers(ui, session.plan()));
+        requests.extend(show_notes(ui, session, detection, settings_cards));
         if settings.show_tips {
             match show_tips_card(ui, self.keys_list) {
                 TipsCard::HideAsked => {
@@ -725,6 +801,20 @@ impl ReviewScreen {
         playhead: Option<f64>,
     ) -> Vec<ReviewRequest> {
         let mut requests = Vec::new();
+        if settings.room == ReviewRoom::FootageOnly {
+            requests.extend(show_focused_title(ui, session));
+            requests.extend(show_export_obstacle(ui, session));
+            requests.extend(self.show_timeline(ui, session, playhead));
+            ui.horizontal_wrapped(|ui| {
+                requests.extend(show_merge_controls(ui, session));
+                requests.extend(show_undo_button(ui, session));
+            });
+            if let Some(answer) = latest_review_event(ui, session) {
+                ui.add(egui::Label::new(answer).wrap());
+            }
+            requests.extend(show_start_over_consent(ui, session));
+            return requests;
+        }
         requests.extend(show_title_and_main_action(ui, session));
         show_what_the_split_will_do(ui, session, settings.export);
         requests.extend(show_export_obstacle(ui, session));
@@ -739,7 +829,7 @@ impl ReviewScreen {
         });
         show_status_line(ui, session);
         show_scene_list_note(ui, session);
-        requests.extend(show_rescan_consent(ui, session));
+        requests.extend(show_start_over_consent(ui, session));
         requests
     }
 
@@ -785,17 +875,22 @@ impl ReviewScreen {
             if scan_again.clicked() {
                 requests.push(ReviewRequest::Rescan(ScanKind::BlackScreens));
             }
-            let settings_label = match self.black_screen_settings {
-                SettingsCard::Hidden => BLACK_SCREEN_SETTINGS_LABEL,
-                SettingsCard::JustOpened | SettingsCard::Open => HIDE_BLACK_SCREEN_SETTINGS_LABEL,
-            };
+            let settings_label = self.black_screen_settings.link_label(
+                BLACK_SCREEN_SETTINGS_LABEL,
+                HIDE_BLACK_SCREEN_SETTINGS_LABEL,
+            );
             let settings_link =
                 whole_link(ui, settings_label).on_hover_text(BLACK_SCREEN_SETTINGS_EXPLANATION);
             if settings_link.clicked() {
-                self.black_screen_settings = match self.black_screen_settings {
-                    SettingsCard::Hidden => SettingsCard::JustOpened,
-                    SettingsCard::JustOpened | SettingsCard::Open => SettingsCard::Hidden,
-                };
+                self.black_screen_settings = self.black_screen_settings.toggled();
+            }
+            let lengths_label = self
+                .scene_length_settings
+                .link_label(SCENE_LENGTHS_LABEL, HIDE_SCENE_LENGTHS_LABEL);
+            let lengths_link =
+                whole_link(ui, lengths_label).on_hover_text(SCENE_LENGTHS_EXPLANATION);
+            if lengths_link.clicked() {
+                self.scene_length_settings = self.scene_length_settings.toggled();
             }
             let missed_label = if self.missed_scenes_open {
                 HIDE_MISSED_SCENES_LABEL
@@ -898,7 +993,12 @@ impl ReviewScreen {
         })
     }
 
-    fn show_scenes(&mut self, ui: &mut egui::Ui, session: &ReviewSession) -> SceneListInput {
+    fn show_scenes(
+        &mut self,
+        ui: &mut egui::Ui,
+        session: &ReviewSession,
+        room: ReviewRoom,
+    ) -> SceneListInput {
         self.scroll_while_dragging_near_an_edge(ui);
 
         let drop_target = self.drop_target(ui.ctx());
@@ -934,7 +1034,7 @@ impl ReviewScreen {
                     if let Some(&card_last_frame) = cards_last_frame.get(scene.position()) {
                         self.note_card_input(ui, scene, card_last_frame, &mut input);
                     }
-                    self.show_scene(ui, session, scene_card, drop_target, &mut input)
+                    self.show_scene(ui, session, scene_card, drop_target, &mut input, room)
                 }
             };
             self.card_heights.insert(shape, card.height());
@@ -1062,6 +1162,7 @@ impl ReviewScreen {
         scene_card: SceneCard,
         drop_target: Option<SceneIndex>,
         input: &mut SceneListInput,
+        room: ReviewRoom,
     ) -> egui::Rect {
         let palette = theme::palette(ui.ctx());
         let SceneCard {
@@ -1079,11 +1180,8 @@ impl ReviewScreen {
         let (color, fill, outline) = match self.highlight(session, scene, drop_target) {
             Highlight::None => {
                 let color = own_color;
-                (
-                    color,
-                    plain_fill,
-                    egui::Stroke::new(1.0_f32, palette.card_border),
-                )
+                // Raised off the page, it needs no outline.
+                (color, plain_fill, egui::Stroke::NONE)
             }
             Highlight::Selected => {
                 let color = own_color;
@@ -1107,16 +1205,17 @@ impl ReviewScreen {
         let mut wanted_parts_view = None;
         let focus_here = session.focus().filter(|focus| focus.scene() == scene);
         let focused_picture = focus_here.and_then(|focus| focus.picture());
-        let card = egui::Frame::none()
+        let frame = egui::Frame::none()
             .fill(fill)
             .rounding(theme::CARD_ROUNDING)
             .stroke(outline)
-            .shadow(palette.soft_shadow())
-            .inner_margin(CARD_MARGIN)
+            .inner_margin(CARD_MARGIN);
+        let card = theme::Raised(frame)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let chapter_title = session.chapter_title(layout.span);
-                if let Some(wanted) = show_scene_heading(ui, scene_card, color, chapter_title) {
+                if let Some(wanted) = show_scene_heading(ui, scene_card, color, chapter_title, room)
+                {
                     input.fate_wanted = Some((scene, wanted));
                 }
                 let room_for_previews = if layout.is_merged() {
@@ -1492,6 +1591,16 @@ fn x_at_time(time: f64, whole_video: TimeSpan, bar: egui::Rangef) -> f32 {
     bar.min + bar.span() * share as f32
 }
 
+/// The time of the video at `x` along the bar, the other way round from
+/// `x_at_time`. A bar with no width has only its start.
+fn time_at_x(x: f32, whole_video: TimeSpan, bar: egui::Rangef) -> f64 {
+    if bar.span() <= 0.0 {
+        return whole_video.start;
+    }
+    let share = f64::from(((x - bar.min) / bar.span()).clamp(0.0, 1.0));
+    whole_video.start + whole_video.seconds() * share
+}
+
 /// Where along the bar each scene's block is drawn, in the order of the
 /// scenes. A scene too short to see still gets a sliver, so in a video of
 /// very many scenes the blocks overlap, each drawn over the one before.
@@ -1739,15 +1848,16 @@ fn letter_key_request(input: &egui::InputState) -> Option<ReviewRequest> {
         return None;
     }
     if input.key_pressed(egui::Key::J) {
-        return Some(ReviewRequest::JoinFocusedWithNext);
+        return Some(ReviewRequest::JoinFocusedWithPrevious);
     }
     input
         .key_pressed(egui::Key::U)
         .then_some(ReviewRequest::TakeSelectedApart)
 }
 
-/// Up, Down, Home and End move the focus. With Shift held the selection
-/// reaches from where it began to the scene the focus lands on.
+/// Up, Down, Home and End move the focus, and W and S do what Up and Down
+/// do. With Shift held the selection reaches from where it began to the
+/// scene the focus lands on.
 fn scene_step_request(input: &egui::InputState) -> Option<ReviewRequest> {
     if input.modifiers.command || input.modifiers.alt {
         return None;
@@ -1755,6 +1865,8 @@ fn scene_step_request(input: &egui::InputState) -> Option<ReviewRequest> {
     let step = [
         (egui::Key::ArrowUp, SceneStep::Previous),
         (egui::Key::ArrowDown, SceneStep::Next),
+        (egui::Key::W, SceneStep::Previous),
+        (egui::Key::S, SceneStep::Next),
         (egui::Key::Home, SceneStep::First),
         (egui::Key::End, SceneStep::Last),
     ]
@@ -1822,10 +1934,10 @@ fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<Review
     }
     let (merge, select_all, undo, drop_or_keep) = ctx.input(|input| {
         (
-            letter_pressed(input, egui::Key::M),
+            letter_pressed(input, keyboard::MERGE_SHORTCUT.logical_key),
             input.modifiers.command && input.key_pressed(egui::Key::A),
-            input.modifiers.command && input.key_pressed(egui::Key::Z),
-            letter_pressed(input, egui::Key::X),
+            input.modifiers.command && input.key_pressed(keyboard::UNDO_SHORTCUT.logical_key),
+            letter_pressed(input, keyboard::DROP_OR_KEEP_SHORTCUT.logical_key),
         )
     });
     // This screen is behind everything else, so it is the last to be
@@ -1849,33 +1961,16 @@ fn shortcut_requests(ctx: &egui::Context, keyboard: KeyboardOwner) -> Vec<Review
 fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
     let mut request = None;
     ui.horizontal(|ui| {
+        // Short of room the name of the video needs the row more than the
+        // word Focus, which is a hover away.
+        let words = editor::ButtonWords::for_room(ui.available_width(), TITLE_ROW_WITH_WORDS);
         // Laid out from the right, so the buttons keep their place and
         // the name takes whatever room is left.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let scene_count = session.scene_count();
-            let dropped_count = session.dropped_count();
-            let label = split_button_label(scene_count - dropped_count, dropped_count);
-            // One scene is the untouched video, there is nothing to write.
-            let export_button = ui
-                .add_enabled(scene_count > 1, theme::primary_button(ui, label))
-                .on_hover_text(SPLIT_HINT)
-                .on_disabled_hover_text("There is only one scene, so there is nothing to split.");
-            if export_button.clicked() {
-                request = Some(ReviewRequest::Split);
-            }
-            let later_button = ui
-                .add_enabled(scene_count > 1, egui::Button::new(SPLIT_LATER_LABEL))
-                .on_hover_text(SPLIT_LATER_EXPLANATION)
-                .on_disabled_hover_text("There is only one scene, so there is nothing to split.");
-            if later_button.clicked() {
-                request = Some(ReviewRequest::SplitLater);
-            }
-            let skip_button = ui
-                .button("Skip this video")
-                .on_hover_text("Leaves this video as it is. Nothing is written.");
-            if skip_button.clicked() {
-                request = Some(ReviewRequest::Skip);
-            }
+            let split = show_split_buttons(ui, session);
+            let skip = show_skip_button(ui);
+            let focus = editor::show_room_button(ui, ReviewRoom::Everything, words);
+            request = split.or(skip).or(focus);
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let name = file_name(session.video());
                 ui.add(egui::Label::new(theme::semibold(&name, FILE_NAME_FONT_SIZE)).truncate())
@@ -1884,6 +1979,70 @@ fn show_title_and_main_action(ui: &mut egui::Ui, session: &ReviewSession) -> Opt
         });
     });
     request
+}
+
+/// The title row in focus: the name, the way back to everything, and the
+/// split. Putting the video off is not footage work, so it waits there.
+fn show_focused_title(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<ReviewRequest> {
+    let mut requests = Vec::new();
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            requests.extend(show_split_button(ui, session));
+            requests.extend(editor::show_room_button(
+                ui,
+                ReviewRoom::FootageOnly,
+                editor::ButtonWords::Shown,
+            ));
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let name = file_name(session.video());
+                ui.add(egui::Label::new(theme::semibold(&name, FILE_NAME_FONT_SIZE)).truncate())
+                    .on_hover_text(name);
+            });
+        });
+    });
+    requests
+}
+
+/// The main action and the way to put it off, in a row laid out from the
+/// right: "Split into N files" first, then "Split later".
+fn show_split_buttons(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    let split = show_split_button(ui, session);
+    let later = show_split_later_button(ui, session);
+    split.or(later)
+}
+
+/// "Split into N files", the main action of the review.
+fn show_split_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    let scene_count = session.scene_count();
+    let dropped_count = session.dropped_count();
+    let label = split_button_label(scene_count - dropped_count, dropped_count);
+    // One scene is the untouched video, there is nothing to write.
+    ui.add_enabled(
+        scene_count > 1,
+        IconButton::new(Icon::Scissors, label, ButtonKind::Primary),
+    )
+    .on_hover_text(SPLIT_HINT)
+    .on_disabled_hover_text(NOTHING_TO_SPLIT_HINT)
+    .clicked()
+    .then_some(ReviewRequest::Split)
+}
+
+fn show_split_later_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    ui.add_enabled(
+        session.scene_count() > 1,
+        IconButton::new(Icon::Clock, SPLIT_LATER_LABEL, ButtonKind::Quiet),
+    )
+    .on_hover_text(SPLIT_LATER_EXPLANATION)
+    .on_disabled_hover_text(NOTHING_TO_SPLIT_HINT)
+    .clicked()
+    .then_some(ReviewRequest::SplitLater)
+}
+
+fn show_skip_button(ui: &mut egui::Ui) -> Option<ReviewRequest> {
+    let skip_button = ui
+        .add(IconButton::new(Icon::Close, SKIP_LABEL, ButtonKind::Quiet))
+        .on_hover_text("Leaves this video as it is. Nothing is written.");
+    skip_button.clicked().then_some(ReviewRequest::Skip)
 }
 
 /// What the split button says: how many files it writes and, when scenes
@@ -1900,7 +2059,7 @@ fn split_button_label(file_count: usize, dropped_count: usize) -> String {
 /// about the original: what the check still does, and how to get the choice
 /// back.
 fn original_always_kept_hint(why: OriginalAlwaysKept) -> String {
-    let keep_every_scene = "The check still compares every new file with its part of the original.";
+    let keep_every_scene = "The check still makes sure every new file reads to its end and plays.";
     let get_the_choice_back = format!(
         "Turn off \"{}\" in Settings to choose what happens to the original again.",
         settings_controls::EXACT_CUT_LABEL
@@ -2110,27 +2269,28 @@ fn show_export_options(
         ui.label(theme::muted(ui, why.in_plain_words()))
             .on_hover_text(original_always_kept_hint(why));
     }
-    ui.horizontal_wrapped(|ui| {
+    ui.vertical(|ui| {
         if always_kept.is_none() {
             let recycle_label = format!(
                 "Then move the original to the {TRASH_NAME} (only if the new files pass the check)"
             );
-            settings_controls::show_original_policy_checkbox(
+            settings_controls::show_original_policy_setting(
                 ui,
                 &mut wanted.original_policy,
-                recycle_label,
+                &recycle_label,
             )
             .on_hover_text(format!(
-                "The check compares the new files with the original. If anything is missing \
-                 or different, the original stays where it is. You can restore it from the {TRASH_NAME}."
+                "{} You can restore it from the {TRASH_NAME}.",
+                settings_controls::RECYCLE_CHECK_EXPLANATION
             ));
         }
-        settings_controls::show_scene_location_checkbox(ui, &mut wanted.scene_location);
+        settings_controls::show_scene_location_setting(ui, &mut wanted.scene_location);
         if let Ok(dir) = split::scene_dir(video, wanted.scene_location) {
             let destination = dir.display().to_string();
             ui.add(
                 // Body size, so it lines up with the checkbox text before it.
-                egui::Label::new(theme::muted(ui, format!("Scenes go to {destination}"))).truncate(),
+                egui::Label::new(theme::muted(ui, format!("Scenes go to {destination}")))
+                    .truncate(),
             )
             .on_hover_text(destination);
         }
@@ -2148,7 +2308,10 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
         None => MERGE_SELECTED_LABEL.to_owned(),
     };
     let merge_button = ui
-        .add_enabled(span_to_merge.is_some(), egui::Button::new(merge_label))
+        .add_enabled(
+            span_to_merge.is_some(),
+            IconButton::new(Icon::Merge, merge_label, ButtonKind::Quiet),
+        )
         .on_hover_text(MERGE_SELECTED_HINT)
         .on_disabled_hover_text(
             "Click a scene, then Shift-click another, to choose the scenes to merge.",
@@ -2160,7 +2323,7 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
     let undo_merge_button = ui
         .add_enabled(
             session.has_merged_scene_selected(),
-            egui::Button::new(TAKE_APART_LABEL),
+            IconButton::new(Icon::Layers, TAKE_APART_LABEL, ButtonKind::Quiet),
         )
         .on_hover_text(TAKE_APART_HINT)
         .on_disabled_hover_text("Select a merged scene to take it apart.");
@@ -2171,28 +2334,35 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
 }
 
 fn show_undo_and_reset(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
-    let mut request = None;
-    let undo_clicked = ui
-        .add_enabled(session.can_undo(), egui::Button::new("Undo"))
-        .on_hover_text("Takes back the last change (Ctrl+Z).")
-        .on_disabled_hover_text("Nothing to take back yet.")
-        .clicked();
-    if undo_clicked {
-        request = Some(ReviewRequest::Undo);
-    }
+    let undo = show_undo_button(ui, session);
+    let reset = show_reset_button(ui, session);
+    undo.or(reset)
+}
 
-    let reset_clicked = ui
-        .add_enabled(
-            !session.plan().is_as_detected(),
-            egui::Button::new("Reset scenes"),
-        )
-        .on_hover_text("Undoes every merge and removes the splits you added.")
-        .on_disabled_hover_text("The scenes are as the scan found them.")
-        .clicked();
-    if reset_clicked {
-        request = Some(ReviewRequest::ResetScenes);
-    }
-    request
+fn show_undo_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    ui.add_enabled(
+        session.can_undo(),
+        IconButton::new(Icon::Undo, "Undo", ButtonKind::Quiet),
+    )
+    .on_hover_text(theme::hint_with_key(
+        ui.ctx(),
+        UNDO_HINT,
+        &keyboard::UNDO_SHORTCUT,
+    ))
+    .on_disabled_hover_text(NOTHING_TO_UNDO_HINT)
+    .clicked()
+    .then_some(ReviewRequest::Undo)
+}
+
+fn show_reset_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+    ui.add_enabled(
+        !session.plan().is_as_detected(),
+        IconButton::new(Icon::Refresh, "Reset scenes", ButtonKind::Quiet),
+    )
+    .on_hover_text("Undoes every merge and removes the splits you added.")
+    .on_disabled_hover_text("The scenes are as the scan found them.")
+    .clicked()
+    .then_some(ReviewRequest::ResetScenes)
 }
 
 fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<ReviewRequest> {
@@ -2215,11 +2385,20 @@ fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<Re
         }
         let pressed_enter =
             field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-        if ui.button("Add split").clicked() || pressed_enter {
+        let add_split = ui.add(IconButton::new(Icon::Plus, "Add split", ButtonKind::Plain));
+        if add_split.clicked() || pressed_enter {
             requests.push(ReviewRequest::AddTypedSplit);
         }
     });
     requests
+}
+
+/// What the review last said back to the person, when it said anything.
+fn latest_review_event(ui: &egui::Ui, session: &ReviewSession) -> Option<egui::RichText> {
+    let palette = theme::palette(ui.ctx());
+    let answer = session.last_answer()?;
+    let color = theme::answer_color(palette, answer.tone(), palette.muted_text);
+    Some(egui::RichText::new(answer.in_words()).color(color))
 }
 
 /// One line that is always there, so the header keeps its height and the
@@ -2228,34 +2407,19 @@ fn show_new_split_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Vec<Re
 /// action may have been a key. With nothing to answer it says what the scan
 /// found.
 fn show_status_line(ui: &mut egui::Ui, session: &ReviewSession) {
-    let palette = theme::palette(ui.ctx());
-    let warning = |words: String| egui::RichText::new(words).color(palette.warning_text);
-    let (words, details) = if let Some(refusal) = session.drop_refusal() {
-        (warning(refusal.to_string()), None)
-    } else if let Some(feedback) = session.new_split_feedback() {
-        // A split that was not added is said in the colour of a warning, so
-        // it is not taken for one that was.
-        let words = if feedback.is_refusal() {
-            warning(feedback.in_words())
-        } else {
-            theme::muted(ui, feedback.in_words())
-        };
-        (words, None)
-    } else {
-        (
+    let (words, details) = match latest_review_event(ui, session) {
+        Some(event) => (event, None),
+        None => (
             theme::muted(ui, session.scan_summary()),
             Some(session.scan_details()),
-        )
+        ),
     };
     let whole_text = words.text().to_owned();
     let line = ui.add(egui::Label::new(words).truncate());
     // The line is cut short in a narrow window, so the whole of it is one
     // hover away.
     line.on_hover_text(match details {
-        Some(details) => format!(
-            "{whole_text}
-{details}"
-        ),
+        Some(details) => format!("{whole_text}\n{details}"),
         None => whole_text,
     });
 }
@@ -2290,16 +2454,7 @@ fn whole_link(ui: &mut egui::Ui, label: &str) -> egui::Response {
 }
 
 fn start_next_row_unless_it_fits(ui: &mut egui::Ui, label: &str) {
-    let width = egui::WidgetText::from(label)
-        .into_galley(
-            ui,
-            Some(egui::TextWrapMode::Extend),
-            f32::INFINITY,
-            egui::TextStyle::Body,
-        )
-        .size()
-        .x;
-    if ui.available_size_before_wrap().x < width {
+    if ui.available_size_before_wrap().x < theme::text_width(ui, &egui::RichText::new(label)) {
         ui.end_row();
     }
 }
@@ -2385,22 +2540,21 @@ fn show_scene_list_note(ui: &mut egui::Ui, session: &ReviewSession) {
     }
 }
 
-/// Asks before a scan throws away the person's edits.
-fn show_rescan_consent(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
+/// Asks before a new scan, or other scene lengths, throw away the person's
+/// edits.
+fn show_start_over_consent(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
     let palette = theme::palette(ui.ctx());
-    if !session.is_asking_before_rescan() {
-        return None;
-    }
+    let (warning, go_ahead_label) = match session.start_over_awaiting_consent()? {
+        StartOver::Rescan(_) => (RESCAN_WARNING, RESCAN_ANYWAY_LABEL),
+        StartOver::WithSceneLengths(_) => (SCENE_LENGTHS_WARNING, USE_SCENE_LENGTHS_ANYWAY_LABEL),
+    };
     let mut request = None;
     ui.horizontal_wrapped(|ui| {
-        ui.colored_label(palette.warning_text, RESCAN_WARNING);
-        if ui
-            .add(theme::danger_button(ui, "Scan again anyway"))
-            .clicked()
-        {
-            request = Some(ReviewRequest::RescanAnyway);
+        ui.colored_label(palette.warning_text, warning);
+        if ui.add(theme::danger_button(ui, go_ahead_label)).clicked() {
+            request = Some(ReviewRequest::StartOverAnyway);
         }
-        if ui.button("Cancel").clicked() {
+        if ui.button(KEEP_EDITS_LABEL).clicked() {
             request = Some(ReviewRequest::KeepEdits);
         }
     });
@@ -2413,19 +2567,25 @@ fn show_notes(
     ui: &mut egui::Ui,
     session: &ReviewSession,
     detection: &DetectionInUse,
-    settings_card: SettingsCard,
+    settings_cards: SettingsCards,
 ) -> Vec<ReviewRequest> {
     let palette = theme::palette(ui.ctx());
     let plan = session.plan();
     let mut requests = Vec::new();
-    if settings_card != SettingsCard::Hidden {
+    if settings_cards.black_screens != SettingsCard::Hidden {
         let (card, asked) = show_black_screen_settings_card(ui, session.video(), detection);
         requests.extend(asked);
-        if settings_card == SettingsCard::JustOpened {
+        if settings_cards.black_screens == SettingsCard::JustOpened {
             ui.scroll_to_rect(card, Some(egui::Align::TOP));
         }
     }
-    ui.horizontal_wrapped(|ui| show_key_numbers(ui, plan));
+    if settings_cards.scene_lengths != SettingsCard::Hidden {
+        let (card, asked) = show_scene_length_card(ui, session, detection);
+        requests.extend(asked);
+        if settings_cards.scene_lengths == SettingsCard::JustOpened {
+            ui.scroll_to_rect(card, Some(egui::Align::TOP));
+        }
+    }
     if session.scene_count() == 1 && show_nothing_found_note(ui) == LookHarder::Asked {
         requests.push(ReviewRequest::Rescan(look_harder_scan(
             detection.detection.hard_cuts,
@@ -2474,6 +2634,56 @@ fn show_black_screen_settings_card(
             scan: wanted,
             ..in_use.detection
         }));
+    }
+    (card, requests)
+}
+
+/// How short and how long a scene of this video may be, whose settings
+/// those are, and the button that makes this video's scenes again with
+/// them. Returns where the card was drawn and what was asked for.
+///
+/// A changed length is saved like any other detection setting. It reaches
+/// the scenes on screen only when the person presses the button: the
+/// review may hold merges and splits made by hand, and a number that is
+/// being dragged should not redo the scenes at every step.
+fn show_scene_length_card(
+    ui: &mut egui::Ui,
+    session: &ReviewSession,
+    in_use: &DetectionInUse,
+) -> (egui::Rect, Vec<ReviewRequest>) {
+    let saved = in_use.detection.scene_length;
+    let mut wanted = saved;
+    let mut use_asked = false;
+    let mut requests = Vec::new();
+    let card = theme::card(ui)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::semibold(
+                settings_controls::SCENE_LENGTHS_HEADING,
+                14.0,
+            ));
+            requests.extend(show_settings_scope(ui, session.video(), &in_use.scope));
+            settings_controls::show_scene_length_controls(ui, &mut wanted);
+            let already_in_use = session.scene_lengths() == saved;
+            use_asked = ui
+                .add_enabled(!already_in_use, egui::Button::new(USE_SCENE_LENGTHS_LABEL))
+                .on_hover_text(USE_SCENE_LENGTHS_EXPLANATION)
+                .on_disabled_hover_text(SCENE_LENGTHS_IN_USE)
+                .clicked();
+            ui.add(egui::Label::new(theme::caption(ui, SCENE_LENGTHS_APPLY_NOTE)).wrap());
+        })
+        .response
+        .rect;
+    // A person changes a length or presses the button, never both in one
+    // frame, so at most one of these is asked for.
+    if wanted != saved {
+        requests.push(ReviewRequest::ChangeDetection(DetectionSettings {
+            scene_length: wanted,
+            ..in_use.detection
+        }));
+    }
+    if use_asked {
+        requests.push(ReviewRequest::UseSceneLengths(saved));
     }
     (card, requests)
 }
@@ -2549,49 +2759,64 @@ fn show_key_numbers(ui: &mut egui::Ui, plan: &SplitPlan) {
     let scene_noun = if scenes.len() == 1 { "scene" } else { "scenes" };
     theme::stat_tile(
         ui,
-        &scenes.len().to_string(),
-        scene_noun,
-        palette.mint_tile,
-        palette.text,
+        StatTile {
+            icon: Icon::Film,
+            icon_color: palette.muted_text,
+            value: &scenes.len().to_string(),
+            value_color: palette.text,
+            caption: scene_noun,
+        },
     );
     theme::stat_tile(
         ui,
-        &format_length(plan.whole_video().seconds()),
-        "whole video",
-        palette.lavender_tile,
-        palette.text,
+        StatTile {
+            icon: Icon::Clock,
+            icon_color: palette.muted_text,
+            value: &format_length(plan.whole_video().seconds()),
+            value_color: palette.text,
+            caption: "whole video",
+        },
     );
     if let Some(longest) = longest_scene {
-        let (tint, value_color) = if is_long_scene(longest) {
-            (palette.rose_tile, palette.danger)
+        let (icon, icon_color, value_color) = if is_long_scene(longest) {
+            (Icon::Alert, palette.danger, palette.danger)
         } else {
-            (palette.peach_tile, palette.text)
+            (Icon::Play, palette.muted_text, palette.text)
         };
         theme::stat_tile(
             ui,
-            &format_length(longest.seconds()),
-            "longest scene",
-            tint,
-            value_color,
+            StatTile {
+                icon,
+                icon_color,
+                value: &format_length(longest.seconds()),
+                value_color,
+                caption: "longest scene",
+            },
         );
     }
     let dropped_count = plan.scenes_to_write().dropped_count();
     if dropped_count > 0 {
         theme::stat_tile(
             ui,
-            &dropped_count.to_string(),
-            DROPPED_TILE_CAPTION,
-            palette.dropped_fill,
-            palette.muted_text,
+            StatTile {
+                icon: Icon::Trash,
+                icon_color: palette.muted_text,
+                value: &dropped_count.to_string(),
+                value_color: palette.muted_text,
+                caption: DROPPED_TILE_CAPTION,
+            },
         );
     }
     if piece_count > scenes.len() {
         theme::stat_tile(
             ui,
-            &piece_count.to_string(),
-            "parts, merged into these scenes",
-            palette.page,
-            palette.muted_text,
+            StatTile {
+                icon: Icon::Layers,
+                icon_color: palette.muted_text,
+                value: &piece_count.to_string(),
+                value_color: palette.muted_text,
+                caption: "parts, merged into these scenes",
+            },
         );
     }
 }
@@ -2712,13 +2937,13 @@ fn show_nothing_found_note(ui: &mut egui::Ui) -> LookHarder {
     let mut look_harder = LookHarder::NotAsked;
     egui::Frame::none()
         .fill(palette.peach_tile)
-        .rounding(theme::CONTROL_ROUNDING)
+        .rounding(theme::palette(ui.ctx()).control_rounding())
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(NOTHING_FOUND_HINT);
             let button = ui
-                .add(theme::primary_button(ui, LOOK_HARDER_LABEL))
+                .add(theme::primary_button(LOOK_HARDER_LABEL))
                 .on_hover_text(LOOK_HARDER_EXPLANATION);
             if button.clicked() {
                 look_harder = LookHarder::Asked;
@@ -2732,7 +2957,7 @@ fn show_nothing_found_note(ui: &mut egui::Ui) -> LookHarder {
 fn show_note(ui: &mut egui::Ui, text: &str, tint: egui::Color32) {
     egui::Frame::none()
         .fill(tint)
-        .rounding(theme::CONTROL_ROUNDING)
+        .rounding(theme::palette(ui.ctx()).control_rounding())
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2883,7 +3108,7 @@ fn show_hard_cut_scan_controls(ui: &mut egui::Ui, in_use: DetectionSettings) -> 
     let saved = in_use.hard_cuts;
     let mut wanted = saved;
     let mut scan_asked = false;
-    ui.horizontal_wrapped(|ui| {
+    ui.vertical(|ui| {
         settings_controls::show_hard_cut_controls(ui, &mut wanted, "review_hard_cut_sensitivity");
         scan_asked = ui
             .button("Look for sudden picture changes")
@@ -2994,6 +3219,7 @@ fn show_scene_heading(
     scene_card: SceneCard,
     color: egui::Color32,
     chapter_title: Option<&str>,
+    room: ReviewRoom,
 ) -> Option<SceneFate> {
     let palette = theme::palette(ui.ctx());
     let SceneCard {
@@ -3054,6 +3280,11 @@ fn show_scene_heading(
                 theme::pill(ui, badge, palette.dropped);
             }
         }
+        // In focus the cards are for playing, splitting and merging; what
+        // is written is decided with everything in view.
+        if room == ReviewRoom::FootageOnly {
+            return;
+        }
         let (label, hint, wanted) = if fate.is_dropped() {
             (KEEP_SCENE_LABEL, KEEP_SCENE_HINT, SceneFate::Keep)
         } else {
@@ -3106,6 +3337,11 @@ pub fn file_name(video: &Path) -> String {
 /// previews fail to load and show placeholders, which does not matter for
 /// merging. What the session does with a request is tested in
 /// `review_session`.
+mod editor;
+mod stage;
+
+pub use editor::EditorOutput;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3382,6 +3618,23 @@ mod tests {
     }
 
     #[test]
+    fn a_place_on_the_bar_is_the_time_drawn_there() {
+        let video = TimeSpan {
+            start: 10.0,
+            end: 70.0,
+        };
+        let bar = egui::Rangef::new(100.0, 700.0);
+        for time in [10.0, 25.0, 40.0, 69.5, 70.0] {
+            let there = time_at_x(x_at_time(time, video, bar), video, bar);
+            assert!((there - time).abs() < 1e-3, "{time} came back as {there}");
+        }
+        assert_eq!(time_at_x(0.0, video, bar), 10.0);
+        assert_eq!(time_at_x(900.0, video, bar), 70.0);
+        let no_width = egui::Rangef::new(100.0, 100.0);
+        assert_eq!(time_at_x(100.0, video, no_width), 10.0);
+    }
+
+    #[test]
     fn the_list_of_keys_and_the_word_on_a_moved_split_fit_the_smallest_window() {
         // As wide as what is left of a window 900 points wide beside the
         // queue.
@@ -3419,6 +3672,20 @@ mod tests {
         // The arrow keys moved through the scenes, and gave no button the
         // keys on the way.
         assert!(!keyboard::a_control_has_the_keys(&screen.ctx));
+    }
+
+    #[test]
+    fn w_and_s_move_through_the_scenes_like_up_and_down() {
+        let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::S);
+        screen.press_plain(egui::Key::S);
+        screen.press_plain(egui::Key::S);
+        assert_eq!(screen.focused_scene(), Some(2));
+        screen.press_plain(egui::Key::W);
+        assert_eq!(screen.focused_scene(), Some(1));
+
+        screen.press(egui::Key::S, egui::Modifiers::SHIFT);
+        assert_eq!(screen.selected_scenes(), vec![1, 2]);
     }
 
     #[test]
@@ -3512,8 +3779,9 @@ mod tests {
     }
 
     #[test]
-    fn j_joins_the_focused_scene_with_the_next_and_u_takes_it_apart() {
+    fn j_joins_the_focused_scene_with_the_one_above_and_u_takes_it_apart() {
         let mut screen = Screen::with_five_scenes();
+        screen.press_plain(egui::Key::ArrowDown);
         screen.press_plain(egui::Key::ArrowDown);
         screen.press_plain(egui::Key::ArrowDown);
         screen.press_plain(egui::Key::J);
@@ -3535,7 +3803,7 @@ mod tests {
         assert_eq!(screen.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
         assert_eq!(
             screen.split_feedback(),
-            "Moved the split from 00:00:20.000 to 00:00:30.000."
+            "Moved the split from 0:20.00 to 0:30.00."
         );
         assert_eq!(screen.focused_scene(), Some(1));
         // No picture was chosen by the same press.
@@ -3546,7 +3814,7 @@ mod tests {
         assert_eq!(screen.scene_ends(), vec![30.0, 40.0, 60.0, 80.0, 100.0]);
         assert_eq!(
             screen.split_feedback(),
-            "The split cannot move further. The split at 00:00:40.000 is in the way."
+            "The split cannot move further. The split at 0:40.00 is in the way."
         );
 
         screen.press(egui::Key::ArrowLeft, egui::Modifiers::ALT);
@@ -3565,7 +3833,7 @@ mod tests {
         assert_eq!(screen.scene_ends(), vec![20.0, 30.0, 60.0, 80.0, 100.0]);
         assert_eq!(
             screen.split_feedback(),
-            "Moved the split from 00:00:40.000 to 00:00:30.000."
+            "Moved the split from 0:40.00 to 0:30.00."
         );
 
         let later = screen.button_between_scene_and_next(1, MOVE_SPLIT_LATER_LABEL);
@@ -4300,7 +4568,7 @@ mod tests {
         let dropped = original_always_kept_hint(OriginalAlwaysKept::ScenesDropped);
         let exact = original_always_kept_hint(OriginalAlwaysKept::CutIsExact);
         let both = original_always_kept_hint(OriginalAlwaysKept::ScenesDroppedAndCutIsExact);
-        assert!(dropped.contains("still compares every new file"));
+        assert!(dropped.contains("still makes sure every new file"));
         assert_eq!(
             exact,
             "Turn off \"Cut on the exact picture (slower)\" in Settings to choose what happens \
@@ -5050,6 +5318,106 @@ mod tests {
         assert_eq!(screen.view.black_screen_settings, SettingsCard::Open);
         // Every card got its place, the one with the long title included.
         assert_eq!(screen.view.scene_cards.len(), 6);
+    }
+
+    /// A 200 second video with title cards a few seconds apart at its start
+    /// and one long black screen in the middle.
+    fn session_with_title_cards() -> ReviewSession {
+        let black = |start: f64, end: f64| crate::timecode::TimeSpan { start, end };
+        let mut detection = test_sessions::scenes_of_twenty_seconds_detected(10);
+        detection.black_screens = vec![
+            black(9.5, 10.5),
+            black(19.5, 20.5),
+            black(29.0, 31.0),
+            black(98.0, 102.0),
+        ];
+        detection.cuts = vec![10.0, 20.0, 30.0, 100.0];
+        test_sessions::fresh_scan_of(detection)
+    }
+
+    /// A review of the title-card video, with the card for scene lengths
+    /// open and "no scene shorter than a minute" saved in the settings. The
+    /// window is as narrow as the smallest one, and tall enough for the
+    /// card to stay in view when the header grows by a question.
+    fn screen_with_a_shortest_scene_saved() -> Screen {
+        const NARROW_AND_TALL: egui::Vec2 = egui::vec2(SMALLEST_MAIN_PANEL.x, 1200.0);
+        let mut screen = Screen::showing(session_with_title_cards(), NARROW_AND_TALL);
+        screen.settings.detection.scene_length = test_sessions::scene_lengths(Some(60.0), None);
+        screen.view.scene_length_settings = SettingsCard::Open;
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen
+    }
+
+    impl Screen {
+        /// Clicks the middle of the one control that says `label`.
+        fn click_the(&mut self, label: &str) {
+            // What the last request changed is drawn one frame later, and
+            // a header that grew by a row shows that row a frame after that.
+            self.frame(Vec::new(), egui::Modifiers::NONE);
+            self.frame(Vec::new(), egui::Modifiers::NONE);
+            let mut places = Vec::new();
+            for clipped in &self.shapes {
+                places_of_text_in(&clipped.shape, label, &mut places);
+            }
+            assert_eq!(places.len(), 1, "\"{label}\" is on screen {places:?}");
+            self.click_at(places[0].center(), egui::Modifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn the_card_for_scene_lengths_is_drawn_at_the_smallest_size_and_asks_for_nothing() {
+        let mut screen = Screen::showing(session_with_title_cards(), SMALLEST_MAIN_PANEL);
+        screen.view.scene_length_settings = SettingsCard::JustOpened;
+        screen.settings.detection.scene_length =
+            test_sessions::scene_lengths(Some(60.0), Some(1200.0));
+        let settings_before = screen.settings.clone();
+
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+
+        assert_eq!(screen.settings, settings_before);
+        assert_eq!(screen.session.scene_count(), 5);
+        assert_eq!(screen.last_follow_up, None);
+        assert_eq!(screen.view.scene_length_settings, SettingsCard::Open);
+        assert!(screen.right_edge_of_all_text() <= SMALLEST_MAIN_PANEL.x);
+    }
+
+    #[test]
+    fn saved_scene_lengths_reach_an_untouched_review_at_the_press_of_their_button() {
+        let mut screen = screen_with_a_shortest_scene_saved();
+        // Saving the setting alone changes no scene of a review on screen.
+        assert_eq!(screen.scene_ends(), [10.0, 20.0, 30.0, 100.0, 200.0]);
+
+        screen.click_the(USE_SCENE_LENGTHS_LABEL);
+        assert_eq!(screen.scene_ends(), [100.0, 200.0]);
+        assert_eq!(
+            screen.session.scan_summary(),
+            "Found 4 black screens. 3 short scenes were merged away."
+        );
+        // Nothing was left for the app to do: no scan was asked for.
+        assert_eq!(screen.last_follow_up, None);
+    }
+
+    #[test]
+    fn scene_lengths_ask_before_they_replace_scenes_merged_by_hand() {
+        let mut screen = screen_with_a_shortest_scene_saved();
+        screen.session.apply(
+            ReviewRequest::MergeScenes(SceneIndex::new(0)..=SceneIndex::new(1)),
+            &test_sessions::nothing_in_the_way,
+        );
+        let merged_by_hand = screen.scene_ends();
+        screen.frame(Vec::new(), egui::Modifiers::NONE);
+
+        screen.click_the(USE_SCENE_LENGTHS_LABEL);
+        assert_eq!(screen.scene_ends(), merged_by_hand);
+
+        screen.click_the(KEEP_EDITS_LABEL);
+        assert_eq!(screen.scene_ends(), merged_by_hand);
+        assert_eq!(screen.session.start_over_awaiting_consent(), None);
+
+        screen.click_the(USE_SCENE_LENGTHS_LABEL);
+        screen.click_the(USE_SCENE_LENGTHS_ANYWAY_LABEL);
+        assert_eq!(screen.scene_ends(), [100.0, 200.0]);
     }
 
     #[test]

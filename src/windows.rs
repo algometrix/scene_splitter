@@ -29,9 +29,52 @@ const ALWAYS_TINY_BYTES: u32 = 64;
 /// often contain a few larger packets (a keyframe, a flicker of noise).
 const MAX_GAP_INSIDE_STRETCH_SECONDS: f64 = 0.5;
 
+/// A stretch must be tiny packets for at least one frame in this many.
+///
+/// A video converted from 24 to 30 pictures a second repeats every fifth
+/// picture, and each repeat is a tiny packet. Measured on such a film, the
+/// repeats alone chained into one stretch over the whole two hours. A real
+/// black screen is tiny packets almost throughout.
+const MIN_TINY_SHARE_DIVISOR: usize = 2;
+
 /// Extra footage decoded on each side of a suspicious stretch, so the exact
 /// first and last black frames are found even when they are not tiny.
 const PADDING_SECONDS: f64 = 0.5;
+
+/// The pixels one thread may decode so that a scan can look at every frame
+/// without being asked to.
+///
+/// Measured on a 16 thread desktop: 67 minutes of 640x360 H.264, 22 billion
+/// pixels, were decoded in full in about 2.5 seconds. Three billion pixels a
+/// thread is then about five seconds of decoding.
+const CHEAP_PIXELS_PER_THREAD: u64 = 3_000_000_000;
+
+/// How many pixels a scan may decode to look at every frame when the setting
+/// only asks for the suspicious stretches.
+///
+/// Packet sizes miss a black screen that does not compress to almost
+/// nothing: one with a logo in a corner, or with grain. In a low bitrate
+/// video such a frame is only a few times smaller than an ordinary one.
+/// Where decoding everything costs a few seconds, that risk buys nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FullDecodeBudget {
+    pub pixels: u64,
+}
+
+impl FullDecodeBudget {
+    /// The budget that keeps a full decode to a few seconds on a machine
+    /// that decodes on `thread_count` threads.
+    pub fn for_threads(thread_count: usize) -> Self {
+        Self {
+            pixels: CHEAP_PIXELS_PER_THREAD.saturating_mul(thread_count as u64),
+        }
+    }
+
+    /// Whether decoding every one of `frame_count` frames stays within it.
+    pub fn covers(self, frame_count: usize, pixels_per_frame: u64) -> bool {
+        (frame_count as u64).saturating_mul(pixels_per_frame) <= self.pixels
+    }
+}
 
 /// Windows around stretches of unusually small packets.
 ///
@@ -40,9 +83,14 @@ const PADDING_SECONDS: f64 = 0.5;
 pub fn suspicious_windows(packets: &[VideoPacket], min_black_seconds: f64) -> Vec<FrameWindow> {
     let tiny_limit = (median_packet_size(packets) / TINY_PACKET_DIVISOR).max(ALWAYS_TINY_BYTES);
     let tiny_runs = runs_of_tiny_packets(packets, tiny_limit);
+    let tiny_before = tiny_packets_before_each_frame(packets, tiny_limit);
 
     let stretches = merge_windows(tiny_runs, |earlier, later| {
-        packets[later.start].time - packets[earlier.end - 1].time <= MAX_GAP_INSIDE_STRETCH_SECONDS
+        let gap_seconds = packets[later.start].time - packets[earlier.end - 1].time;
+        let joined = earlier.start..later.end;
+        let tiny_packets = tiny_before[joined.end] - tiny_before[joined.start];
+        gap_seconds <= MAX_GAP_INSIDE_STRETCH_SECONDS
+            && tiny_packets * MIN_TINY_SHARE_DIVISOR >= joined.len()
     });
 
     // Half the shortest black screen, because the frames at either edge of one
@@ -83,6 +131,21 @@ fn median_packet_size(packets: &[VideoPacket]) -> u32 {
     }
     let middle = sizes.len() / 2;
     *sizes.select_nth_unstable(middle).1
+}
+
+/// How many tiny packets come before each frame, with one more entry for the
+/// end of the video, so that a subtraction counts those in any window.
+fn tiny_packets_before_each_frame(packets: &[VideoPacket], tiny_limit: u32) -> Vec<usize> {
+    let mut tiny_so_far = 0;
+    let mut tiny_before = Vec::with_capacity(packets.len() + 1);
+    tiny_before.push(tiny_so_far);
+    for packet in packets {
+        if packet.size_bytes <= tiny_limit {
+            tiny_so_far += 1;
+        }
+        tiny_before.push(tiny_so_far);
+    }
+    tiny_before
 }
 
 fn runs_of_tiny_packets(packets: &[VideoPacket], tiny_limit: u32) -> Vec<FrameWindow> {
@@ -225,6 +288,44 @@ mod tests {
         packets
     }
 
+    const PIXELS_OF_360P: u64 = 640 * 360;
+    const PIXELS_OF_1080P: u64 = 1920 * 1080;
+    const FRAMES_IN_AN_HOUR: usize = 24 * 3600;
+
+    #[test]
+    fn an_hour_of_360p_is_cheap_enough_to_decode_in_full_on_a_few_threads() {
+        let budget = FullDecodeBudget::for_threads(8);
+        assert!(budget.covers(FRAMES_IN_AN_HOUR, PIXELS_OF_360P));
+    }
+
+    #[test]
+    fn an_hour_of_1080p_is_left_to_the_packet_sizes() {
+        let budget = FullDecodeBudget::for_threads(8);
+        assert!(!budget.covers(FRAMES_IN_AN_HOUR, PIXELS_OF_1080P));
+    }
+
+    #[test]
+    fn more_threads_afford_a_longer_video() {
+        let two_hours = 2 * FRAMES_IN_AN_HOUR;
+        assert!(!FullDecodeBudget::for_threads(4).covers(two_hours, PIXELS_OF_360P));
+        assert!(FullDecodeBudget::for_threads(16).covers(two_hours, PIXELS_OF_360P));
+    }
+
+    #[test]
+    fn a_video_exactly_as_large_as_the_budget_is_covered() {
+        let budget = FullDecodeBudget { pixels: 1_000 };
+        assert!(budget.covers(10, 100));
+        assert!(!budget.covers(11, 100));
+    }
+
+    #[test]
+    fn a_video_too_large_to_count_is_not_covered() {
+        let nearly_everything = FullDecodeBudget {
+            pixels: u64::MAX - 1,
+        };
+        assert!(!nearly_everything.covers(usize::MAX, u64::MAX));
+    }
+
     #[test]
     fn a_video_without_packets_has_no_suspicious_windows() {
         assert!(suspicious_windows(&[], MIN_BLACK_SECONDS).is_empty());
@@ -282,6 +383,32 @@ mod tests {
         let tiny: Vec<usize> = (40..44).chain(48..52).collect();
         let packets = footage_with_tiny_frames(100, &tiny);
         assert!(suspicious_windows(&packets, LONG_MIN_BLACK_SECONDS).is_empty());
+    }
+
+    #[test]
+    fn a_repeated_picture_every_few_frames_is_not_a_stretch() {
+        // Every fifth packet is tiny, as in a film converted from 24 to 30
+        // pictures a second. No two of them are half a second apart.
+        let repeats: Vec<usize> = (0..400).step_by(5).collect();
+        let packets = footage_with_tiny_frames(400, &repeats);
+        assert!(suspicious_windows(&packets, MIN_BLACK_SECONDS).is_empty());
+    }
+
+    #[test]
+    fn a_black_screen_among_repeated_pictures_is_found_on_its_own() {
+        let repeats = (0..400).step_by(5);
+        let tiny: Vec<usize> = repeats.chain(200..220).collect();
+        let packets = footage_with_tiny_frames(400, &tiny);
+        let windows = suspicious_windows(&packets, MIN_BLACK_SECONDS);
+
+        assert_eq!(windows.len(), 1, "{windows:?}");
+        assert!(
+            windows[0].start <= 196 && windows[0].end >= 224,
+            "{windows:?}"
+        );
+        // The repeats after it are taken along only while tiny packets
+        // still make up half the stretch.
+        assert!(windows[0].len() < 80, "{windows:?}");
     }
 
     #[test]

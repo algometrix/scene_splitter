@@ -104,9 +104,13 @@ fn detect_with_cache_in(
 
     if cache_use == CacheUse::ReuseStoredScan {
         // A stored scan that never looked for hard cuts cannot answer a
-        // request for them.
+        // request for them, and one that skipped frames a scan decodes
+        // today may have missed black screens.
         let stored = load_stored_scan(scans_dir, &fingerprint, settings)
-            .filter(|detection| detection.satisfies(depth));
+            .filter(|detection| detection.satisfies(depth))
+            .filter(|detection| {
+                !detect::skipped_frames_a_scan_now_decodes(detection, video, settings)
+            });
         if let Some(mut detection) = stored {
             if detection.chapters == ChapterMarks::NeverRead {
                 // Stored before chapter marks were read. Reading them takes
@@ -408,7 +412,12 @@ mod tests {
         let dir = ScansDir::for_test("fill_in_chapters");
         let fingerprint = VideoFingerprint::of(&video.path).unwrap();
         // What an earlier version stored for this file: no word on chapters.
-        store_scan(&dir.0, &fingerprint, &settings(), &detection()).unwrap();
+        // It looked at every frame, so nothing else about it is out of date.
+        let stored = Detection {
+            decoded_frames: detection().frame_count,
+            ..detection()
+        };
+        store_scan(&dir.0, &fingerprint, &settings(), &stored).unwrap();
 
         let reused = detect_with_cache_in(
             &dir.0,
@@ -430,6 +439,42 @@ mod tests {
         assert_eq!(
             load_stored_scan(&dir.0, &fingerprint, &settings()),
             Some(reused.detection)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg on the PATH"]
+    fn a_stored_scan_that_skipped_frames_of_a_short_video_is_made_again() {
+        use crate::test_videos::TestVideo;
+
+        let video = TestVideo::two_scenes_with_a_black_screen("stored_fast_scan");
+        let dir = ScansDir::for_test("skipped_frames");
+        let fingerprint = VideoFingerprint::of(&video.path).unwrap();
+        let found_nothing = Detection {
+            frame_count: 120,
+            decoded_frames: 0,
+            decoded_windows: 0,
+            black_screens: Vec::new(),
+            cuts: Vec::new(),
+            ..detection()
+        };
+        store_scan(&dir.0, &fingerprint, &settings(), &found_nothing).unwrap();
+
+        let scanned = detect_with_cache_in(
+            &dir.0,
+            &video.path,
+            &settings(),
+            CacheUse::ReuseStoredScan,
+            ScanDepth::BlackScreens,
+            &detect::no_scan_progress,
+        )
+        .unwrap();
+
+        assert_eq!(scanned.source, DetectionSource::FreshScan);
+        assert_eq!(scanned.detection.black_screens.len(), 1);
+        assert_eq!(
+            scanned.detection.decoded_frames,
+            scanned.detection.frame_count
         );
     }
 

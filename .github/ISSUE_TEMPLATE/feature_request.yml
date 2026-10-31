@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest something Cutaway could do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The task or problem, not the solution yet.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: How you picture it working.
+  - type: textarea
+    id: today
+    attributes:
+      label: How do you do it today?
+      description: Any workaround you use now.

@@ -1,6 +1,7 @@
 //! Writes one file per scene by copying the compressed streams. Nothing is
 //! re-encoded, so a two hour video splits in seconds and loses no quality.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::cache::fnv1a_64;
 use crate::export::TRASH_NAME;
 use crate::fates::{SceneFate, ScenesToWrite};
-use crate::ffmpeg::{Program, TimeLimit, COPY_SCENE_STREAMS};
+use crate::ffmpeg::{Program, ShowTimeOption, TimeLimit, COPY_SCENE_STREAMS};
 use crate::folder_settings::{PathCase, SYSTEM_PATH_CASE};
+use crate::probe;
 use crate::scene_name::{
     self, EarlierSplit, SceneNamePattern, SceneNames, SceneNaming, FIRST_SCENE_NUMBER,
 };
@@ -142,6 +144,14 @@ pub fn files_of(earlier_splits: &[EarlierSplit]) -> Vec<PathBuf> {
     files
 }
 
+/// Hears how much of the video has been written into scenes, from 0.0 to
+/// 1.0.
+pub type OnShareWritten<'a> = &'a dyn Fn(f32);
+
+/// For callers that do not show how far the writing is.
+#[cfg(test)]
+pub fn no_share_written(_share: f32) {}
+
 /// What a split made of one scene.
 #[derive(Debug, PartialEq)]
 pub enum SceneOutcome<Record> {
@@ -156,14 +166,28 @@ pub enum SceneOutcome<Record> {
 /// the default names, and returns the scene files in order.
 #[cfg(test)]
 pub fn split_at_keyframes(input: &Path, cuts: &CutTimes, out_dir: &Path) -> Result<Vec<PathBuf>> {
+    split_at_keyframes_timing_pictures(input, cuts, out_dir, show_time_option()?)
+}
+
+/// Like `split_at_keyframes`, with the way pictures without a show time
+/// get one chosen by the test, and not by what the ffmpeg in use can do.
+#[cfg(test)]
+pub fn split_at_keyframes_timing_pictures(
+    input: &Path,
+    cuts: &CutTimes,
+    out_dir: &Path,
+    show_times: ShowTimeOption,
+) -> Result<Vec<PathBuf>> {
     let every_scene = ScenesToWrite::every_scene(cuts.clone());
     let nothing_is_dropped = |_dropped: &Path| Ok(());
-    let outcomes = split_scenes(
+    let outcomes = split_scenes_timing_pictures(
         input,
         &every_scene,
         out_dir,
-        SceneNamePattern::default(),
+        SceneNamePattern::default().into(),
         nothing_is_dropped,
+        show_times,
+        &no_share_written,
     )?;
     Ok(written_files(&outcomes))
 }
@@ -201,8 +225,37 @@ pub fn split_scenes<Record>(
     out_dir: &Path,
     names: impl Into<SceneNames>,
     record_dropped_scene: impl Fn(&Path) -> Result<Record>,
+    on_share_written: OnShareWritten,
 ) -> Result<Vec<SceneOutcome<Record>>> {
-    let names = names.into();
+    split_scenes_timing_pictures(
+        input,
+        scenes,
+        out_dir,
+        names.into(),
+        record_dropped_scene,
+        show_time_option()?,
+        on_share_written,
+    )
+}
+
+/// Asked before anything is written, so an ffmpeg that does not answer
+/// stops the split while the folder is still as it was.
+fn show_time_option() -> Result<ShowTimeOption> {
+    tools::show_time_option().context("could not ask ffmpeg which filters it has")
+}
+
+/// `split_scenes`, told how pictures without a show time get one. What the
+/// ffmpeg in use can do decides that for a real split, and a test decides
+/// it for itself.
+fn split_scenes_timing_pictures<Record>(
+    input: &Path,
+    scenes: &ScenesToWrite,
+    out_dir: &Path,
+    names: SceneNames,
+    record_dropped_scene: impl Fn(&Path) -> Result<Record>,
+    show_times: ShowTimeOption,
+    on_share_written: OnShareWritten,
+) -> Result<Vec<SceneOutcome<Record>>> {
     let name = UnfinishedNames::of(&SceneNaming::of(input, names.in_use())?);
     write_then_move_into_place(
         input,
@@ -210,7 +263,15 @@ pub fn split_scenes<Record>(
         out_dir,
         names,
         |unfinished| {
-            write_scenes(input, scenes.cuts(), &unfinished.folder, &name).map(|_written| ())
+            write_scenes(
+                input,
+                scenes.cuts(),
+                &unfinished.folder,
+                &name,
+                show_times,
+                on_share_written,
+            )
+            .map(|_written| ())
         },
         record_dropped_scene,
     )
@@ -378,6 +439,45 @@ fn settle_scenes<Record>(
         .context("there are not as many scene files as scenes to write")
 }
 
+/// ffmpeg ended as if all went well and left fewer scene files than there
+/// are scenes.
+///
+/// It starts a scene file at the first keyframe whose show time has reached
+/// the cut. A cut no keyframe ever reaches, by the times ffmpeg goes by, is
+/// passed over without a word, and the scene before it runs on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScenesNotCut {
+    scenes_asked_for: usize,
+    scenes_written: usize,
+    show_times: ShowTimeOption,
+}
+
+impl fmt::Display for ScenesNotCut {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            scenes_asked_for,
+            scenes_written,
+            show_times,
+        } = self;
+        write!(
+            formatter,
+            "ffmpeg wrote {scenes_written} of {scenes_asked_for} scenes and reported no problem. \
+             It starts a scene only at a keyframe whose time has reached the cut, and found \
+             none for the other cuts. That happens when a video does not state the times of \
+             its pictures, or states them out of order. Such a video cannot be split by copying"
+        )?;
+        match show_times {
+            ShowTimeOption::FromDecodeTime => Ok(()),
+            ShowTimeOption::WorkedOutByFfmpeg => write!(
+                formatter,
+                ". This ffmpeg is from before version 4.4, and a newer one reads such videos better"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScenesNotCut {}
+
 /// Has ffmpeg write every scene into `unfinished_dir` and returns those
 /// files in scene order. Fails unless every one of them was written.
 fn write_scenes(
@@ -385,7 +485,11 @@ fn write_scenes(
     cuts: &CutTimes,
     unfinished_dir: &Path,
     name: &UnfinishedNames,
+    show_times: ShowTimeOption,
+    on_share_written: OnShareWritten,
 ) -> Result<Vec<PathBuf>> {
+    // A length that cannot be read costs the progress bar and nothing else.
+    let video_seconds = probe::read_duration_seconds(input).ok();
     let cut_times = cuts
         .as_slice()
         .iter()
@@ -397,22 +501,63 @@ fn write_scenes(
         .args(["-nostdin", "-v", "error", "-y"])
         // Progress reports on standard output, which the stall limit watches.
         .args(["-progress", "pipe:1"])
+        .args(show_times.input_arguments())
         .arg("-i")
         .arg(input)
         .args(COPY_SCENE_STREAMS)
+        // The times decide where a scene starts and are not what the check
+        // compares, which is the packets themselves.
+        .args(show_times.output_arguments())
         .args(["-f", "segment", "-segment_times", &cut_times])
         .args(["-segment_start_number", &FIRST_SCENE_NUMBER.to_string()])
         // Each scene file starts at time zero instead of its time in the source.
         .args(["-reset_timestamps", "1"])
         .arg(name.ffmpeg_pattern_in(unfinished_dir))
-        .stream_lines(COPY_STALL_LIMIT, |_progress_report| Ok(()))
+        .stream_lines(COPY_STALL_LIMIT, |progress_report| {
+            let share_written = video_seconds
+                .and_then(|video_seconds| share_written(progress_report, video_seconds));
+            if let Some(share_written) = share_written {
+                on_share_written(share_written);
+            }
+            Ok(())
+        })
         .with_context(|| format!("could not split {}", input.display()))?;
 
     let unfinished_files = name.unfinished_files_in(unfinished_dir, cuts.len() + 1);
-    if let Some(missing) = unfinished_files.iter().find(|file| !file.is_file()) {
-        bail!("ffmpeg finished without writing {}", missing.display());
+    let scenes_written = unfinished_files
+        .iter()
+        .filter(|file| file.is_file())
+        .count();
+    if scenes_written < unfinished_files.len() {
+        return Err(ScenesNotCut {
+            scenes_asked_for: unfinished_files.len(),
+            scenes_written,
+            show_times,
+        })
+        .with_context(|| format!("could not split {}", input.display()));
     }
     Ok(unfinished_files)
+}
+
+/// The line of a progress report that says up to which time of the video
+/// ffmpeg has written, in millionths of a second.
+const WRITTEN_UP_TO_KEY: &str = "out_time_us=";
+const MICROSECONDS_PER_SECOND: f64 = 1_000_000.0;
+
+/// How much of a video of `video_seconds` is written, going by one line of
+/// ffmpeg's progress report. `None` for the other lines of a report, and
+/// for a time ffmpeg does not know yet.
+fn share_written(progress_report_line: &str, video_seconds: f64) -> Option<f32> {
+    let microseconds: f64 = progress_report_line
+        .trim()
+        .strip_prefix(WRITTEN_UP_TO_KEY)?
+        .parse()
+        .ok()?;
+    if video_seconds <= 0.0 {
+        return None;
+    }
+    let share = microseconds / MICROSECONDS_PER_SECOND / video_seconds;
+    Some(share.clamp(0.0, 1.0) as f32)
 }
 
 /// Gives each finished scene its real name, replacing a scene file of an
@@ -579,6 +724,20 @@ impl UnfinishedNames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_progress_report_says_how_much_of_the_video_is_written() {
+        assert_eq!(share_written("out_time_us=30000000", 120.0), Some(0.25));
+        assert_eq!(share_written("out_time_us=500000000", 120.0), Some(1.0));
+    }
+
+    #[test]
+    fn other_lines_of_a_progress_report_say_nothing_about_the_share_written() {
+        assert_eq!(share_written("out_time=00:00:30.000000", 120.0), None);
+        assert_eq!(share_written("out_time_us=N/A", 120.0), None);
+        assert_eq!(share_written("progress=continue", 120.0), None);
+        assert_eq!(share_written("out_time_us=30000000", 0.0), None);
+    }
 
     #[test]
     fn scenes_go_beside_the_video_by_default() {
@@ -1148,6 +1307,30 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("could not put"), "{error:#}");
         assert_eq!(folder.file_names(), vec!["holiday_scene_001.mp4"]);
+    }
+
+    #[test]
+    fn scenes_ffmpeg_did_not_cut_are_counted_and_the_likely_reason_is_named() {
+        let not_cut = ScenesNotCut {
+            scenes_asked_for: 7,
+            scenes_written: 1,
+            show_times: ShowTimeOption::FromDecodeTime,
+        };
+        let said = not_cut.to_string();
+        assert!(said.starts_with("ffmpeg wrote 1 of 7 scenes"), "{said}");
+        assert!(said.ends_with("cannot be split by copying"), "{said}");
+
+        // Only an ffmpeg that had to work the times out is called too old.
+        let with_an_old_ffmpeg = ScenesNotCut {
+            show_times: ShowTimeOption::WorkedOutByFfmpeg,
+            ..not_cut
+        };
+        assert!(
+            with_an_old_ffmpeg
+                .to_string()
+                .contains("before version 4.4"),
+            "{with_an_old_ffmpeg}"
+        );
     }
 
     #[test]

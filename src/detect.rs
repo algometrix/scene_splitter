@@ -13,12 +13,15 @@ use crate::chapters::{self, Chapter, ChapterSplits};
 use crate::hardcut::{self, HardCutCandidate, HardCutSettings};
 use crate::scan::{self, UndecodedFrames};
 use crate::timecode::TimeSpan;
+use crate::windows::FullDecodeBudget;
 use crate::{probe, scenes, windows};
 
 /// How much of the video to decode while looking for black screens.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum, Serialize, Deserialize)]
 pub enum ScanMode {
-    /// Decode only where the packet sizes hint at a black screen. Fastest.
+    /// Decode only where the packet sizes hint at a black screen. A video
+    /// small enough to decode in a few seconds is decoded in full all the
+    /// same. Fastest.
     Suspicious,
     /// Decode every frame. Use this when the black screens are noisy or
     /// grainy, since those do not compress into tiny packets.
@@ -163,8 +166,10 @@ impl Detection {
         }
     }
 
-    /// The cuts a review of this scan starts from: its black-screen cuts,
-    /// and for a hard-cut scan the hard cuts its settings choose as well.
+    /// The cuts this scan suggests: its black-screen cuts, and for a
+    /// hard-cut scan the hard cuts its settings choose as well. A review or
+    /// a split starts from these only once `starting_cuts` has added the
+    /// chapter marks and applied the limits on scene length.
     pub fn cuts_for(&self, scan_kind: ScanKind) -> Vec<f64> {
         match scan_kind {
             ScanKind::BlackScreens => self.cuts.clone(),
@@ -279,14 +284,57 @@ pub fn scan_for_scene_changes(
     depth: ScanDepth,
     on_progress: OnScanProgress,
 ) -> Result<ScanOutcome> {
+    scan_within_budget(video, settings, depth, full_decode_budget(), on_progress)
+}
+
+fn full_decode_budget() -> FullDecodeBudget {
+    FullDecodeBudget::for_threads(rayon::current_num_threads())
+}
+
+/// Whether `stored` skipped frames that a scan with the same settings
+/// decodes today. A scan stored before small videos were decoded in full
+/// looked only at their suspicious stretches, and may have missed black
+/// screens there. Scanning such a video again takes a few seconds.
+pub fn skipped_frames_a_scan_now_decodes(
+    stored: &Detection,
+    video: &Path,
+    settings: &ScanSettings,
+) -> bool {
+    if settings.mode == ScanMode::EveryFrame || stored.decoded_frames >= stored.frame_count {
+        return false;
+    }
+    // A picture size that cannot be read is no reason to throw away a scan
+    // that is good otherwise.
+    probe::read_pixels_per_frame(video).is_ok_and(|pixels_per_frame| {
+        full_decode_budget().covers(stored.frame_count, pixels_per_frame)
+    })
+}
+
+/// `scan_for_scene_changes`, decoding every frame unasked only when that
+/// stays within `full_decode_budget`.
+pub(crate) fn scan_within_budget(
+    video: &Path,
+    settings: &ScanSettings,
+    depth: ScanDepth,
+    full_decode_budget: FullDecodeBudget,
+    on_progress: OnScanProgress,
+) -> Result<ScanOutcome> {
     let index = probe::read_packet_index(video)?;
     let chapters = ChapterMarks::read_from(video);
     let packets = &index.packets;
     let criteria = &settings.criteria;
 
-    let windows = match settings.mode {
-        ScanMode::Suspicious => windows::suspicious_windows(packets, criteria.min_seconds),
-        ScanMode::EveryFrame => windows::whole_video_windows(packets, rayon::current_num_threads()),
+    let decode_every_frame = match settings.mode {
+        ScanMode::EveryFrame => true,
+        ScanMode::Suspicious => {
+            let pixels_per_frame = probe::read_pixels_per_frame(video)?;
+            full_decode_budget.covers(packets.len(), pixels_per_frame)
+        }
+    };
+    let windows = if decode_every_frame {
+        windows::whole_video_windows(packets, rayon::current_num_threads())
+    } else {
+        windows::suspicious_windows(packets, criteria.min_seconds)
     };
     let decoded_frames = windows.iter().map(|window| window.len()).sum();
     let work = ScanWork {

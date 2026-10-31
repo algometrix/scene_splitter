@@ -90,6 +90,7 @@ impl ScenesToWrite {
             .count()
     }
 
+    #[cfg(test)]
     pub fn has_dropped_scenes(&self) -> bool {
         self.dropped_count() > 0
     }

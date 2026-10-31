@@ -67,6 +67,20 @@ impl CutTimes {
     pub fn is_empty(&self) -> bool {
         self.times.is_empty()
     }
+
+    /// These cuts without those `stays` turns down. What is left of cuts
+    /// inside the video is inside it too, so this cannot fail.
+    pub fn only(&self, stays: impl Fn(f64) -> bool) -> Self {
+        Self {
+            whole_video: self.whole_video,
+            times: self
+                .times
+                .iter()
+                .copied()
+                .filter(|&time| stays(time))
+                .collect(),
+        }
+    }
 }
 
 /// One cut per black screen, placed on the keyframe nearest to it.
@@ -82,15 +96,37 @@ pub fn cut_points(
 ) -> Vec<f64> {
     let mut cuts: Vec<f64> = black_screens
         .iter()
-        // A black opening or closing has footage on one side only, so it
-        // separates nothing.
-        .filter(|screen| screen.start > whole_video.start && screen.end < whole_video.end)
+        .filter(|screen| separates_footage(screen, whole_video))
         .filter_map(|screen| nearest_keyframe(screen, keyframe_times))
         // A cut at the very start or end would only produce an empty scene.
         .filter(|&cut| whole_video.has_strictly_inside(cut))
         .collect();
     cuts.dedup();
     cuts
+}
+
+/// A black opening or closing has footage on one side only, so it separates
+/// nothing.
+fn separates_footage(black_screen: &TimeSpan, whole_video: TimeSpan) -> bool {
+    black_screen.start > whole_video.start && black_screen.end < whole_video.end
+}
+
+/// How long the black screen behind the cut at `cut` lasted, where
+/// `cut_points` places the cuts for the same black screens and keyframes.
+/// The longest one, where several black screens share a cut. `None` for a
+/// cut that no black screen is behind.
+pub fn black_seconds_behind(
+    cut: f64,
+    black_screens: &[TimeSpan],
+    keyframe_times: &[f64],
+    whole_video: TimeSpan,
+) -> Option<f64> {
+    black_screens
+        .iter()
+        .filter(|screen| separates_footage(screen, whole_video))
+        .filter(|screen| nearest_keyframe(screen, keyframe_times) == Some(cut))
+        .map(TimeSpan::seconds)
+        .max_by(f64::total_cmp)
 }
 
 /// The scenes between the cuts. Together they cover the whole video.
@@ -149,6 +185,34 @@ mod tests {
             time,
             whole_video: WHOLE_VIDEO,
         })
+    }
+
+    #[test]
+    fn the_black_screen_behind_a_cut_is_the_longest_one_cut_there() {
+        let black_screens = [black(1.75, 2.25), black(2.5, 3.5), black(5.5, 6.5)];
+        let behind = |cut| black_seconds_behind(cut, &black_screens, &KEYFRAMES, WHOLE_VIDEO);
+        // Both of the first two are cut at 2.
+        assert_eq!(behind(2.0), Some(1.0));
+        assert_eq!(behind(6.0), Some(1.0));
+        assert_eq!(behind(4.0), None);
+    }
+
+    #[test]
+    fn a_black_opening_is_behind_no_cut() {
+        let opening = [black(0.0, 2.5)];
+        assert_eq!(cut_points(&opening, &KEYFRAMES, WHOLE_VIDEO), [0.0; 0]);
+        assert_eq!(
+            black_seconds_behind(2.0, &opening, &KEYFRAMES, WHOLE_VIDEO),
+            None
+        );
+    }
+
+    #[test]
+    fn cuts_can_be_thinned_and_stay_inside_their_video() {
+        let cuts = CutTimes::inside(WHOLE_VIDEO, vec![2.0, 4.0, 6.0]).unwrap();
+        let thinned = cuts.only(|time| time != 4.0);
+        assert_eq!(thinned.as_slice(), [2.0, 6.0]);
+        assert_eq!(thinned.whole_video(), WHOLE_VIDEO);
     }
 
     #[test]

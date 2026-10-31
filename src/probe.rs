@@ -99,6 +99,67 @@ pub fn read_container_start(input: &Path) -> Result<f64> {
         .with_context(|| format!("unexpected container start time {field:?}"))
 }
 
+/// How long the video is, as its container says. Good enough to say how far
+/// a copy of it has come, and not exact enough to place a cut.
+pub fn read_duration_seconds(input: &Path) -> Result<f64> {
+    let output = ffprobe_on(
+        input,
+        &["-show_entries", "format=duration", "-of", "csv=p=0"],
+    )
+    .run_for_text(QUICK_ANSWER_LIMIT)
+    .with_context(|| format!("could not open {}", input.display()))?;
+    let field = output.trim().trim_end_matches(',');
+    field
+        .parse()
+        .with_context(|| format!("unexpected length {field:?} of {}", input.display()))
+}
+
+/// How many pixels one picture of the video has, which is what decoding it
+/// costs.
+pub fn read_pixels_per_frame(input: &Path) -> Result<u64> {
+    let printed = ffprobe_on(
+        input,
+        &[
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+        ],
+    )
+    .run_for_text(QUICK_ANSWER_LIMIT)
+    .with_context(|| format!("could not read the picture size of {}", input.display()))?;
+    parse_pixels_per_frame(&printed).with_context(|| {
+        format!(
+            "could not understand the picture size of {}",
+            input.display()
+        )
+    })
+}
+
+/// What `ffprobe -show_entries stream=width,height -of csv=p=0` prints: the
+/// width and the height on one line, as in "640,360".
+fn parse_pixels_per_frame(printed: &str) -> Result<u64> {
+    let line = printed
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .context("ffprobe printed no picture size")?;
+    let mut fields = line.trim().split(',');
+    let width = fields.next().context("missing width")?;
+    let height = fields.next().context("missing height")?;
+    let width: u64 = width
+        .parse()
+        .with_context(|| format!("unexpected width {width:?}"))?;
+    let height: u64 = height
+        .parse()
+        .with_context(|| format!("unexpected height {height:?}"))?;
+    if width == 0 || height == 0 {
+        bail!("a picture of {width} by {height} pixels");
+    }
+    Ok(width.saturating_mul(height))
+}
+
 /// The chapter marks of the file, in the order they begin. Most videos have
 /// none, which is not an error.
 pub fn read_chapters(input: &Path) -> Result<Vec<Chapter>> {
@@ -245,6 +306,24 @@ mod tests {
     #[test]
     fn rejects_a_truncated_line() {
         assert!(parse_packet_line("1.0,1.0", 0.0).is_err());
+    }
+
+    #[test]
+    fn the_picture_size_is_read_as_its_pixels() {
+        assert_eq!(parse_pixels_per_frame("640,360\n").unwrap(), 230_400);
+        // Some streams end the line with a comma, for side data they list.
+        assert_eq!(
+            parse_pixels_per_frame("\n1920,1080,\r\n").unwrap(),
+            2_073_600
+        );
+    }
+
+    #[test]
+    fn a_picture_size_that_is_no_size_is_refused() {
+        assert!(parse_pixels_per_frame("").is_err());
+        assert!(parse_pixels_per_frame("640").is_err());
+        assert!(parse_pixels_per_frame("N/A,N/A").is_err());
+        assert!(parse_pixels_per_frame("0,0").is_err());
     }
 
     fn chapter(start: f64, title: Option<&str>) -> Chapter {

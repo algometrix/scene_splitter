@@ -21,14 +21,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::ScanSettings;
 use crate::hardcut::HardCutSettings;
+use crate::scene_length::SceneLengthLimits;
 
-/// Everything that decides which scene changes a scan suggests: what counts
-/// as a black screen, and how sudden picture changes are thinned.
+/// Everything that decides which splits a video starts with: what counts
+/// as a black screen, how sudden picture changes are thinned, and how short
+/// and how long a scene may be.
+///
+/// `hard_cuts` has a shortest scene of its own, which is about something
+/// else than the one in `scene_length`. Films cut between camera angles
+/// every few seconds, so sudden picture changes are thinned among
+/// themselves, and around the black-screen cuts, before they are suggested
+/// at all. That thinning never takes a black-screen cut away, and without it
+/// the slow scan is of no use, so it is always on. The limits in
+/// `scene_length` are off unless the person sets them. They are applied
+/// afterwards, to every suggested split of whatever kind, and are the ones
+/// that hold for the scenes a review starts with.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DetectionSettings {
     pub scan: ScanSettings,
     pub hard_cuts: HardCutSettings,
+    /// Missing from a file written before scenes could have limits, which
+    /// means no limit. Not part of `scan`: a stored scan stays good when
+    /// these change.
+    pub scene_length: SceneLengthLimits,
 }
 
 impl DetectionSettings {
@@ -339,6 +355,39 @@ mod tests {
             serde_json::from_value::<FolderSettings>(stored).unwrap(),
             folders
         );
+    }
+
+    #[test]
+    fn a_folder_remembers_its_scene_lengths_with_its_other_settings() {
+        use crate::scene_length::SceneLength;
+        let no_scene_under_a_minute =
+            SceneLengthLimits::new(Some(SceneLength::from_seconds(60.0).unwrap()), None).unwrap();
+        let detection = DetectionSettings {
+            scene_length: no_scene_under_a_minute,
+            ..DetectionSettings::default()
+        };
+        let folders = remembered_for("videos/tapes", detection);
+
+        let stored = serde_json::to_value(&folders).unwrap();
+        assert_eq!(
+            stored["videos/tapes"]["scene_length"]["shortest_seconds"],
+            60.0
+        );
+        assert_eq!(
+            serde_json::from_value::<FolderSettings>(stored).unwrap(),
+            folders
+        );
+    }
+
+    #[test]
+    fn folder_settings_from_before_scenes_had_limits_load_without_any() {
+        let stored = serde_json::json!({
+            "videos/tapes": {"scan": {"mode": "EveryFrame"}, "hard_cuts": {}}
+        });
+        let folders: FolderSettings = serde_json::from_value(stored).unwrap();
+        let remembered = found(&folders, "videos/tapes", PathCase::Matters).unwrap();
+        assert_eq!(remembered.scene_length, SceneLengthLimits::NONE);
+        assert_eq!(remembered.scan.mode, ScanMode::EveryFrame);
     }
 
     #[test]

@@ -34,8 +34,8 @@ use crate::exact_fallback::{ExactCutLook, WhyNotExact};
 use crate::exact_verify::{self, ExactCutProof, VerifyError};
 use crate::fates::ScenesToWrite;
 use crate::ffmpeg::{
-    FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit, Turn, TurnOption,
-    QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT,
+    lists_bitstream_filter, FfmpegError, NotUnderstood, PictureTimesOption, Program, TimeLimit,
+    Turn, TurnOption, QUICK_ANSWER_LIMIT, STEADY_OUTPUT_LIMIT, TIME_FILTER,
 };
 use crate::probe;
 use crate::scene_name::SceneNames;
@@ -46,10 +46,6 @@ use crate::tools;
 /// that can be set up to match what it is joined to, and both the ffmpeg the
 /// app downloads and most others carry it.
 const ENCODER: &str = "libx264";
-/// The bitstream filter that gives the encoded pictures the decode times of
-/// the copied ones they are joined to. ffmpeg has it from version 4.4 on.
-const TIME_FILTER: &str = "setts";
-
 /// The encoder an exact split looks for in the ffmpeg in use before it
 /// writes anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -520,12 +516,6 @@ fn look_for_time_filter() -> Result<(), ExactCutError> {
     } else {
         Err(ExactCutError::TimeFilterMissing)
     }
-}
-
-/// Whether ffmpeg's list of bitstream filters names `filter`. The list has
-/// a heading and then one name to a line.
-fn lists_bitstream_filter(listing: &str, filter: &str) -> bool {
-    listing.lines().any(|line| line.trim() == filter)
 }
 
 /// Whether ffmpeg's list of encoders names `encoder`. A line of it reads
@@ -1283,16 +1273,6 @@ mod tests {
         }
         let shown = parse_stored_frame("0,0.000000,-1024,-0.080000,K__", 0.0).unwrap();
         assert_eq!(shown.showing, Showing::Shown);
-    }
-
-    #[test]
-    fn the_time_filter_is_found_by_its_whole_name() {
-        let listing = "Bitstream filters:\naac_adtstoasc\nsetts\ntrace_headers\n";
-        assert!(lists_bitstream_filter(listing, "setts"));
-        assert!(!lists_bitstream_filter(
-            "Bitstream filters:\nsetts_of_another_kind\n",
-            "setts"
-        ));
     }
 
     #[test]

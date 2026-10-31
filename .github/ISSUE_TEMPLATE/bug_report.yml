@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in Cutaway does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+        Please do not attach private videos, or paste their names or folder paths.
+        A description of the footage (black screens, fades, title cards, a hard cut) is enough.
+  - type: input
+    id: version
+    attributes:
+      label: Cutaway version
+      description: Run `scene_splitter --version`, or see the release you downloaded.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      placeholder: "Windows 11 24H2, macOS 15 on Apple silicon, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where it happened
+      options:
+        - In the window
+        - On the command line
+    validations:
+      required: true
+  - type: textarea
+    id: video
+    attributes:
+      label: The video
+      description: The container and codec if you know them (for example MP4 with H.264, MKV with HEVC), its length, and what kind of footage it is.
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add a video ...
+        2. Click ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: |
+        Include the message the app showed. In the window, "Copy details" under an error copies all of it.
+        Remove any private path or file name first.
+      render: text
+    validations:
+      required: true

@@ -52,6 +52,15 @@ pub fn format_clock(seconds: f64) -> String {
     }
 }
 
+/// Formats a moment like `format_clock`, to the hundredth of a second, so a
+/// step of one picture shows: "2:40.12", or "1:02:40.12" past an hour.
+pub fn format_clock_precise(seconds: f64) -> String {
+    let total_hundredths = (seconds.max(0.0) * 100.0).round() as u64;
+    let hundredths = total_hundredths % 100;
+    let whole = format_clock((total_hundredths / 100) as f64);
+    format!("{whole}.{hundredths:02}")
+}
+
 /// Formats a length of time the way people say it: "50 s", "3 min 44 s",
 /// "1 h 05 min 10 s".
 pub fn format_length(seconds: f64) -> String {
@@ -140,6 +149,15 @@ mod tests {
         assert_eq!(format_clock(0.0), "0:00");
         assert_eq!(format_clock(160.2), "2:40");
         assert_eq!(format_clock(3792.0), "1:03:12");
+    }
+
+    #[test]
+    fn a_precise_clock_time_shows_the_hundredths_of_a_second() {
+        assert_eq!(format_clock_precise(0.0), "0:00.00");
+        assert_eq!(format_clock_precise(160.124), "2:40.12");
+        assert_eq!(format_clock_precise(59.999), "1:00.00");
+        assert_eq!(format_clock_precise(3792.5), "1:03:12.50");
+        assert_eq!(parse_timestamp(&format_clock_precise(63.25)), Some(63.25));
     }
 
     #[test]

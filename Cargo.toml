@@ -24,6 +24,9 @@ rfd = "0.15"
 rodio = { version = "0.20", default-features = false }
 trash = "5"
 
+[build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 lto = true
 codegen-units = 1

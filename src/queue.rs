@@ -15,11 +15,12 @@ use crate::cache::{CacheUse, SourcedDetection};
 use crate::detect::{ScanDepth, ScanKind, ScanProgress};
 use crate::exact_fallback::{ExactCutLook, NoWayToCut};
 use crate::exact_split::ExactCutError;
-use crate::export::ExportReport;
+use crate::export::{ExportReport, SplitProgress};
 use crate::fates::ScenesToWrite;
 use crate::ffmpeg::FfmpegError;
 use crate::review_session::ReviewSession;
-use crate::scenes::CutTimes;
+use crate::scene_length::SceneLengthLimits;
+use crate::starting_cuts::{CutSources, SuggestedCuts};
 
 /// Names one video for as long as the window is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,7 +147,12 @@ pub enum JobStatus {
     ReadyToSplit(Box<ReviewSession>),
     /// The review is kept while its split runs. If the split fails, nothing
     /// about the review was wrong, and the person gets it back.
-    Exporting(Box<ReviewSession>),
+    Exporting {
+        review: Box<ReviewSession>,
+        /// How far the split has come, once it has said so. A split on
+        /// exact pictures never does.
+        progress: Option<SplitProgress>,
+    },
     Finished(ExportReport),
     /// Left as it is. The review is kept, in case that was a slip.
     Skipped(Box<ReviewSession>),
@@ -194,7 +200,7 @@ impl JobStatus {
             Self::Scanning(_) => Stage::Scanning,
             Self::Reviewing(_) => Stage::Reviewing,
             Self::ReadyToSplit(_) => Stage::ReadyToSplit,
-            Self::Exporting(_) => Stage::Exporting,
+            Self::Exporting { .. } => Stage::Exporting,
             Self::Finished(_) => Stage::Finished,
             Self::Skipped(_) => Stage::Skipped,
             Self::Failed { .. } => Stage::Failed,
@@ -207,7 +213,7 @@ impl JobStatus {
         match self {
             Self::Reviewing(review)
             | Self::ReadyToSplit(review)
-            | Self::Exporting(review)
+            | Self::Exporting { review, .. }
             | Self::Skipped(review) => Some(review),
             Self::Failed { review, .. } => review.as_deref(),
             Self::Waiting | Self::Scanning(_) | Self::Finished(_) => None,
@@ -218,7 +224,7 @@ impl JobStatus {
         match self {
             Self::Reviewing(review)
             | Self::ReadyToSplit(review)
-            | Self::Exporting(review)
+            | Self::Exporting { review, .. }
             | Self::Skipped(review) => Some(review),
             Self::Failed { review, .. } => review.as_deref_mut(),
             Self::Waiting | Self::Scanning(_) | Self::Finished(_) => None,
@@ -231,7 +237,7 @@ impl JobStatus {
         match std::mem::replace(self, Self::Waiting) {
             Self::Reviewing(review)
             | Self::ReadyToSplit(review)
-            | Self::Exporting(review)
+            | Self::Exporting { review, .. }
             | Self::Skipped(review) => Some(review),
             Self::Failed { review, .. } => review,
             Self::Waiting | Self::Scanning(_) | Self::Finished(_) => None,
@@ -289,11 +295,13 @@ pub enum Transition {
     EditAgain,
     StartExport,
     StartReadyExport,
+    SplitProgressed,
     Finished,
     Failed,
     Crashed,
     TryAgain,
     BackToReview,
+    Forget,
 }
 
 impl fmt::Display for Transition {
@@ -310,11 +318,13 @@ impl fmt::Display for Transition {
             Self::EditAgain => "editing the scenes again",
             Self::StartExport => "starting the split",
             Self::StartReadyExport => "starting the split of a ready video",
+            Self::SplitProgressed => "reporting how far the split is",
             Self::Finished => "taking the result of the split",
             Self::Failed => "failing",
             Self::Crashed => "reporting a crash",
             Self::TryAgain => "trying again",
             Self::BackToReview => "going back to the review",
+            Self::Forget => "taking off the list",
         };
         formatter.write_str(in_words)
     }
@@ -399,6 +409,18 @@ pub struct ExportOrder {
     /// Where to cut, and which of the scenes between the cuts to write.
     pub scenes: ScenesToWrite,
 }
+
+/// The stages at which a video is of no use on the list once its file is
+/// gone. A video that is being scanned or split says so itself when it
+/// fails, and the file of a finished one is often gone on purpose: it went
+/// to the Recycle Bin or Trash after the split.
+const STAGES_THAT_NEED_THE_FILE: [Stage; 5] = [
+    Stage::Waiting,
+    Stage::Reviewing,
+    Stage::ReadyToSplit,
+    Stage::Skipped,
+    Stage::Failed,
+];
 
 #[derive(Debug, Default)]
 pub struct Queue {
@@ -557,18 +579,25 @@ impl Queue {
     }
 
     /// The scan is in. The video goes to review, starting from the cuts of
-    /// the scan the person chose, or fails when the scan makes no sense.
-    pub fn scan_finished(&mut self, id: JobId, scan: SourcedDetection) -> Result<(), Refused> {
+    /// the scan the person chose within `scene_lengths`, the limits on scene
+    /// length in force for this video. It fails when the scan makes no sense.
+    pub fn scan_finished(
+        &mut self,
+        id: JobId,
+        scan: SourcedDetection,
+        scene_lengths: SceneLengthLimits,
+    ) -> Result<(), Refused> {
         let job = self.job_at(id, Transition::ScanFinished, &[Stage::Scanning])?;
         let video = Arc::clone(&job.video);
-        let detected_times = scan.detection.cuts_for(job.scan_kind);
+        let sources = CutSources::for_review(job.scan_kind);
         // A scan never suggests a cut outside its video. A stored scan that was
         // damaged on disk could, and a review built on it would write nonsense.
-        let cuts = match CutTimes::inside(scan.detection.video, detected_times) {
-            Ok(cuts) => cuts,
+        let suggested = match SuggestedCuts::of(&scan.detection, &sources) {
+            Ok(suggested) => suggested,
             Err(error) => return self.failed(id, Failure::cut_outside_video(error.to_string())),
         };
-        self.begin_review(id, ReviewSession::new(video, scan, cuts))
+        let session = ReviewSession::new(video, scan, suggested, scene_lengths);
+        self.begin_review(id, session)
     }
 
     pub fn begin_review(&mut self, id: JobId, session: ReviewSession) -> Result<(), Refused> {
@@ -696,12 +725,30 @@ impl Queue {
             return Err(Refused::NoReviewKept(id));
         };
         let scenes = session.scenes_to_write();
-        job.status = JobStatus::Exporting(session);
+        job.status = JobStatus::Exporting {
+            review: session,
+            progress: None,
+        };
         Ok(ExportOrder {
             job: id,
             video,
             scenes,
         })
+    }
+
+    /// The split says how far it has come. The check of the scenes reports
+    /// from several threads, so a report can arrive after one that was made
+    /// later. The furthest one heard so far is kept, and the bar never
+    /// moves backwards.
+    pub fn split_progressed(&mut self, id: JobId, reported: SplitProgress) -> Result<(), Refused> {
+        let job = self.job_at(id, Transition::SplitProgressed, &[Stage::Exporting])?;
+        if let JobStatus::Exporting { progress, .. } = &mut job.status {
+            let is_further = progress.is_none_or(|furthest| reported.fraction > furthest.fraction);
+            if is_further {
+                *progress = Some(reported);
+            }
+        }
+        Ok(())
     }
 
     /// The split worked. Only now is the review let go.
@@ -775,6 +822,28 @@ impl Queue {
         }
     }
 
+    /// The videos that are taken off the list when their file is gone, with
+    /// where each file should be.
+    pub fn videos_to_look_for(&self) -> Vec<(JobId, Arc<Path>)> {
+        self.jobs
+            .iter()
+            .filter(|job| STAGES_THAT_NEED_THE_FILE.contains(&job.status.stage()))
+            .map(|job| (job.id, Arc::clone(&job.video)))
+            .collect()
+    }
+
+    /// Takes a video whose file is gone off the list, with its review. When
+    /// it was the one shown, the video after it is shown.
+    pub fn forget(&mut self, id: JobId) -> Result<(), Refused> {
+        self.job_at(id, Transition::Forget, &STAGES_THAT_NEED_THE_FILE)?;
+        if self.current == Some(id) {
+            let next_listed = self.jobs_around(id).next().map(|job| job.id);
+            self.current = next_listed;
+        }
+        self.jobs.retain(|job| job.id != id);
+        Ok(())
+    }
+
     fn scanning_job(&self) -> Option<JobId> {
         self.jobs
             .iter()
@@ -836,7 +905,7 @@ mod tests {
     use super::*;
     use crate::cache::DetectionSource;
     use crate::detect::{Detection, ScanStage};
-    use crate::export::{CutOutcome, OriginalOutcome, Verification};
+    use crate::export::{CutOutcome, OriginalOutcome, SplitStage, Verification};
     use crate::ffmpeg::{Program, TimeLimit};
     use crate::hardcut::{HardCutCandidate, HardCutSettings};
     use crate::plan::SceneIndex;
@@ -870,6 +939,9 @@ mod tests {
     fn two_cuts() -> SourcedDetection {
         scan_suggesting(vec![20.0, 60.0])
     }
+
+    /// Scenes may be as short and as long as they come.
+    const NO_LIMITS: SceneLengthLimits = SceneLengthLimits::NONE;
 
     fn report() -> ExportReport {
         ExportReport {
@@ -918,7 +990,7 @@ mod tests {
     /// Takes a waiting video as far as its review.
     fn bring_to_review(queue: &mut Queue, id: JobId) {
         queue.start_scan(id).unwrap();
-        queue.scan_finished(id, two_cuts()).unwrap();
+        queue.scan_finished(id, two_cuts(), NO_LIMITS).unwrap();
     }
 
     /// A queue of one video at the given stage.
@@ -1081,7 +1153,7 @@ mod tests {
         assert_eq!(queue.start_next_scan(), None);
         assert_eq!(stages(&queue), vec![Stage::Scanning, Stage::Waiting]);
 
-        queue.scan_finished(ids[0], two_cuts()).unwrap();
+        queue.scan_finished(ids[0], two_cuts(), NO_LIMITS).unwrap();
         assert_eq!(queue.start_next_scan().unwrap().job, ids[1]);
     }
 
@@ -1160,7 +1232,7 @@ mod tests {
     fn a_new_scan_of_the_same_video_starts_without_progress() {
         let (mut queue, id) = queue_at(Stage::Scanning);
         queue.scan_progressed(id, black_screens_done(1.0)).unwrap();
-        queue.scan_finished(id, two_cuts()).unwrap();
+        queue.scan_finished(id, two_cuts(), NO_LIMITS).unwrap();
         scan_for_black_screens_again(&mut queue, id).unwrap();
 
         queue.start_scan(id).unwrap();
@@ -1173,6 +1245,93 @@ mod tests {
             Transition::ScanProgressed,
             &[Stage::Scanning],
             |queue, id| queue.scan_progressed(id, black_screens_done(0.5)),
+        );
+    }
+
+    #[test]
+    fn a_video_whose_file_is_gone_is_taken_off_the_list_and_the_next_one_shown() {
+        let (mut queue, ids) = queue_with(3);
+        bring_to_review(&mut queue, ids[0]);
+        queue.show(ids[0]).unwrap();
+
+        queue.forget(ids[0]).unwrap();
+
+        let listed: Vec<JobId> = queue.jobs().iter().map(Job::id).collect();
+        assert_eq!(listed, vec![ids[1], ids[2]]);
+        assert_eq!(queue.current(), Some(ids[1]));
+    }
+
+    #[test]
+    fn taking_the_only_video_off_the_list_leaves_nothing_shown() {
+        let (mut queue, id) = queue_at(Stage::Waiting);
+        queue.forget(id).unwrap();
+        assert!(queue.is_empty());
+        assert_eq!(queue.current(), None);
+    }
+
+    #[test]
+    fn a_video_that_is_not_the_one_shown_goes_without_changing_what_is_shown() {
+        let (mut queue, ids) = queue_with(2);
+        queue.show(ids[0]).unwrap();
+        queue.forget(ids[1]).unwrap();
+        assert_eq!(queue.current(), Some(ids[0]));
+    }
+
+    #[test]
+    fn only_videos_that_still_need_their_file_are_looked_for_and_taken_off() {
+        for stage in EVERY_STAGE {
+            let (mut queue, id) = queue_at(stage);
+            let needs_the_file = STAGES_THAT_NEED_THE_FILE.contains(&stage);
+            assert_eq!(
+                queue.videos_to_look_for().len(),
+                usize::from(needs_the_file)
+            );
+            assert_eq!(queue.forget(id).is_ok(), needs_the_file, "{stage}");
+        }
+    }
+
+    fn scenes_written(stage_fraction: f32) -> SplitProgress {
+        SplitProgress::within(SplitStage::WritingScenes, stage_fraction)
+    }
+
+    fn split_progress(queue: &Queue, id: JobId) -> Option<SplitProgress> {
+        match queue.job(id).unwrap().status() {
+            JobStatus::Exporting { progress, .. } => *progress,
+            other => panic!("the video is not being split but {:?}", other.stage()),
+        }
+    }
+
+    #[test]
+    fn a_split_has_no_progress_until_it_reports_some() {
+        let (queue, id) = queue_at(Stage::Exporting);
+        assert_eq!(split_progress(&queue, id), None);
+    }
+
+    #[test]
+    fn a_split_shows_the_progress_it_reported() {
+        let (mut queue, id) = queue_at(Stage::Exporting);
+        queue.split_progressed(id, scenes_written(0.5)).unwrap();
+        assert_eq!(split_progress(&queue, id), Some(scenes_written(0.5)));
+
+        let checking = SplitProgress::within(SplitStage::CheckingScenes, 0.5);
+        queue.split_progressed(id, checking).unwrap();
+        assert_eq!(split_progress(&queue, id), Some(checking));
+    }
+
+    #[test]
+    fn a_late_report_does_not_move_the_progress_of_a_split_backwards() {
+        let (mut queue, id) = queue_at(Stage::Exporting);
+        queue.split_progressed(id, scenes_written(0.5)).unwrap();
+        queue.split_progressed(id, scenes_written(0.4)).unwrap();
+        assert_eq!(split_progress(&queue, id), Some(scenes_written(0.5)));
+    }
+
+    #[test]
+    fn progress_of_a_split_is_refused_for_a_video_that_is_not_being_split() {
+        assert_refused_elsewhere(
+            Transition::SplitProgressed,
+            &[Stage::Exporting],
+            |queue, id| queue.split_progressed(id, scenes_written(0.5)),
         );
     }
 
@@ -1210,7 +1369,7 @@ mod tests {
             source: DetectionSource::StoredScan,
             ..two_cuts()
         };
-        queue.scan_finished(id, stored).unwrap();
+        queue.scan_finished(id, stored, NO_LIMITS).unwrap();
 
         assert_eq!(
             queue.review(id).unwrap().scan_summary(),
@@ -1230,7 +1389,7 @@ mod tests {
             undecoded: vec![stretch],
             ..two_cuts()
         };
-        queue.scan_finished(id, scan).unwrap();
+        queue.scan_finished(id, scan, NO_LIMITS).unwrap();
 
         assert_eq!(queue.review(id).unwrap().undecoded(), [stretch]);
     }
@@ -1250,7 +1409,7 @@ mod tests {
             time: 40.0,
             strength: u8::MAX,
         }]);
-        queue.scan_finished(id, scan).unwrap();
+        queue.scan_finished(id, scan, NO_LIMITS).unwrap();
 
         assert_eq!(
             queue.review(id).unwrap().accepted_cuts().as_slice(),
@@ -1259,10 +1418,28 @@ mod tests {
     }
 
     #[test]
+    fn a_review_starts_within_the_scene_lengths_in_force_for_its_video() {
+        let (mut queue, id) = queue_at(Stage::Scanning);
+        let no_scene_under_thirty_seconds = test_sessions::scene_lengths(Some(30.0), None);
+        queue
+            .scan_finished(id, two_cuts(), no_scene_under_thirty_seconds)
+            .unwrap();
+
+        // The cut at 20 would leave a first scene of 20 seconds.
+        let review = queue.review(id).unwrap();
+        assert_eq!(review.accepted_cuts().as_slice(), [60.0]);
+        assert_eq!(review.scene_lengths(), no_scene_under_thirty_seconds);
+        assert_eq!(
+            review.scan_summary(),
+            "Found 0 black screens. 1 short scene was merged away."
+        );
+    }
+
+    #[test]
     fn a_scan_with_a_cut_outside_the_video_fails_instead_of_being_reviewed() {
         let (mut queue, id) = queue_at(Stage::Scanning);
         queue
-            .scan_finished(id, scan_suggesting(vec![20.0, 140.0]))
+            .scan_finished(id, scan_suggesting(vec![20.0, 140.0]), NO_LIMITS)
             .unwrap();
 
         let JobStatus::Failed { failure, review } = queue.job(id).unwrap().status() else {
@@ -1282,7 +1459,7 @@ mod tests {
     #[test]
     fn a_scan_result_is_refused_for_a_video_that_is_not_being_scanned() {
         assert_refused_elsewhere(Transition::ScanFinished, &[Stage::Scanning], |queue, id| {
-            queue.scan_finished(id, two_cuts())
+            queue.scan_finished(id, two_cuts(), NO_LIMITS)
         });
     }
 
@@ -2006,10 +2183,12 @@ mod tests {
             Transition::EditAgain,
             Transition::StartExport,
             Transition::StartReadyExport,
+            Transition::SplitProgressed,
             Transition::Finished,
             Transition::Failed,
             Transition::Crashed,
             Transition::TryAgain,
+            Transition::Forget,
             Transition::BackToReview,
         ]
         .iter()

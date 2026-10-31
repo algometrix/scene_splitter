@@ -32,6 +32,7 @@ mod focus;
 mod folder_settings;
 mod folders;
 mod hardcut;
+mod icons;
 mod keyboard;
 mod library;
 mod plan;
@@ -42,13 +43,17 @@ mod queue;
 mod review;
 mod review_session;
 mod scan;
+mod scene_length;
 mod scene_list;
 mod scene_name;
 mod scenes;
+mod screenshot;
 mod selection;
 mod settings;
 mod settings_controls;
+mod settings_dialog;
 mod split;
+mod starting_cuts;
 #[cfg(test)]
 mod test_videos;
 mod theme;
@@ -73,11 +78,13 @@ use export::{ExistingListFile, OriginalPolicy, SplitMethod, SplitOrder};
 use fates::ScenesToWrite;
 use folder_settings::{DetectionInUse, SettingsScope};
 use hardcut::HardCutSettings;
+use scene_length::{SceneLengthLimits, SceneLengthOverride};
 use scene_list::{FrameRate, SceneList, SceneListFormat};
 use scene_name::{EarlierNaming, EarlierSplit, SceneNamePattern};
 use scenes::CutTimes;
 use settings::Settings;
-use timecode::{format_timestamp, TimeSpan};
+use starting_cuts::{ChapterMarksUse, CutSources, LimitsEffect, SuggestedCuts};
+use timecode::{format_length, format_timestamp, TimeSpan};
 
 /// How often the download of ffmpeg reports its progress on the console.
 const PROGRESS_STEP_PERCENT: u32 = 10;
@@ -182,6 +189,30 @@ struct Arguments {
     /// Share of a frame's pixels that must be black, from 0 to 1.
     #[arg(long)]
     black_fraction: Option<f64>,
+
+    /// The shortest a scene may be, whatever the saved setting says: a time
+    /// like 90, 1:30 or 1:02:03. Splits are left out until no scene is
+    /// shorter. Those at the longest black screens stay. Give "off" to
+    /// allow scenes of any length in this run.
+    #[arg(
+        long,
+        requires = "video",
+        conflicts_with = "scan_only",
+        value_name = "TIME"
+    )]
+    min_scene: Option<SceneLengthOverride>,
+
+    /// The longest a scene may be, whatever the saved setting says: a time
+    /// like 20:00 or 1:30:00. A longer scene is cut into equal parts, at the
+    /// nearest points where the video can be cut. Give "off" to allow
+    /// scenes of any length in this run.
+    #[arg(
+        long,
+        requires = "video",
+        conflicts_with = "scan_only",
+        value_name = "TIME"
+    )]
+    max_scene: Option<SceneLengthOverride>,
 }
 
 fn main() -> Result<()> {
@@ -292,12 +323,14 @@ fn refuse_overrides_for_the_window(arguments: &Arguments) -> Result<()> {
         || arguments.black_fraction.is_some()
         || arguments.keep_original
         || arguments.scene_name.is_some()
-        || arguments.exact_cuts;
+        || arguments.exact_cuts
+        || arguments.min_scene.is_some()
+        || arguments.max_scene.is_some();
     if overrides_given {
         bail!(
-            "--scan, --min-black, --max-luma, --black-fraction, --keep-original, --scene-name \
-             and --exact-cuts apply to a command line run. For the window, change them in its \
-             Settings section."
+            "--scan, --min-black, --max-luma, --black-fraction, --min-scene, --max-scene, \
+             --keep-original, --scene-name and --exact-cuts apply to a command line run. \
+             For the window, change them in its Settings section."
         );
     }
     Ok(())
@@ -348,6 +381,11 @@ fn settings_for_this_run(
     if arguments.exact_cuts {
         settings.export.cut_precision = CutPrecision::ExactFrame;
     }
+    settings.detection.scene_length = settings
+        .detection
+        .scene_length
+        .overridden_by(arguments.min_scene, arguments.max_scene)
+        .context("the scene lengths given cannot be used")?;
     settings
         .validate()
         .context("the options given cannot be used")?;
@@ -416,28 +454,27 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     }
     let detection = scan.detection;
     let method = settings.export.split_method();
-    let scan_kind = scan_kind(arguments, settings.detection.hard_cuts);
-    let detected_cuts = match settings.export.cut_precision {
-        CutPrecision::NearestKeyframe => detection.cuts_for(scan_kind),
-        // Nobody reviews a split from the command line, so the cuts go
-        // where the scan saw the scene change.
-        CutPrecision::ExactFrame => exact_cut::exact_cut_times(&detection, scan_kind),
+    let sources = CutSources {
+        scan_kind: scan_kind(arguments, settings.detection.hard_cuts),
+        // Nobody reviews a split from the command line, so with exact cuts
+        // they go where the scan saw the scene change.
+        placement: settings.export.cut_precision,
+        chapter_marks: if arguments.no_chapters {
+            ChapterMarksUse::LeaveOut
+        } else {
+            ChapterMarksUse::SplitAtThem
+        },
     };
-    let chapter_splits = if arguments.no_chapters {
-        ChapterSplits::default()
-    } else {
-        detection.chapter_splits(&detected_cuts)
-    };
-    let every_cut = detected_cuts
-        .iter()
-        .chain(&chapter_splits.cuts)
-        .copied()
-        .collect();
+    let scan_made_no_sense =
+        |outside| anyhow::anyhow!("the scan of {} made no sense: {outside}", video.display());
+    let suggested = SuggestedCuts::of(&detection, &sources).map_err(scan_made_no_sense)?;
+    let scene_lengths = settings.detection.scene_length;
+    let starting = suggested.within(scene_lengths);
     // Checked once, here, so that neither the listing nor the split can be
     // handed a cut that is not inside the video.
-    let cuts = CutTimes::inside(detection.video, every_cut).map_err(|outside| {
-        anyhow::anyhow!("the scan of {} made no sense: {outside}", video.display())
-    })?;
+    let cuts =
+        CutTimes::inside(detection.video, starting.every_cut_time()).map_err(scan_made_no_sense)?;
+    let chapter_splits = starting.chapter_splits;
 
     println!(
         "Decoded {} of {} frames in {} windows.",
@@ -448,7 +485,7 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
         println!(
             "Sudden picture changes: {}, of which {} became cuts.",
             candidates.len(),
-            detected_cuts.len().saturating_sub(detection.cuts.len())
+            suggested.sudden_change_count()
         );
     }
     let chapter_mark_count = detection.chapter_marks().len();
@@ -457,8 +494,11 @@ fn split_from_command_line(video: &Path, arguments: &Arguments, settings: &Setti
     } else if chapter_mark_count > 0 {
         println!(
             "Chapter marks: {chapter_mark_count}. Cuts they add: {}.",
-            chapter_splits.cuts.len()
+            suggested.chapter_split_count()
         );
+    }
+    for line in scene_length_lines(scene_lengths, starting.limits_effect) {
+        println!("{line}");
     }
     print_scenes(&cuts.scenes(), &chapter_splits);
     println!("Detection took {detection_seconds:.2}s.");
@@ -716,6 +756,32 @@ fn print_black_screens(black_screens: &[TimeSpan]) {
     }
 }
 
+/// What the limits on scene length did to the splits listed above them, one
+/// line for each limit that is set. Without them a listing with fewer
+/// scenes than black screens, or with scenes no black screen explains,
+/// could not be understood.
+fn scene_length_lines(limits: SceneLengthLimits, effect: LimitsEffect) -> Vec<String> {
+    let shortest = limits.shortest().map(|shortest| {
+        format!(
+            "No scene shorter than {}: {} left out.",
+            format_length(shortest.seconds()),
+            counted_splits(effect.splits_left_out)
+        )
+    });
+    let longest = limits.longest().map(|longest| {
+        format!(
+            "No scene longer than {}: {} added.",
+            format_length(longest.seconds()),
+            counted_splits(effect.splits_added)
+        )
+    });
+    [shortest, longest].into_iter().flatten().collect()
+}
+
+fn counted_splits(count: usize) -> String {
+    review_session::counted(count, "split")
+}
+
 /// Lists the scenes, each with the title of the chapter that begins where
 /// it begins, if the file names one.
 fn print_scenes(scenes: &[TimeSpan], chapter_splits: &ChapterSplits) {
@@ -838,6 +904,106 @@ mod tests {
             "{notice}"
         );
         assert!(notice.contains(export::TRASH_NAME), "{notice}");
+    }
+
+    fn arguments(given: &[&str]) -> Arguments {
+        Arguments::try_parse_from(std::iter::once("scene_splitter").chain(given.iter().copied()))
+            .unwrap_or_else(|refused| panic!("{refused}"))
+    }
+
+    fn general_settings() -> DetectionInUse {
+        DetectionInUse {
+            detection: Settings::default().detection,
+            scope: SettingsScope::General,
+        }
+    }
+
+    fn limits(shortest_seconds: Option<f64>, longest_seconds: Option<f64>) -> SceneLengthLimits {
+        let length = |seconds: f64| scene_length::SceneLength::from_seconds(seconds).unwrap();
+        SceneLengthLimits::new(shortest_seconds.map(length), longest_seconds.map(length)).unwrap()
+    }
+
+    #[test]
+    fn scene_lengths_are_given_as_times_and_override_the_saved_ones_for_the_run() {
+        let given = arguments(&["film.mp4", "--min-scene", "1:30", "--max-scene", "20:00"]);
+        let settings =
+            settings_for_this_run(Settings::default(), &general_settings(), &given).unwrap();
+        assert_eq!(
+            settings.detection.scene_length,
+            limits(Some(90.0), Some(1200.0))
+        );
+
+        // A saved limit holds for a run that says nothing, and "off" lifts it.
+        let mut saved = general_settings();
+        saved.detection.scene_length = limits(Some(60.0), None);
+        let nothing_said = arguments(&["film.mp4"]);
+        let settings = settings_for_this_run(Settings::default(), &saved, &nothing_said).unwrap();
+        assert_eq!(settings.detection.scene_length, limits(Some(60.0), None));
+        let lifted = arguments(&["film.mp4", "--min-scene", "off"]);
+        let settings = settings_for_this_run(Settings::default(), &saved, &lifted).unwrap();
+        assert_eq!(settings.detection.scene_length, SceneLengthLimits::NONE);
+    }
+
+    #[test]
+    fn a_longest_scene_below_the_shortest_is_refused_in_plain_words() {
+        let given = arguments(&["film.mp4", "--min-scene", "10:00", "--max-scene", "5:00"]);
+        let refused = settings_for_this_run(Settings::default(), &general_settings(), &given)
+            .map(|settings| settings.detection.scene_length)
+            .unwrap_err();
+        assert_eq!(
+            format!("{refused:#}"),
+            "the scene lengths given cannot be used: the longest scene (5 min 00 s) must not \
+             be shorter than the shortest scene (10 min 00 s)"
+        );
+    }
+
+    #[test]
+    fn a_scene_length_that_is_no_time_is_refused_by_the_command_line() {
+        for not_a_length in ["soon", "0", "-3"] {
+            let refused = Arguments::try_parse_from([
+                "scene_splitter",
+                "film.mp4",
+                "--min-scene",
+                not_a_length,
+            ]);
+            assert!(refused.is_err(), "{not_a_length}");
+        }
+        // A scan ahead of time keeps no scenes, so it takes no lengths.
+        let scan_only = Arguments::try_parse_from([
+            "scene_splitter",
+            "videos",
+            "--scan-only",
+            "--max-scene",
+            "9",
+        ]);
+        assert!(scan_only.is_err());
+    }
+
+    #[test]
+    fn the_window_takes_no_scene_lengths_from_the_command_line() {
+        let for_the_window = arguments(&["film.mp4", "--review", "--min-scene", "1:00"]);
+        let refused = refuse_overrides_for_the_window(&for_the_window).unwrap_err();
+        assert!(refused.to_string().contains("--min-scene"), "{refused}");
+    }
+
+    #[test]
+    fn a_listing_says_what_each_scene_length_that_is_set_did() {
+        let effect = LimitsEffect {
+            splits_left_out: 26,
+            splits_added: 1,
+        };
+        assert_eq!(
+            scene_length_lines(limits(Some(60.0), Some(1200.0)), effect),
+            [
+                "No scene shorter than 1 min 00 s: 26 splits left out.",
+                "No scene longer than 20 min 00 s: 1 split added."
+            ]
+        );
+        assert_eq!(
+            scene_length_lines(limits(None, Some(1200.0)), LimitsEffect::default()),
+            ["No scene longer than 20 min 00 s: 0 splits added."]
+        );
+        assert!(scene_length_lines(SceneLengthLimits::NONE, LimitsEffect::default()).is_empty());
     }
 
     #[test]

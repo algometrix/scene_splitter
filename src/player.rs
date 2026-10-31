@@ -21,12 +21,13 @@ use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
 
 use crate::exact_cut::CutPrecision;
+use crate::icons::Icon;
 use crate::keyboard::{self, KeyboardOwner};
 use crate::plan::SceneIndex;
 use crate::review_session::SplitFeedback;
 use crate::theme;
 use crate::thumbnails::{self, DecoderThreads, PictureSize};
-use crate::timecode::{format_clock, format_timestamp, TimeSpan};
+use crate::timecode::{format_clock, format_clock_precise, format_timestamp, TimeSpan};
 use crate::tools;
 
 /// How wide the picture is decoded, in pixels. The narrowest is enough for
@@ -67,10 +68,14 @@ const SCENE_BAR_HANDLE_RADIUS: f32 = 7.0;
 /// How strongly the scenes that are not playing are faded on the bar.
 const OTHER_SCENE_OPACITY: f32 = 0.45;
 /// The frame around the picture, in the colour of the scene on screen.
-const PICTURE_FRAME_WIDTH: f32 = 4.0;
+const PICTURE_FRAME_WIDTH: f32 = 2.0;
 /// How long the picture says which scene has just begun.
 const SCENE_NOTICE_SECONDS: f64 = 2.5;
 const SCENE_NOTICE_MARGIN: f32 = 12.0;
+/// Around the words of a note drawn on the embedded picture.
+const NOTE_PADDING: egui::Vec2 = egui::vec2(10.0, 6.0);
+/// How long a note about a split stays on the embedded picture.
+const NOTE_ON_PICTURE_SECONDS: f64 = 4.0;
 /// How far from the corner of the window the player first appears.
 const PLAYER_CORNER_GAP: f32 = 16.0;
 /// On a touchpad, which scrolls smoothly, this much scrolling steps one frame.
@@ -79,10 +84,11 @@ const SCROLL_POINTS_PER_FRAME: f32 = 50.0;
 const SAME_MOMENT_SECONDS: f64 = 0.0005;
 /// The split button says where its split lands: near the picture on show
 /// while the video is copied, on it while cuts are exact.
-const SPLIT_NEAR_LABEL: &str = "Split near here (S)";
+const SPLIT_NEAR_LABEL: &str = "Split near here";
 const SPLIT_NEAR_HINT: &str =
     "Cuts the scene playing now in two, at the closest point where the video can be cut.";
-const SPLIT_EXACTLY_LABEL: &str = "Split here (S)";
+const SPLIT_EXACTLY_LABEL: &str = "Split here";
+/// Shown on the split button, which the key S also presses.
 const SPLIT_EXACTLY_HINT: &str = "Cuts the scene playing now in two, on this picture.";
 /// Room for the two one-picture buttons side by side.
 const PICTURE_STEP_BUTTONS_WIDTH: f32 = 185.0;
@@ -92,6 +98,114 @@ const ONE_PICTURE_BACK_LABEL: &str = "-1 picture";
 const ONE_PICTURE_FORWARD_LABEL: &str = "+1 picture";
 const PLAYER_HINT: &str =
     "Esc closes the player. Pause, then step one picture at a time to find the exact one.";
+/// Between the embedded picture and the row of buttons under it.
+const TRANSPORT_TOP_GAP: f32 = 8.0;
+/// The row of buttons under the embedded picture.
+const TRANSPORT_HEIGHT: f32 = 52.0;
+/// The row of buttons under the embedded picture, with the gap above it.
+const EMBEDDED_CONTROLS_HEIGHT: f32 = TRANSPORT_TOP_GAP + TRANSPORT_HEIGHT;
+const TRANSPORT_GAP: f32 = 8.0;
+/// The row is never narrower than its buttons with sound beside them.
+const TRANSPORT_LEAST_WIDTH: f32 = 300.0;
+/// A cut this close to where the video is counts as the place itself, so
+/// "previous cut" moves to the one before.
+const CUT_NEARBY_SECONDS: f64 = 0.25;
+const PLAY_LABEL: &str = "Play";
+const PAUSE_LABEL: &str = "Pause";
+const PLAY_HINT: &str = "Play or pause (Space)";
+const PREVIOUS_CUT_LABEL: &str = "Previous cut";
+const NEXT_CUT_LABEL: &str = "Next cut";
+const ONE_PICTURE_BACK_HINT: &str =
+    "One picture back. The mouse wheel over the picture does the same.";
+const ONE_PICTURE_FORWARD_HINT: &str = "One picture forward";
+const MUTE_LABEL: &str = "Mute";
+const SOUND_ON_LABEL: &str = "Turn the sound on";
+const STILL_PROBLEM_NOTE: &str =
+    "This picture could not be shown. Try a moment a little earlier or later.";
+
+/// The buttons of the embedded player's row, in their order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportAction {
+    PreviousCut,
+    PictureBack,
+    PlayOrPause,
+    PictureForward,
+    NextCut,
+}
+
+const TIME_FONT_SIZE: f32 = 13.0;
+
+/// What the row under the embedded picture holds in the room it has.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CompactRow {
+    time: TimeShown,
+    cut_steps: CutSteps,
+    /// The room kept on each side of the buttons, for the time on the left
+    /// and sound on the right, so play stays in the middle.
+    side_room: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TimeShown {
+    /// Where the video is and how long it is.
+    Whole,
+    /// Where the video is.
+    Short,
+    Hidden,
+}
+
+/// Whether the buttons to the previous and next cut are in the row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CutSteps {
+    Shown,
+    LeftOut,
+}
+
+/// The widths `compact_row` chooses between.
+#[derive(Debug, Clone, Copy)]
+struct CompactRowWidths {
+    all_buttons: f32,
+    without_cut_steps: f32,
+    whole_time: f32,
+    short_time: f32,
+}
+
+/// Short of room, the steps to the cuts go first: the timeline shows the
+/// cuts, and the time has no other place under the picture. Then the time
+/// gets shorter, and last it goes.
+fn compact_row(room: f32, widths: CompactRowWidths) -> CompactRow {
+    let side_room_for = |time: f32| time + TRANSPORT_GAP;
+    let fits = |buttons: f32, time: f32| buttons + 2.0 * side_room_for(time) <= room;
+    let (cut_steps, buttons) = if fits(widths.all_buttons, widths.whole_time) {
+        (CutSteps::Shown, widths.all_buttons)
+    } else {
+        (CutSteps::LeftOut, widths.without_cut_steps)
+    };
+    let (time, side_room) = if fits(buttons, widths.whole_time) {
+        (TimeShown::Whole, side_room_for(widths.whole_time))
+    } else if fits(buttons, widths.short_time) {
+        (TimeShown::Short, side_room_for(widths.short_time))
+    } else {
+        (TimeShown::Hidden, theme::CONTROL_HEIGHT + TRANSPORT_GAP)
+    };
+    CompactRow {
+        time,
+        cut_steps,
+        side_room,
+    }
+}
+
+/// `words` with every digit made a zero, the width the time takes at most
+/// as its digits change.
+fn widest_digits(words: &str) -> String {
+    words
+        .chars()
+        .map(|letter| if letter.is_ascii_digit() { '0' } else { letter })
+        .collect()
+}
+
+/// Below this the embedded picture is not shrunk further, and its area scrolls.
+const MIN_EMBEDDED_PICTURE_WIDTH: f32 = 160.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlaybackSpeed {
@@ -441,6 +555,23 @@ pub enum PlayerEvent {
     SplitRequested(f64),
 }
 
+/// What a screen around the player asks of it, from controls the player
+/// does not draw itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PlayerAsk {
+    /// Go to this place, playing on if it was playing.
+    GoTo(f64),
+    /// The playhead is being dragged here. Playing on from every place the
+    /// drag passes would stutter, so the player holds the place, and shows
+    /// its picture when paused.
+    ScrubTo(f64),
+    /// The drag of the playhead is over: go where it ended, playing on if
+    /// it was playing.
+    ScrubEnded,
+    /// Split near the place on screen, as the S key does.
+    SplitHere,
+}
+
 pub struct Player {
     video: Arc<Path>,
     video_end: f64,
@@ -454,10 +585,12 @@ pub struct Player {
     split_requested: bool,
     /// Set by the Escape key, and reported by `show`.
     close_requested: bool,
+    /// Where the player was last drawn, which decides what its hint says.
+    place: PlayerPlace,
     /// True while the "turn the sound on?" question is on screen.
     asking_to_turn_sound_on: bool,
     /// What the last split asked for here did, once one was.
-    split_feedback: Option<SplitFeedback>,
+    split_note: Option<SplitNote>,
     /// Why the picture at the place the person stepped to could not be
     /// shown, until a picture can be shown again.
     still_problem: Option<String>,
@@ -513,6 +646,20 @@ impl Player {
         player
     }
 
+    /// A player paused at `position`, showing the picture there once it is
+    /// grabbed.
+    pub fn showing_still_at(
+        video: Arc<Path>,
+        video_end: f64,
+        frame_seconds: f64,
+        position: f64,
+        ctx: &egui::Context,
+    ) -> Self {
+        let mut player = Self::paused_at(video, video_end, frame_seconds, position, ctx);
+        player.pause_at(position, ctx);
+        player
+    }
+
     /// A player that shows nothing yet and has started no decoder.
     pub(crate) fn paused_at(
         video: Arc<Path>,
@@ -533,8 +680,9 @@ impl Player {
             scrubbing_to: None,
             split_requested: false,
             close_requested: false,
+            place: PlayerPlace::Window,
             asking_to_turn_sound_on: false,
-            split_feedback: None,
+            split_note: None,
             still_problem: None,
             frame_seconds,
             stills_sender,
@@ -547,6 +695,16 @@ impl Player {
             frame_size: frame_size_for(ctx.pixels_per_point()),
             scene_on_screen: None,
             scene_notice: None,
+        }
+    }
+
+    /// Carries out what the screen around the player asked of it.
+    pub fn act_on(&mut self, ask: PlayerAsk, ctx: &egui::Context) {
+        match ask {
+            PlayerAsk::GoTo(position) => self.seek(position, ctx),
+            PlayerAsk::ScrubTo(position) => self.scrub_to(position, ctx),
+            PlayerAsk::ScrubEnded => self.end_scrub(ctx),
+            PlayerAsk::SplitHere => self.split_requested = true,
         }
     }
 
@@ -641,6 +799,34 @@ impl Player {
         };
     }
 
+    /// Holds the playhead where it is dragged. A drag held still asks for
+    /// the same place every frame, which starts nothing new.
+    fn scrub_to(&mut self, position: f64, ctx: &egui::Context) {
+        if self.scrubbing_to == Some(position) {
+            return;
+        }
+        self.scrubbing_to = Some(position);
+        if matches!(self.state, PlayState::Paused { .. }) {
+            // Paused, the picture follows the drag. Stills are grabbed one
+            // at a time, so a fast drag starts few.
+            self.pause_at(position, ctx);
+        }
+    }
+
+    fn end_scrub(&mut self, ctx: &egui::Context) {
+        let Some(position) = self.scrubbing_to.take() else {
+            return;
+        };
+        if matches!(self.state, PlayState::Playing(_)) {
+            self.play_at(position, ctx);
+        }
+    }
+
+    /// Where the playhead is drawn: where it is dragged to, during a drag.
+    pub fn playhead(&self) -> f64 {
+        self.scrubbing_to.unwrap_or_else(|| self.position())
+    }
+
     fn toggle_pause(&mut self, ctx: &egui::Context) {
         match self.state {
             PlayState::Playing(_) => self.pause(),
@@ -722,10 +908,8 @@ impl Player {
         scenes: &[TimeSpan],
         split_here: SplitHere,
     ) -> PlayerEvent {
-        self.take_newest_frame(ctx);
-        self.take_newest_still(ctx);
-        self.pause_at_the_end();
-        self.decode_for_the_sharpness_of_the_screen(ctx);
+        self.place = PlayerPlace::Window;
+        self.keep_up_with_the_video(ctx);
 
         // The window can be resized under the player, and the player must
         // still fit inside it with its controls in reach.
@@ -742,36 +926,118 @@ impl Player {
             .pivot(egui::Align2::RIGHT_BOTTOM)
             .default_pos(screen.right_bottom() - egui::vec2(PLAYER_CORNER_GAP, PLAYER_CORNER_GAP))
             .constrain_to(screen)
-            .show(ctx, |ui| {
-                let scene = scene_at(scenes, self.position());
-                self.notice_a_new_scene(scene, ui.ctx());
-                let pointer_over_picture = self.show_picture(ui, scene);
-                if pointer_over_picture {
-                    self.step_frames_with_the_wheel(ui.ctx());
-                }
-                self.show_scene_bar(ui, scenes, scene);
-                self.show_controls(ui, scenes, scene, split_here);
-            })
+            .show(ctx, |ui| self.show_inside(ui, scenes, split_here))
             .map_or(screen, |shown| shown.response.rect);
         self.ask_before_turning_sound_on(ctx, player_window);
         if !open || self.close_requested {
             return PlayerEvent::Closed;
         }
+        self.split_event()
+    }
+
+    /// Draws the player into `ui`, as part of a screen, with the picture
+    /// as large as the room allows. It cannot be closed there: Escape is
+    /// left for whatever else the screen does with it.
+    pub fn show_embedded(
+        &mut self,
+        ui: &mut egui::Ui,
+        scenes: &[TimeSpan],
+        split_here: SplitHere,
+    ) -> PlayerEvent {
+        self.place = PlayerPlace::Embedded;
+        self.close_requested = false;
+        self.keep_up_with_the_video(ui.ctx());
+        let area = ui
+            .scope(|ui| {
+                // Every gap is counted in EMBEDDED_CONTROLS_HEIGHT, so egui
+                // must add none, or the row is pushed out of its card.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // The picture and its controls sit in the middle of the
+                // room, so whatever room is left over is shared above and
+                // below.
+                let room = ui.available_size();
+                self.picture_size = picture_size_within(room);
+                let left_over = room.y - self.picture_size.y - EMBEDDED_CONTROLS_HEIGHT;
+                ui.add_space((left_over / 2.0).max(0.0));
+                ui.vertical_centered(|ui| self.show_inside(ui, scenes, split_here))
+                    .response
+                    .rect
+            })
+            .inner;
+        self.ask_before_turning_sound_on(&ui.ctx().clone(), area);
+        self.split_event()
+    }
+
+    /// Takes the newest decoded picture and still, and keeps decoding at the
+    /// sharpness the screen needs. Called once a frame, before drawing.
+    fn keep_up_with_the_video(&mut self, ctx: &egui::Context) {
+        self.take_newest_frame(ctx);
+        self.take_newest_still(ctx);
+        self.pause_at_the_end();
+        self.decode_for_the_sharpness_of_the_screen(ctx);
+    }
+
+    /// The picture, the scene bar and the controls.
+    fn show_inside(&mut self, ui: &mut egui::Ui, scenes: &[TimeSpan], split_here: SplitHere) {
+        let scene = scene_at(scenes, self.position());
+        self.notice_a_new_scene(scene, ui.ctx());
+        let mut picture = self.show_picture(ui, scene);
+        if let Some(problem) = &self.still_problem {
+            // The note on the picture is short; the reason is a hover away.
+            picture = picture.on_hover_text(problem);
+        }
+        if picture.contains_pointer() {
+            self.step_frames_with_the_wheel(ui.ctx());
+        }
+        match self.place {
+            PlayerPlace::Window => self.show_scene_bar(ui, scenes, scene),
+            // The timeline under it shows the scenes and moves the playhead.
+            PlayerPlace::Embedded => {
+                let now = ui.input(|input| input.time);
+                if let Some(left) = self.expire_split_note(now) {
+                    ui.ctx().request_repaint_after(left);
+                }
+                self.show_note_on_picture(ui, picture.rect);
+                ui.add_space(TRANSPORT_TOP_GAP);
+            }
+        }
+        self.show_controls(ui, scenes, scene, split_here);
+    }
+
+    fn split_event(&mut self) -> PlayerEvent {
         if std::mem::take(&mut self.split_requested) {
             return PlayerEvent::SplitRequested(self.position());
         }
         PlayerEvent::StillOpen
     }
 
-    /// Shows the outcome of a split in the player window.
     /// Whether the question about sound is open in front of the player.
     /// Until it is answered, the keys are not the review screen's either.
     pub fn is_asking_about_sound(&self) -> bool {
         self.asking_to_turn_sound_on
     }
 
+    /// Shows the outcome of a split in the player.
     pub fn show_split_feedback(&mut self, feedback: SplitFeedback) {
-        self.split_feedback = Some(feedback);
+        self.split_note = Some(SplitNote {
+            feedback,
+            shown_until: None,
+        });
+    }
+
+    /// Takes the note about a split off the embedded picture once it has
+    /// been there long enough. Returns how long it has left, for a repaint
+    /// to take it off then.
+    fn expire_split_note(&mut self, now: f64) -> Option<Duration> {
+        let note = self.split_note.as_mut()?;
+        let until = *note
+            .shown_until
+            .get_or_insert(now + NOTE_ON_PICTURE_SECONDS);
+        if now >= until {
+            self.split_note = None;
+            return None;
+        }
+        Some(Duration::from_secs_f64(until - now))
     }
 
     fn take_newest_frame(&mut self, ctx: &egui::Context) {
@@ -885,25 +1151,24 @@ impl Player {
             }
             return;
         }
-        if keyboard::take_escape(ctx) {
+        // Part of the review screen, the player cannot be closed, so Escape
+        // is left for the review, which clears its selection with it.
+        if self.place == PlayerPlace::Window && keyboard::take_escape(ctx) {
             self.close_requested = true;
         }
-        // The review screen behind the player reads the arrow keys and
-        // Space too, as "another picture" and "play this scene". They are
-        // taken here, so one press does one thing. With Alt held an arrow
-        // key moves a split in the review, and is left for it.
+        // The review screen behind the player reads the arrow keys, Space
+        // and S too, as "another picture", "play this scene" and "the scene
+        // below". They are taken here, so one press does one thing. With Alt
+        // held an arrow key moves a split in the review, and is left for it.
         let back_arrow = keyboard::take_plain_key(ctx, egui::Key::ArrowLeft);
         let forward_arrow = keyboard::take_plain_key(ctx, egui::Key::ArrowRight);
         let pause = keyboard::take_plain_key(ctx, egui::Key::Space);
-        let (back_letter, forward_letter, split) = ctx.input(|input| {
+        let split = keyboard::take_plain_key(ctx, keyboard::SPLIT_SHORTCUT.logical_key);
+        let (back_letter, forward_letter) = ctx.input(|input| {
             // With Ctrl held a letter is a shortcut of the review screen,
             // such as "select all", and not the player's.
             let plain_key = |key| input.key_pressed(key) && !input.modifiers.command;
-            (
-                plain_key(egui::Key::A),
-                plain_key(egui::Key::D),
-                plain_key(egui::Key::S),
-            )
+            (plain_key(egui::Key::A), plain_key(egui::Key::D))
         });
         let back = back_arrow || back_letter;
         let forward = forward_arrow || forward_letter;
@@ -945,8 +1210,8 @@ impl Player {
         }
     }
 
-    /// Draws the picture and returns whether the pointer is over it.
-    fn show_picture(&self, ui: &mut egui::Ui, scene: Option<SceneIndex>) -> bool {
+    /// Draws the picture.
+    fn show_picture(&self, ui: &mut egui::Ui, scene: Option<SceneIndex>) -> egui::Response {
         let palette = theme::palette(ui.ctx());
         let size = self.picture_size;
         let response = match (&self.state, &self.picture) {
@@ -980,7 +1245,46 @@ impl Player {
         if let Some(notice) = self.scene_notice {
             show_scene_notice(ui, response.rect, notice.scene);
         }
-        response.contains_pointer()
+        response
+    }
+
+    /// What a split just did, and a picture that could not be shown, in a
+    /// dark band along the bottom of the embedded picture. The note about a
+    /// split goes after a few seconds; the timeline shows the split itself.
+    fn show_note_on_picture(&self, ui: &egui::Ui, picture: egui::Rect) {
+        let mut lines = Vec::new();
+        if let Some(note) = &self.split_note {
+            let color = theme::picture_note_color(note.feedback.tone());
+            lines.push((note.feedback.in_words(), color));
+        }
+        if self.still_problem.is_some() {
+            lines.push((STILL_PROBLEM_NOTE.to_owned(), theme::PICTURE_NOTE_PROBLEM));
+        }
+        if lines.is_empty() {
+            return;
+        }
+        let painter = ui.painter();
+        let wrap_width = picture.width() - 2.0 * NOTE_PADDING.x;
+        let font = egui::FontId::proportional(theme::PICTURE_NOTE_FONT_SIZE);
+        let texts: Vec<_> = lines
+            .into_iter()
+            .map(|(words, color)| painter.layout(words, font.clone(), color, wrap_width))
+            .collect();
+        let text_height: f32 = texts.iter().map(|text| text.size().y).sum();
+        let band = egui::Rect::from_min_max(
+            egui::pos2(
+                picture.left(),
+                picture.bottom() - text_height - 2.0 * NOTE_PADDING.y,
+            ),
+            picture.right_bottom(),
+        );
+        painter.rect_filled(band, 0.0, theme::PICTURE_NOTE_FILL);
+        let mut at = band.min + NOTE_PADDING;
+        for text in texts {
+            let height = text.size().y;
+            painter.galley(at, text, theme::PICTURE_NOTE_TEXT);
+            at.y += height;
+        }
     }
 
     /// The scenes of the video as coloured blocks, with the place in the
@@ -1046,11 +1350,9 @@ impl Player {
                 f64::from(share.clamp(0.0, 1.0)) * video_end
             });
         if let (true, Some(time)) = (response.dragged(), pointed_time) {
-            // Hold the handle where the person has it. Restarting playback
-            // on every pixel of the drag would stutter.
-            self.scrubbing_to = Some(time);
-        } else if let Some(time) = self.scrubbing_to.take() {
-            self.seek(time, ui.ctx());
+            self.scrub_to(time, ui.ctx());
+        } else if response.drag_stopped() {
+            self.end_scrub(ui.ctx());
         } else if let (true, Some(time)) = (response.clicked(), pointed_time) {
             self.seek(time, ui.ctx());
         }
@@ -1067,6 +1369,181 @@ impl Player {
         }
     }
 
+    /// The row under the picture of the player that is part of the review
+    /// screen, as wide as the picture: where the video is on the left, the
+    /// ways to move in the middle with play at their centre, sound on the
+    /// right. The split is on the timeline, with the cuts it makes.
+    fn show_compact_controls(&mut self, ui: &mut egui::Ui, scenes: &[TimeSpan]) {
+        let palette = theme::palette(ui.ctx());
+        let paused = !matches!(self.state, PlayState::Playing(_));
+        let position = self.position();
+        let time_in_words = |words: String| {
+            ui.painter()
+                .layout_no_wrap(words, theme::semibold_font(TIME_FONT_SIZE), palette.text)
+        };
+        let whole_time = |at: f64| {
+            format!(
+                "{} / {}",
+                format_clock_precise(at),
+                format_clock(self.video_end)
+            )
+        };
+        // The length of the video is on the ruler of the timeline, so short
+        // of room only where the video is stays.
+        let short_time = format_clock_precise;
+        // Measured with the last moment of the video in zeros, so the row
+        // does not change as the digits do while the video plays.
+        let widest = |words: String| time_in_words(widest_digits(&words)).size().x;
+        let (play_icon, play_label) = if paused {
+            (Icon::Play, PLAY_LABEL)
+        } else {
+            (Icon::Pause, PAUSE_LABEL)
+        };
+        let round = |icon, label| {
+            theme::ToolButton::new(icon, label, theme::ButtonKind::Quiet)
+                .size(theme::ToolButtonSize::Small)
+        };
+        let previous_cut = cut_before(scenes, position);
+        let next_cut = cut_after(scenes, position);
+        let play = theme::ToolButton::new(play_icon, play_label, theme::ButtonKind::Primary)
+            .size(theme::ToolButtonSize::Large);
+        let all_buttons = [
+            (
+                round(Icon::SkipBack, PREVIOUS_CUT_LABEL),
+                PREVIOUS_CUT_LABEL,
+                previous_cut.is_some(),
+                TransportAction::PreviousCut,
+            ),
+            (
+                round(Icon::StepBack, ONE_PICTURE_BACK_HINT),
+                ONE_PICTURE_BACK_HINT,
+                true,
+                TransportAction::PictureBack,
+            ),
+            (play, PLAY_HINT, true, TransportAction::PlayOrPause),
+            (
+                round(Icon::StepForward, ONE_PICTURE_FORWARD_HINT),
+                ONE_PICTURE_FORWARD_HINT,
+                true,
+                TransportAction::PictureForward,
+            ),
+            (
+                round(Icon::SkipForward, NEXT_CUT_LABEL),
+                NEXT_CUT_LABEL,
+                next_cut.is_some(),
+                TransportAction::NextCut,
+            ),
+        ];
+        // Short of room, the steps to the cuts go first: the timeline shows
+        // the cuts, and the steps of one picture have no other place.
+        let width_of =
+            |widths: &[f32]| widths.iter().sum::<f32>() + TRANSPORT_GAP * (widths.len() - 1) as f32;
+        let mut buttons: Vec<_> = all_buttons.into_iter().collect();
+        let is_cut_step = |action: &TransportAction| {
+            matches!(
+                action,
+                TransportAction::PreviousCut | TransportAction::NextCut
+            )
+        };
+        let all_widths: Vec<f32> = buttons.iter().map(|(button, ..)| button.width()).collect();
+        let widths_without_cut_steps: Vec<f32> = buttons
+            .iter()
+            .filter(|(.., action)| !is_cut_step(action))
+            .map(|(button, ..)| button.width())
+            .collect();
+        let widest_row = ui.available_width();
+        let shape = compact_row(
+            widest_row,
+            CompactRowWidths {
+                all_buttons: width_of(&all_widths),
+                without_cut_steps: width_of(&widths_without_cut_steps),
+                whole_time: widest(whole_time(self.video_end)),
+                short_time: widest(short_time(self.video_end)),
+            },
+        );
+        if shape.cut_steps == CutSteps::LeftOut {
+            buttons.retain(|(.., action)| !is_cut_step(action));
+        }
+        let buttons_width = match shape.cut_steps {
+            CutSteps::Shown => width_of(&all_widths),
+            CutSteps::LeftOut => width_of(&widths_without_cut_steps),
+        };
+        let time = match shape.time {
+            TimeShown::Whole => Some(time_in_words(whole_time(position))),
+            TimeShown::Short => Some(time_in_words(short_time(position))),
+            TimeShown::Hidden => None,
+        };
+        let side_room = shape.side_room;
+        // As wide as the picture, or a little wider when the time would not
+        // fit beside the buttons under a small picture.
+        let width = (buttons_width + 2.0 * side_room)
+            .max(self.picture_size.x)
+            .max(TRANSPORT_LEAST_WIDTH)
+            .min(widest_row);
+        let (row, _) =
+            ui.allocate_exact_size(egui::vec2(width, TRANSPORT_HEIGHT), egui::Sense::hover());
+        let mut left = row.center().x - buttons_width / 2.0;
+        let mut pressed = None;
+        for (button, hint, enabled, action) in buttons {
+            let side = button.width();
+            let place = egui::Rect::from_center_size(
+                egui::pos2(left + side / 2.0, row.center().y),
+                egui::vec2(side, side),
+            );
+            left += side + TRANSPORT_GAP;
+            let clicked = ui
+                .add_enabled_ui(enabled, |ui| {
+                    ui.put(place, button).on_hover_text(hint).clicked()
+                })
+                .inner;
+            if clicked {
+                pressed = Some(action);
+            }
+        }
+        match pressed {
+            Some(TransportAction::PreviousCut) => {
+                if let Some(cut) = previous_cut {
+                    self.seek(cut, ui.ctx());
+                }
+            }
+            Some(TransportAction::PictureBack) => self.step_frames(-1, ui.ctx()),
+            Some(TransportAction::PlayOrPause) => self.toggle_pause(ui.ctx()),
+            Some(TransportAction::PictureForward) => self.step_frames(1, ui.ctx()),
+            Some(TransportAction::NextCut) => {
+                if let Some(cut) = next_cut {
+                    self.seek(cut, ui.ctx());
+                }
+            }
+            None => {}
+        }
+
+        // Where the video is, on the left, when it fits beside the buttons.
+        if let Some(time) = time {
+            let at = egui::pos2(row.left(), row.center().y - time.size().y / 2.0);
+            ui.painter().galley(at, time, palette.text);
+        }
+
+        let muted = self.sound == Sound::Muted;
+        let (sound_icon, sound_label) = if muted {
+            (Icon::SoundOff, SOUND_ON_LABEL)
+        } else {
+            (Icon::SoundOn, MUTE_LABEL)
+        };
+        let sound = round(sound_icon, sound_label);
+        let side = sound.width();
+        let place = egui::Rect::from_center_size(
+            egui::pos2(row.right() - side / 2.0, row.center().y),
+            egui::vec2(side, side),
+        );
+        if ui.put(place, sound).on_hover_text(sound_label).clicked() {
+            if muted {
+                self.asking_to_turn_sound_on = true;
+            } else {
+                self.set_sound(Sound::Muted, ui.ctx());
+            }
+        }
+    }
+
     fn show_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -1074,6 +1551,10 @@ impl Player {
         scene: Option<SceneIndex>,
         split_here: SplitHere,
     ) {
+        if self.place == PlayerPlace::Embedded {
+            self.show_compact_controls(ui, scenes);
+            return;
+        }
         let palette = theme::palette(ui.ctx());
         ui.set_max_width(self.picture_size.x);
         let paused = !matches!(self.state, PlayState::Playing(_));
@@ -1154,8 +1635,16 @@ impl Player {
 
         ui.horizontal_wrapped(|ui| {
             let split_button = ui
-                .add(theme::primary_button(ui, split_here.button_label()))
-                .on_hover_text(split_here.button_hint());
+                .add(theme::IconButton::new(
+                    Icon::Scissors,
+                    split_here.button_label(),
+                    theme::ButtonKind::Primary,
+                ))
+                .on_hover_text(theme::hint_with_key(
+                    ui.ctx(),
+                    split_here.button_hint(),
+                    &keyboard::SPLIT_SHORTCUT,
+                ));
             if split_button.clicked() {
                 self.split_requested = true;
             }
@@ -1177,23 +1666,14 @@ impl Player {
                 format_clock(self.video_end)
             ));
         });
-        if let Some(feedback) = &self.split_feedback {
-            // A split that was not made is said in the colour of a warning,
-            // so it is not taken for one that was.
-            let words = egui::RichText::new(feedback.in_words());
-            let words = if feedback.is_refusal() {
-                words.color(palette.warning_text)
-            } else {
-                words
-            };
+        if let Some(note) = &self.split_note {
+            let color = theme::answer_color(palette, note.feedback.tone(), palette.text);
+            let words = egui::RichText::new(note.feedback.in_words()).color(color);
             ui.add(egui::Label::new(words).wrap());
         }
         if let Some(problem) = &self.still_problem {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(
-                    palette.danger,
-                    "The picture at this place could not be shown.",
-                );
+                ui.colored_label(palette.danger, STILL_PROBLEM_NOTE);
                 theme::copy_details_button(ui, problem);
             });
         }
@@ -1266,6 +1746,54 @@ fn show_scene_notice(ui: &egui::Ui, picture: egui::Rect, scene: SceneIndex) {
     painter.galley(label.min + padding, text, palette.on_fill);
 }
 
+/// What a split asked for here did, and, on the embedded picture, until
+/// when that is said: a few seconds from the first frame it was drawn on.
+#[derive(Debug, PartialEq)]
+struct SplitNote {
+    feedback: SplitFeedback,
+    shown_until: Option<f64>,
+}
+
+/// Where the player is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlayerPlace {
+    /// A window of its own, in front of the review screen.
+    Window,
+    /// Part of the review screen, which it fills.
+    Embedded,
+}
+
+/// The cut before `position`, leaving out one it is at.
+fn cut_before(scenes: &[TimeSpan], position: f64) -> Option<f64> {
+    scenes
+        .iter()
+        .skip(1)
+        .map(|scene| scene.start)
+        .rev()
+        .find(|&cut| cut < position - CUT_NEARBY_SECONDS)
+}
+
+/// The cut after `position`, leaving out one it is at.
+fn cut_after(scenes: &[TimeSpan], position: f64) -> Option<f64> {
+    scenes
+        .iter()
+        .skip(1)
+        .map(|scene| scene.start)
+        .find(|&cut| cut > position + CUT_NEARBY_SECONDS)
+}
+
+/// The largest picture that leaves room for the controls under it in
+/// `room`, kept to the picture's shape.
+fn picture_size_within(room: egui::Vec2) -> egui::Vec2 {
+    let widest_that_fits_down = (room.y - EMBEDDED_CONTROLS_HEIGHT) / PICTURE_ASPECT;
+    let width = room
+        .x
+        .min(widest_that_fits_down)
+        .max(MIN_EMBEDDED_PICTURE_WIDTH)
+        .floor();
+    egui::vec2(width, (width * PICTURE_ASPECT).round())
+}
+
 /// How large to draw the picture so that the whole player fits a window of
 /// `screen` size.
 fn picture_size_for(screen: egui::Vec2) -> egui::Vec2 {
@@ -1282,6 +1810,29 @@ fn picture_size_for(screen: egui::Vec2) -> egui::Vec2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cuts_either_side_leave_out_the_one_the_video_is_at() {
+        let scenes = [
+            TimeSpan {
+                start: 0.0,
+                end: 10.0,
+            },
+            TimeSpan {
+                start: 10.0,
+                end: 20.0,
+            },
+            TimeSpan {
+                start: 20.0,
+                end: 30.0,
+            },
+        ];
+        assert_eq!(cut_before(&scenes, 15.0), Some(10.0));
+        assert_eq!(cut_after(&scenes, 15.0), Some(20.0));
+        assert_eq!(cut_before(&scenes, 10.0), None);
+        assert_eq!(cut_after(&scenes, 10.0), Some(20.0));
+        assert_eq!(cut_after(&scenes, 25.0), None);
+    }
     use crate::test_videos::TestVideo;
 
     /// The picture as it is decoded for a screen of ordinary sharpness.
@@ -1338,9 +1889,9 @@ mod tests {
             precision: CutPrecision::ExactFrame,
             would_land_at: Some(10.0),
         };
-        assert_eq!(SPLIT_NEAR_NOWHERE.button_label(), "Split near here (S)");
+        assert_eq!(SPLIT_NEAR_NOWHERE.button_label(), "Split near here");
         assert!(SPLIT_NEAR_NOWHERE.button_hint().contains("closest point"));
-        assert_eq!(exactly.button_label(), "Split here (S)");
+        assert_eq!(exactly.button_label(), "Split here");
         assert!(exactly.button_hint().contains("on this picture"));
     }
 
@@ -1427,6 +1978,20 @@ mod tests {
         );
         assert!(!left_for_the_review_screen);
         assert_eq!(paused.player.position(), 10.0 + SKIP_SECONDS);
+    }
+
+    #[test]
+    fn s_splits_in_the_player_and_is_not_left_to_move_through_the_review() {
+        let mut paused = PausedPlayer::new();
+        let mut left_for_the_review_screen = true;
+        let _ = paused
+            .ctx
+            .run(key_press(egui::Key::S, egui::Modifiers::NONE), |ctx| {
+                paused.player.take_keys(ctx, KeyboardOwner::Screens);
+                left_for_the_review_screen = ctx.input(|input| input.key_pressed(egui::Key::S));
+            });
+        assert!(!left_for_the_review_screen);
+        assert!(paused.player.split_requested);
     }
 
     #[test]
@@ -1530,16 +2095,94 @@ mod tests {
     #[test]
     fn the_outcome_of_a_split_is_kept_to_be_shown() {
         let mut paused = PausedPlayer::new();
-        assert_eq!(paused.player.split_feedback, None);
+        assert_eq!(paused.player.split_note, None);
 
         paused
             .player
             .show_split_feedback(SplitFeedback::Added(12.0));
         paused.frame(Vec::new());
         assert_eq!(
-            paused.player.split_feedback,
-            Some(SplitFeedback::Added(12.0))
+            paused.player.split_note.as_ref().map(|note| &note.feedback),
+            Some(&SplitFeedback::Added(12.0))
         );
+    }
+
+    #[test]
+    fn the_note_about_a_split_leaves_the_embedded_picture_after_a_while() {
+        let mut paused = PausedPlayer::new();
+        paused
+            .player
+            .show_split_feedback(SplitFeedback::Added(12.0));
+        assert!(paused.player.expire_split_note(100.0).is_some());
+        assert!(paused
+            .player
+            .expire_split_note(100.0 + NOTE_ON_PICTURE_SECONDS - 0.1)
+            .is_some());
+        assert_eq!(
+            paused
+                .player
+                .expire_split_note(100.0 + NOTE_ON_PICTURE_SECONDS),
+            None
+        );
+        assert_eq!(paused.player.split_note, None);
+    }
+
+    #[test]
+    fn a_drag_held_still_grabs_no_new_picture() {
+        let mut paused = PausedPlayer::new();
+        let ctx = paused.ctx.clone();
+        paused.player.act_on(PlayerAsk::ScrubTo(42.0), &ctx);
+        let grabs = paused.player.still_request;
+        paused.player.act_on(PlayerAsk::ScrubTo(42.0), &ctx);
+        assert_eq!(paused.player.still_request, grabs);
+        assert_eq!(paused.player.playhead(), 42.0);
+
+        paused.player.act_on(PlayerAsk::ScrubEnded, &ctx);
+        assert_eq!(paused.player.scrubbing_to, None);
+        assert_eq!(paused.player.position(), 42.0);
+    }
+
+    /// The row's widths in the smallest window: five buttons, three without
+    /// the steps to the cuts, and the time measured as it is drawn.
+    const ROW_WIDTHS: CompactRowWidths = CompactRowWidths {
+        all_buttons: 208.0,
+        without_cut_steps: 128.0,
+        whole_time: 95.0,
+        short_time: 50.0,
+    };
+
+    #[test]
+    fn a_roomy_row_has_every_button_and_the_whole_time() {
+        let row = compact_row(420.0, ROW_WIDTHS);
+        assert_eq!(row.time, TimeShown::Whole);
+        assert_eq!(row.cut_steps, CutSteps::Shown);
+        assert_eq!(row.side_room, 95.0 + TRANSPORT_GAP);
+    }
+
+    #[test]
+    fn short_of_room_the_steps_to_the_cuts_go_before_the_time() {
+        let row = compact_row(340.0, ROW_WIDTHS);
+        assert_eq!(row.time, TimeShown::Whole);
+        assert_eq!(row.cut_steps, CutSteps::LeftOut);
+    }
+
+    #[test]
+    fn in_the_smallest_window_the_row_keeps_where_the_video_is() {
+        let row = compact_row(290.0, ROW_WIDTHS);
+        assert_eq!(row.time, TimeShown::Short);
+        assert_eq!(row.cut_steps, CutSteps::LeftOut);
+    }
+
+    #[test]
+    fn with_no_room_for_any_time_the_row_keeps_room_for_sound() {
+        let row = compact_row(200.0, ROW_WIDTHS);
+        assert_eq!(row.time, TimeShown::Hidden);
+        assert_eq!(row.side_room, theme::CONTROL_HEIGHT + TRANSPORT_GAP);
+    }
+
+    #[test]
+    fn the_time_is_measured_with_its_digits_as_zeros() {
+        assert_eq!(widest_digits("1:23.45 / 8:53"), "0:00.00 / 0:00");
     }
 
     #[test]

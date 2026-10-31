@@ -44,6 +44,34 @@ const REORDERED_PICTURE_ENCODING: [&str; 8] = [
     "0",
 ];
 
+/// The encoders nearly every test video is made with.
+const H264_WITH_AAC: Encoders = Encoders {
+    pictures: "libx264",
+    sound: "aac",
+};
+/// What most AVI files hold: MPEG-4 part 2 pictures, as DivX and Xvid write
+/// them. Both encoders are part of ffmpeg itself, so every build has them.
+const MPEG4_WITH_AC3: Encoders = Encoders {
+    pictures: "mpeg4",
+    sound: "ac3",
+};
+pub const AVI_VIDEO_SECONDS: f64 = 9.0;
+/// Up to two pictures in a row that are stored after the picture that
+/// follows them, which is what makes an AVI file leave out when its
+/// keyframes are shown. A keyframe about every second, and no others where
+/// the encoder sees a new scene, so the test knows where they are. The
+/// quality is set high enough for noise to stay noise.
+const AVI_PICTURE_ENCODING: [&str; 8] = [
+    "-bf",
+    "2",
+    "-g",
+    "25",
+    "-sc_threshold",
+    "1000000000",
+    "-q:v",
+    "5",
+];
+
 const OPEN_GROUP_PICTURE_ENCODING: [&str; 10] = [
     "-preset",
     "veryfast",
@@ -106,6 +134,7 @@ impl TestVideo {
                 file_name: container.file_name(),
                 patterns: &black_screen_patterns(),
                 picture_graph: &black_screen_pictures(),
+                encoders: H264_WITH_AAC,
                 picture_encoding: &PLAIN_PICTURE_ENCODING,
                 chapters,
             },
@@ -138,6 +167,34 @@ impl TestVideo {
         )
     }
 
+    /// Nine seconds of one pattern in an AVI file with MPEG-4 part 2
+    /// pictures stored out of order. Such a file states when each picture
+    /// is decoded, and for its keyframes not when they are shown.
+    pub fn avi_without_show_times(test_name: &str) -> Self {
+        let pictures = format!("[0:v]{NOISE},format=yuv420p[picture]");
+        Self::generate_from(
+            test_name,
+            &Recipe {
+                file_name: "video.avi",
+                patterns: &[pattern("testsrc", AVI_VIDEO_SECONDS)],
+                picture_graph: &pictures,
+                encoders: MPEG4_WITH_AC3,
+                picture_encoding: &AVI_PICTURE_ENCODING,
+                chapters: &[],
+            },
+        )
+    }
+
+    /// A copy of `video`, such as a scene of another test video, in a
+    /// folder of its own, so it can be split like any video.
+    pub fn copy_of(video: &Path, test_name: &str) -> Self {
+        let folder = empty_folder_for(test_name);
+        let file_name = video.file_name().expect("the video to copy has no name");
+        let path = folder.join(file_name);
+        std::fs::copy(video, &path).expect("could not copy the video for the test");
+        Self { folder, path }
+    }
+
     pub fn folder(&self) -> &Path {
         &self.folder
     }
@@ -150,6 +207,7 @@ impl TestVideo {
                 file_name: "video.mp4",
                 patterns,
                 picture_graph,
+                encoders: H264_WITH_AAC,
                 picture_encoding: &PLAIN_PICTURE_ENCODING,
                 chapters: &[],
             },
@@ -170,6 +228,7 @@ impl TestVideo {
                 file_name: "video.mp4",
                 patterns,
                 picture_graph,
+                encoders: H264_WITH_AAC,
                 picture_encoding,
                 chapters: &[],
             },
@@ -184,15 +243,11 @@ impl TestVideo {
             file_name,
             patterns,
             picture_graph,
+            encoders,
             picture_encoding,
             chapters,
         } = *recipe;
-        let folder = std::env::temp_dir().join(format!(
-            "scene_splitter_video_test_{}_{test_name}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&folder);
-        std::fs::create_dir_all(&folder).expect("could not create a folder for the test video");
+        let folder = empty_folder_for(test_name);
         let path = folder.join(file_name);
 
         let mut ffmpeg = tools::command(Program::Ffmpeg).args(["-nostdin", "-v", "error", "-y"]);
@@ -216,9 +271,9 @@ impl TestVideo {
         let encoded = ffmpeg
             .args(["-filter_complex", picture_graph])
             .args(["-map", "[picture]", "-map", &format!("{sound_input}:a")])
-            .args(["-c:v", "libx264"])
+            .args(["-c:v", encoders.pictures])
             .args(picture_encoding)
-            .args(["-c:a", "aac", "-shortest"])
+            .args(["-c:a", encoders.sound, "-shortest"])
             .arg(&path)
             .run(ENCODING_LIMIT);
         if let Err(error) = encoded {
@@ -226,6 +281,18 @@ impl TestVideo {
         }
         Self { folder, path }
     }
+}
+
+/// A new, empty folder for the video of one test. Named after the test and
+/// this process, so tests that run at once do not share one.
+fn empty_folder_for(test_name: &str) -> PathBuf {
+    let folder = std::env::temp_dir().join(format!(
+        "scene_splitter_video_test_{}_{test_name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).expect("could not create a folder for the test video");
+    folder
 }
 
 /// What a test video is made of.
@@ -236,9 +303,17 @@ struct Recipe<'parts> {
     patterns: &'parts [String],
     /// Joins the inputs into the stream named `[picture]`.
     picture_graph: &'parts str,
+    encoders: Encoders,
     /// The options for the picture encoder.
     picture_encoding: &'parts [&'parts str],
     chapters: &'parts [TestChapter],
+}
+
+/// The encoders of a test video, by the names ffmpeg knows them under.
+#[derive(Clone, Copy)]
+struct Encoders {
+    pictures: &'static str,
+    sound: &'static str,
 }
 
 impl Drop for TestVideo {

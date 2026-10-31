@@ -10,6 +10,20 @@
 
 use eframe::egui;
 
+// The keys of the review, each named once, so that a hover naming a key
+// names the one that works, in the words of the system it runs on.
+pub const SPLIT_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::S);
+/// Gives the footage the whole window, or shows everything again.
+pub const ROOM_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::F);
+pub const MERGE_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::M);
+pub const DROP_OR_KEEP_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::X);
+pub const UNDO_SHORTCUT: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+
 /// Who may act on the keys pressed in this frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyboardOwner {
