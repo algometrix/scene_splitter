@@ -1288,7 +1288,7 @@ fn in_digit_groups(count: usize) -> String {
     let digits = count.to_string();
     let mut grouped = String::new();
     for (place, digit) in digits.chars().enumerate() {
-        if place > 0 && (digits.len() - place) % 3 == 0 {
+        if place > 0 && (digits.len() - place).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
