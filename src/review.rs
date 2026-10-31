@@ -282,6 +282,9 @@ const DROPPED_BADGE: &str = "Dropped, not written";
 const DROPPED_SHORT_LABEL: &str = "Dropped";
 const DROPPED_TILE_CAPTION: &str = "dropped, not written";
 const SAVE_SCENE_LIST_LABEL: &str = "Save the scene list";
+const RESET_SCENES_LABEL: &str = "Reset scenes";
+const RESET_SCENES_HINT: &str = "Undoes every merge and removes the splits you added.";
+const SCENES_AS_FOUND_HINT: &str = "The scenes are as the scan found them.";
 const SAVE_SCENE_LIST_HINT: &str =
     "Saves the scenes with their times to a file, without splitting the video: \
      as a table, as chapter marks, or as an edit list.";
@@ -822,7 +825,7 @@ impl ReviewScreen {
         requests.extend(self.show_timeline(ui, session, playhead));
         ui.horizontal_wrapped(|ui| {
             requests.extend(show_merge_controls(ui, session));
-            requests.extend(show_undo_and_reset(ui, session));
+            requests.extend(show_undo_button(ui, session));
             if !settings.show_tips && ui.button("Show tips").clicked() {
                 requests.push(ReviewRequest::ChangeSettings(SettingsChange::ShowTips));
             }
@@ -870,6 +873,19 @@ impl ReviewScreen {
                 if leave_out.clicked() {
                     requests.push(ReviewRequest::LeaveOutChapterSplits);
                 }
+            }
+            // Here and not beside Undo in the header, which has to fit the
+            // smallest window: a reset is rare, and Undo takes it back.
+            start_next_row_unless_it_fits(ui, RESET_SCENES_LABEL);
+            let reset = ui
+                .add_enabled(
+                    !session.plan().is_as_detected(),
+                    egui::Link::new(RESET_SCENES_LABEL),
+                )
+                .on_hover_text(RESET_SCENES_HINT)
+                .on_disabled_hover_text(SCENES_AS_FOUND_HINT);
+            if reset.clicked() {
+                requests.push(ReviewRequest::ResetScenes);
             }
             let scan_again = whole_link(ui, "Scan again").on_hover_text(SCAN_AGAIN_EXPLANATION);
             if scan_again.clicked() {
@@ -2333,12 +2349,6 @@ fn show_merge_controls(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Rev
     request
 }
 
-fn show_undo_and_reset(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
-    let undo = show_undo_button(ui, session);
-    let reset = show_reset_button(ui, session);
-    undo.or(reset)
-}
-
 fn show_undo_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
     ui.add_enabled(
         session.can_undo(),
@@ -2357,10 +2367,10 @@ fn show_undo_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<Review
 fn show_reset_button(ui: &mut egui::Ui, session: &ReviewSession) -> Option<ReviewRequest> {
     ui.add_enabled(
         !session.plan().is_as_detected(),
-        IconButton::new(Icon::Refresh, "Reset scenes", ButtonKind::Quiet),
+        IconButton::new(Icon::Refresh, RESET_SCENES_LABEL, ButtonKind::Quiet),
     )
-    .on_hover_text("Undoes every merge and removes the splits you added.")
-    .on_disabled_hover_text("The scenes are as the scan found them.")
+    .on_hover_text(RESET_SCENES_HINT)
+    .on_disabled_hover_text(SCENES_AS_FOUND_HINT)
     .clicked()
     .then_some(ReviewRequest::ResetScenes)
 }
